@@ -26,17 +26,31 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
+from microduck_local.robots.body import geom_aabb_world
+
+#: Camera distance as a multiple of the body's largest extent.
+CAM_FILL = 2.1
+
 
 def frame(body, width: int = 900, height: int = 640,
           azimuth: float = 135.0, elevation: float = -20.0) -> np.ndarray:
     """One RGB frame of `body` at its spawn keyframe.
 
-    The camera is framed off the body's OWN measured width — 2.1x it, which
-    is `lab_spacing_m * 0.6` since the pitch is 3.52x the width — so a 0.33 m
-    arm and a 1.3 m humanoid both fill the frame without a per-robot number.
-    MEASURED on the Go2: the pitch itself (3.05 m out on a 0.75 m robot) put
-    the body in about a seventh of the frame, which is a picture of a
-    checkerboard.
+    The camera is framed off the body's own LARGEST extent at the keyframe —
+    2.1x it, and aimed at the centre of its bounding box — so a 0.33 m arm, a
+    0.75 m quadruped and a 1.2 m biped all fill the frame without a per-robot
+    number. MEASURED on the Go2: the stage pitch itself (3.05 m out on a
+    0.75 m robot) put the body in about a seventh of the frame, which is a
+    picture of a checkerboard.
+
+    The extent and not the WIDTH, which is what this framed off until a tall
+    body arrived: `lab_spacing_m` is 3.52x the widest HORIZONTAL extent, which
+    is the right quantity for two robots standing side by side and the wrong
+    one for a camera. MEASURED on Asimov 1 — 0.42 m across and 1.3 m tall —
+    the width-framed shot cut off its head and its feet, which is precisely
+    the picture that cannot show you a body spawned folded into the floor.
+    For a body whose width dominates (every Menagerie model tried so far) the
+    two agree and the picture is unchanged.
 
     The scene goes through `MjSpec` rather than `MjModel.from_xml_path` for
     one reason, MEASURED: MuJoCo's offscreen framebuffer is 640x480 unless a
@@ -57,8 +71,9 @@ def frame(body, width: int = 900, height: int = 640,
 
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultFreeCamera(model, cam)
-    cam.lookat[:] = data.xpos[1:].mean(axis=0) if model.nbody > 1 else [0, 0, 0]
-    cam.distance = float(body.lab_spacing_m) * 0.6
+    lo, hi = geom_aabb_world(model, data)
+    cam.lookat[:] = (lo + hi) / 2.0
+    cam.distance = CAM_FILL * float(np.max(hi - lo))
     cam.azimuth, cam.elevation = azimuth, elevation
     with mujoco.Renderer(model, height=height, width=width) as r:
         r.update_scene(data, camera=cam)

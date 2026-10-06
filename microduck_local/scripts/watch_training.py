@@ -87,8 +87,30 @@ def main() -> None:
         task = (json.loads((d / "run.json").read_text()).get("task") or "pick")
     except (OSError, ValueError):
         pass
+    # VERIFY FIRST, and for every task. The task-specific reports below score
+    # `policy.onnx` — the FINAL model — against a single number, and on
+    # 2026-10-05/06 that was wrong in four separate ways on one task: a
+    # training curve read as a result while the deterministic rise got worse, a
+    # final checkpoint scored when an earlier one was twice as good, a stale
+    # export scored as a fresh one, and a policy scored under flags it never
+    # trained with. `verify_run.py` scores EVERY checkpoint deterministically,
+    # under the run's own recorded flags plus the deployment's noise and
+    # latency, prices the do-nothing policy, and says out loud when the best
+    # checkpoint is not the one `export-walk` just wrote.
+    verify = HERE / "verify_run.py"
+    if verify.is_file():
+        print("----- verify_run.py -----", flush=True)
+        subprocess.run(["uv", "run", "--with", "onnxruntime", "python",
+                        str(verify), str(d), "--episodes", "36"],
+                       cwd=HERE.parent, check=False)
+        print(flush=True)
+
     reports = (("stow_report.py",) if task == "stow"
                else ("pick_report.py", "reward_budget.py"))
+    if str(task).startswith("getup"):
+        # The duck/MOSS reports do not know this env; `verify_run` is the
+        # report for it.
+        reports = ()
     for script in reports:
         p = HERE / script
         if not p.is_file():

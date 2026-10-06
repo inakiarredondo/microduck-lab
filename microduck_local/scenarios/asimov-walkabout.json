@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "name": "asimov-walkabout",
+  "seed": 0,
+  "floor": {
+    "size": [
+      8.0,
+      7.0
+    ]
+  },
+  "walls": [
+    {
+      "from": [
+        -3.6,
+        -3.1
+      ],
+      "to": [
+        3.6,
+        -3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        3.6,
+        -3.1
+      ],
+      "to": [
+        3.6,
+        3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        3.6,
+        3.1
+      ],
+      "to": [
+        -3.6,
+        3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        -3.6,
+        3.1
+      ],
+      "to": [
+        -3.6,
+        -3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    }
+  ],
+  "boxes": [
+    {
+      "pos": [
+        -2.2,
+        1.8,
+        0.125
+      ],
+      "size": [
+        0.3,
+        0.3,
+        0.25
+      ]
+    },
+    {
+      "pos": [
+        2.3,
+        -1.6,
+        0.1
+      ],
+      "size": [
+        0.35,
+        0.22,
+        0.2
+      ]
+    }
+  ],
+  "balls": [],
+  "persons": [
+    {
+      "id": "p0",
+      "kind": "asimov1",
+      "pos": [
+        1.6,
+        -1.6
+      ],
+      "yaw": 1.57,
+      "path": [
+        [
+          1.6,
+          1.6
+        ],
+        [
+          -1.6,
+          1.6
+        ],
+        [
+          -1.6,
+          -1.6
+        ],
+        [
+          1.6,
+          -1.6
+        ]
+      ],
+      "speed": 0.5,
+      "yield_m": 0.9,
+      "height": 1.2,
+      "radius": 0.3
+    }
+  ],
+  "ducks": [
+    {
+      "id": "d0",
+      "spawn": [
+        0.2,
+        -0.4,
+        1.2
+      ],
+      "policy": "pollen:alpha_walking",
+      "tof": "datasheet",
+      "detector": "datasheet",
+      "brain": "learned:follow-v4"
+    },
+    {
+      "id": "d1",
+      "spawn": [
+        -0.5,
+        0.3,
+        0.6
+      ],
+      "policy": "pollen:alpha_walking",
+      "tof": "datasheet",
+      "detector": "datasheet",
+      "brain": "learned:follow-v4"
+    },
+    {
+      "id": "d2",
+      "spawn": [
+        0.6,
+        0.8,
+        2.4
+      ],
+      "policy": "pollen:alpha_walking",
+      "tof": "datasheet",
+      "detector": "datasheet",
+      "brain": "learned:follow-v4"
+    }
+  ],
+  "_note": "speed 0.5 is MEASURED, not taste: over 60 s with three following ducks it walks 22.5 m clean, while 0.40 and 0.25 both jam at 3.9 m with 43-49 s of yielding. The ducks can only keep up below ~0.4 m/s, and keeping up is what pins the robot \u2014 they crowd its feet, it yields, and a yielded command is one it cannot walk at. At 0.5 it outpaces them and they trail. One duck instead of three works at 0.25-0.40 if you want them close."
+}

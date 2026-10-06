@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "name": "asimov-solo",
+  "seed": 0,
+  "floor": {
+    "size": [
+      8.0,
+      7.0
+    ]
+  },
+  "walls": [
+    {
+      "from": [
+        -3.6,
+        -3.1
+      ],
+      "to": [
+        3.6,
+        -3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        3.6,
+        -3.1
+      ],
+      "to": [
+        3.6,
+        3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        3.6,
+        3.1
+      ],
+      "to": [
+        -3.6,
+        3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    },
+    {
+      "from": [
+        -3.6,
+        3.1
+      ],
+      "to": [
+        -3.6,
+        -3.1
+      ],
+      "height": 0.35,
+      "thickness": 0.04
+    }
+  ],
+  "boxes": [
+    {
+      "pos": [
+        -2.4,
+        2.0,
+        0.125
+      ],
+      "size": [
+        0.3,
+        0.3,
+        0.25
+      ]
+    },
+    {
+      "pos": [
+        2.5,
+        -1.9,
+        0.1
+      ],
+      "size": [
+        0.35,
+        0.22,
+        0.2
+      ]
+    }
+  ],
+  "balls": [],
+  "ducks": [],
+  "persons": [
+    {
+      "id": "p0",
+      "kind": "asimov1",
+      "pos": [
+        1.6,
+        -1.6
+      ],
+      "yaw": 1.57,
+      "path": [
+        [
+          1.6,
+          1.6
+        ],
+        [
+          -1.6,
+          1.6
+        ],
+        [
+          -1.6,
+          -1.6
+        ],
+        [
+          1.6,
+          -1.6
+        ]
+      ],
+      "speed": 0.35,
+      "yield_m": 0.0,
+      "height": 1.2,
+      "radius": 0.3
+    }
+  ],
+  "_note": "Asimov 1 alone on a 12.8 m patrol \u2014 the rig for watching THIS robot walk, with nothing else in the room to explain a stall away. The companion level asimov-walkabout adds three following ducks, and they change the problem: they crowd its feet, it yields, and a yielded command can fall under the policy's floor (see robots/asimov_walk.MIN_FORWARD_CMD). Solo there is no yielding at all (yield_m 0), so a stall here is the ROBOT. MEASURED over 90 s, no falls and zero waiting at every speed: 0.20 -> 15.0 m (1 lap), 0.25 -> 20.3 m, 0.35 -> 28.7 m (2 laps), 0.50 -> 38.4 m (3 laps). 0.35 is the default because it laps twice while sitting well clear of the 0.20 deadband; drop to 0.25 if you want a more sensitive probe of the gait's floor."
+}
