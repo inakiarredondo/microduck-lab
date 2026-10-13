@@ -10,6 +10,11 @@ written back into the item. Keep the answers — a negative result that took an
 hour is worth as much as the positive one, and this file is where the next
 person finds out it was already tried.
 
+**Live work (2026-10-10): Track 14, the Asimov 1 get-up — start at phase 3n.**
+It rises 200/200 and stays up 180/200 by handing off to Menlo's shipped walk
+policy, and passes 6 of the 7 clauses in `scripts/getup_acceptance.py`. The "Now:" section
+immediately below is older than that; read it as history.
+
 ---
 
 > ## ⚠ EVERY LEVEL MEASURED BEFORE 2026-09-09 IS ON THE WRONG CAMERA — read 12z.
@@ -18548,3 +18553,2025 @@ guards its jaw command — cheap and testable without retraining, but it must
 still admit a 33 mm toppled can, so the margin is small. Score either on
 `probe_moss_scrape.py` (slip per run is the abrasion measure) with binned at
 180 s and 300 s as the mission cost.
+
+## MOSS tidies a Microduck: the figurine, and what it measured (2026-10-02)
+
+A showcase level — `scenarios/moss-duckling.json`, MOSS clearing four
+Microduck figurines into his own bin — and the three measurements it forced.
+
+**The real robot does not fit, three independent ways.** Measured before
+anything was built, which is the only reason none of it was wasted:
+
+  * **Mass.** The walk MJCF weighs 737 g. On the can's own 9-spot grid
+    (`scripts/probe_moss_grasp.py`, the CAN unchanged scores 7/9 in the same
+    harness) the jaw holds 7/9 at 18 g and at 30 g, 5/9 at 50 g, 2/9 at 70 g,
+    0/9 at 100 g. It is the pads SLIPPING, not the arm stalling — every arm
+    joint clamps at 2.2 N·m and 737 g at the 0.26 m grasp needs ~1.9 of it —
+    and friction does not buy it back: µ 5.0 at 100 g is still 3/9.
+  * **Jaw.** 90 mm clear wide open; the duck's trunk is 97 × 105 mm.
+  * **Bin.** Mouth 154 × 192 mm, 151 mm deep; the duck's tight bbox is
+    168 × 189 × 279 mm. No axis works.
+
+So **0.333 scale**, which mass decides (737 g × 0.333³ = 27 g, inside the
+30 g band) and which clears the other two with room: 50.8 × 49.7 × 93.0 mm.
+
+**`GRASP_PROPS["duckling"]`** carries the band, measured the same way as the
+can's: it holds 8/9 from 28 mm of interference down to 4 mm and falls to 3/9
+at a 2 mm GAP, so 0.024 is kept as the gentlest jaw that still holds, at
+0.040 grasp height (0.030 → 5/9, 0.060 → 2/9; the palm starts taking it).
+
+**A box collider jams the jaws open, and the jam reads as a pass.** Squared
+to 60 mm its diagonal is 85 mm against an 82 mm inner gap: finger qpos driven
+to 0.0443, past its own 0.041 limit, and the arm then lifts the wedge. That
+scored 4/4 at every jaw command *including an 8 mm nominal gap*, with a
+byte-identical 0.083 m lift. A cylinder has no yaw and the duck's plan
+silhouette is round to within a few mm anyway. **Scoring only the lift cannot
+tell a grasp from a wedge** — the band's shape (holds on interference, fails
+on a gap) is what separates them.
+
+**The pick needed no training at all; the stow did.** The figurine lands
+inside `sample_prop`'s existing cylinder family (r 0.022-0.034, h 0.030-0.075,
+10-60 g), and the shipped `teach-moss_pick_grip-3d2aa6-s6` picks it **24/24**
+at rung 2 with nothing retrained. `moss-stow-v1` managed **4/24**, and
+bisecting by knob found the cause was SIZE alone — jaw, grasp height, mass and
+friction all null:
+
+      half-height 52 mm 12/12 | 46.5 mm 4/12
+      radius      33 mm 12/12 | 30   mm 4/12
+
+i.e. **`moss-stow-v1` is overfit to the can's exact dimensions**, which is a
+finding about the stow leg and not about ducks.
+
+**Fine-tuned through the lab** (`POST /teach` with `initFrom: moss-stow-v1`
+and `startStage: 1`, the chain's three rungs, 2.0M steps):
+`teach-moss_stow-c4fe72-s3` stows the figurine **24/24**. It is a SPECIALIST
+— on the can it falls to 15/24 — so the brain's shipped stow stays
+`moss-stow-v1`. **Open:** retrain this with `prop_variety` on and see whether
+one stow can hold both; that is the run worth doing next, and the number that
+settles it is the can and the figurine from the same policy.
+
+**The room never needed any of it.** `record-world scenarios/moss-duckling.json`
+delivers **4/4 figurines in 70 s with zero falls** on the SHIPPED legs — the
+scripted loop's framing carries a stow that scores 4/24 in its own env. Worth
+remembering before crediting an env score to a room.
+
+**`scenario.Prop.look`** is the new seam: a picture drawn over a prop whose
+collider stays a measured primitive. `"duck"` bakes the Microduck's own CAD at
+its rest keyframe (`world/compose.py _duck_figurine`), and the /sim page draws
+its own from `GET /scene`'s new `home` + `bbox`. **The bake's one real bug is
+worth not repeating:** the compiler shifts a mesh geom's `pos` by that mesh's
+centroid offset, so re-declaring `geom_xpos` applies it TWICE — the figurine
+came out 123 mm instead of 93 with its parts flung apart. Place parts from
+DECLARED transforms composed with body world transforms.
+
+## Track 14 — Asimov 1 gets up: a CONTRACT-PRESERVING get-up — OPEN (2026-10-04)
+
+**The goal, and it is deliberately one pose:** Asimov 1 stands up from a
+**supine** fallen pose and holds it, inside the 78-obs / 23-action contract.
+Everything else in this track is in service of that first number.
+
+**STATE (2026-10-13): it gets up from a fall in ANY of the two
+well-sampled postures.** `teach-asimov_getup_turn-967072` (`--pick`), handing
+off to Menlo's own shipped walk policy: **supine 48/48 rises, prone 47/48**,
+42/48 still standing at the buzzer either way, within **1.0-1.1 deg** of the
+idle pose, no joint jam, and 0.977-1.000 of the shoves that land survived.
+Six of the seven acceptance clauses pass on both postures; the seventh (peak
+foot span) is measurably the wrong gate. Its parent `540bc4` is the
+supine-only baseline at 200/200 rises and 180/200 stays over a longer
+battery. Start at **phase 3n**. Six of the seven acceptance clauses in
+`scripts/getup_acceptance.py` pass; the seventh (peak foot span) is
+measurably the wrong gate. Start at **phase 3n**, which has the deliverable,
+the eleven runs behind it and the five instrument faults found on the way.
+
+**Why this and not another getup.** Two already exist and neither can be
+deployed as-is. `cyclotron` PR #7 (@eckartal, +18,954 lines, OPEN since
+2026-09-28 with **zero reviews**) reports 100 % from 8 start poses, ~88 %
+under weakened motors and rough ground, ~97 % cross-checked in MuJoCo.
+`openhorizon-labs/asimov1-getup-safefall` reports 99.8 % and a 1.70 s median.
+**Both are simulation only, and the HF one needs a 5-step observation history
+(375 inputs), so it will not even load in Menlo's own viewer**
+(`cyclotron.sh --view` expects 78 obs at 50 Hz, 23 actions). A get-up that
+keeps the walk policy's contract hot-swaps on the real robot and runs in their
+viewer; that is the thing nobody has.
+
+**And we can answer a question they cannot.** Their own shipped walk policy
+already peaks at **100 % of rated torque** on ankle_pitch, ankle_roll and
+shoulder_roll in our sim (`scripts/probe_asimov_walk.py`). A get-up loads the
+arms and shoulders far harder than walking. "Does it stay inside the motor
+envelope" is measurable here and is the difference between a sim demo and
+something worth putting on a $20,000 robot.
+
+### Phase 1 — the fallen poses — DONE (2026-10-04)
+
+`robots/asimov_getup.py` ports Menlo's collection procedure (their
+`scripts/getup/build_fallen_cache.py`, itself from NVIDIA WBC-AGILE) to
+MuJoCo: drop a LIMP robot (Kp 0, **Kd 0.5**, not zero torque) from 0.3-0.8 m
+at a random orientation, settle 2 s, keep what is finite, penetration-free and
+at rest (root speed < 0.05 m/s), and label it by torso orientation and ground
+contact with their thresholds and in their rule ORDER.
+
+```bash
+uv run python -c "from microduck_local.robots import asimov_getup as G; print(G.collect(n=500)[1])"
+```
+
+**MEASURED, 500 drops in 23 s (45 ms each), 92 % kept:**
+
+| supine | prone | side_left | side_right | sitting | kneeling | other |
+|---|---|---|---|---|---|---|
+| 240 | 220 | 5 | 3 | 5 | 4 | 3 |
+
+**A free drop gives two categories and nothing else** — 92 % of the cache is
+back-or-front. That is not a bug and it independently reproduces why Menlo
+carry TEN category-targeted spawn recipes with a tuned mix (`side_prop` 0.45,
+`kneel_hands` 0.22) instead of uniform drops; their own untargeted `side` seed
+is weighted **0.0**, i.e. they tried it and it did not yield either. A
+balanced six-category cache needs those recipes. **This track does not need
+one**: the goal is supine, and there are 240 of them.
+
+Looked at, not just counted: six rendered supine poses are robots lying on
+their backs with limbs settled at plausible angles, resting on the floor.
+Open refinement: this collects at `alpha = 1.0` (joints drawn uniformly in
+range), which produces some contorted poses; Menlo's propped seeds use
+`alpha` 0-0.3, which is "fell over while standing". A lower alpha is probably
+the easier first target and is closer to how a robot actually falls.
+
+### Phase 2 — the observation question  `[x] ANSWERED 2026-10-04 — it is NOT the observation`
+
+Can a get-up be learned from the deployment contract's 78 floats — angular
+velocity, projected gravity, a twist command, joint positions, joint
+velocities, previous action — with **no height, no contact sensing and no
+history**? The one public attempt that works said no and used 5 frames (375
+inputs), which is why this was written as the deciding experiment.
+
+**Run at last, and the answer is yes — or at least, history is not what is
+stopping it.** `teach-asimov_getup_hist-38ca15` is `teach-asimov_getup_ref-2f6e93`
+with ONE thing changed: the policy sees five stacked frames (390 floats) instead
+of one. Same reference, same reward, same six rungs, same 2.0 M steps, same
+seeds, scored the same way on the deterministic exports.
+
+| rung | start | contract arm (78) | **control arm (390, 5 frames)** |
+|---|---|---|---|
+| s1 | `pike` | `rock_back` 16/16 | `rock_back` 16/16 |
+| s2 | `quadruped` | `pike` 5, `rock_back` 11 | `pike` 11, `rock_back` 5 |
+| s3 | `draw_knees_in` | `quadruped` 16/16 | `quadruped` 16/16 |
+| s4 | `plant_forearms` | `quadruped` 16/16 | `quadruped` 16/16 |
+| s5 | `prone` (cache) | `prone` 16/16 | `prone` 16/16 |
+| s6 | `prone` (cache) | `prone` 16/16 | `prone` 16/16 |
+
+**Waypoint for waypoint identical**, and s2 is marginally WORSE with history.
+Neither arm crosses `pike` -> `fold`. Five frames of memory buy nothing, so the
+78-float contract is not the constraint and the free twist slots do not need to
+carry a phase. **The contract-preserving version is not ruled out by its
+observation** — which is the useful half of a negative result, and it closes the
+most recently plausible explanation for six failed chains.
+
+What this rules out, cumulatively, each measured:
+
+| hypothesis | ruled out by |
+|---|---|
+| the reward is wrong | 4 runs, phase 3 |
+| the exploration/curriculum is wrong | 2 chains, 6 rungs, phase 3d |
+| the instrument was lying | 4 faults found and fixed, chain 1 |
+| the observation is insufficient | **this control, matched steps** |
+| their joint ranges are wider than ours | `soft_joint_pos_limit_factor: 0.9` in Menlo's own `env.yaml` |
+
+What is left is the ROUTE. `pike` -> `fold` requires lifting the trunk about the
+hip with near-straight legs (`pike` has knee 0.05), and phase 3c measured that
+this body cannot do that: 92 % of rated torque and 0.485 rad of sag. The
+authored reference asks for the one motion the hardware provably refuses. A
+route that avoids it has to push with the ARMS rather than the hip — and the
+asymmetric version of that (half-kneel, lunge) is closed by `ankle_roll` at
+±0.10 rad, so it must be symmetric.
+
+**Settles next:** a real trajectory optimisation from the SETTLED pike — longer
+horizon, more knots, torque-aware, arms as the prime mover. The 15-parameter CEM
+tried so far is not evidence of impossibility: it started from the placement
+transient at 100 % torque and never raised the pelvis at all.
+
+**Infrastructure this phase left behind.** The control arm is 390 inputs and
+cannot be deployed, so three things now say so without anyone remembering to:
+`run.json` records `history`, `export-walk` refuses a width its run does not
+account for, and the exported ONNX is stamped
+`asimov1-390-hist5-control` with a deploy sentence that names what it will not
+load into. The export used to stamp the BODY's 78-obs contract onto whatever
+file it wrote, and the printed contract line restated the intention rather than
+reading the artefact — it now reads the stamp back off the file, so the line
+verifies the export instead of describing it.
+
+### Phase 3 — curriculum and reward — FOUR RUNS, and the fourth found the real problem (2026-10-04)
+
+Every run below is 2-3M steps on CPU, ~10 min each, launched through the lab
+and judged on the per-term budget plus a render. **`standing` is the number**:
+the bonus for being up, upright and on both feet at once.
+
+| run | the lever | what it did | standing |
+|---|---|---|---|
+| `be7733` | per-axis reward | **sat up** and never moved again — upright 885/1200 with its hips on the floor | 0.00 |
+| `08bdf5` | gate upright on height, + fading assist | **shoulder stand** — pelvis to 0.52 m with the torso INVERTED (u_z -0.57) | 0.00 |
+| `990c5d` | reward collapsed to PRODUCTS (`height x upright x feet`) | exploits dead — the shoulder-stand policy rescored 568.9 -> **-55.2** — and so was the gradient: `stand` 64 of a possible 3200 | 0.00 |
+| `66ee20` | reverse curriculum on the reset pose (0.8 -> 0.5 -> 0.2 -> 0.0) | **2.19**, the first non-zero, at the easiest rung only; every rung below it went back to 0.00 | 2.19 |
+
+The first two are the same mistake twice: **a proxy that failure also
+satisfies.** Paying an axis on its own always found a trick that satisfied
+that axis and nothing else. The third fixed it and showed the cost — a reward
+no trick can farm is ~0 everywhere, so nothing is learned either.
+
+**And the fourth run read as "it cannot balance" — which is false, and the
+control that settles it costs 30 seconds.** Stage 1 starts at pelvis 0.612 m
+and u_z +0.93 — 96 % of standing HEIGHT — and ends on the floor. That was read
+as a balance deficit, and a donor warm-start was proposed on the strength of
+it. Then the control that should have come first: a **zero-action** policy
+(action 0 commands `DEFAULT_POSE`, so this is "hold the stand and do nothing
+else") from the same reset pose, 6 cache poses, no randomisation.
+
+| blend α | pelvis z at reset | u_z at reset | holds 8 s, zero action | time to u_z < 0.90 |
+|---|---|---|---|---|
+| 1.00 | 0.614 | 1.00 | **6/6** | — |
+| 0.95 | 0.626 | 1.00 | **6/6** | — |
+| 0.94 | 0.628 | 0.99 | **6/6** | — |
+| 0.92 | 0.631 | 0.99 | 5/6 | 1.18 s |
+| 0.90 | 0.634 | 0.98 | 3/6 | 0.99 s |
+| 0.85 | 0.637 | 0.97 | 0/6 | 0.62 s |
+| **0.80** — the "almost up already" rung | 0.636 | 0.94 | **0/6** | **0.34 s** |
+
+At α = 1.0 the blend IS `DEFAULT_POSE` (max joint error 0.0000 rad) and it
+holds open-loop, exactly as the 2026-10-03 conformance measurement says.
+**Balance was never the deficit.** Three faults were.
+
+**1. The ladder's rungs are not on the ladder.** `blend_to_stand` SLERPs the
+root toward upright and lerps the joints toward `DEFAULT_POSE`. An
+interpolation between a sprawl and a stand is a THIRD pose, not an intermediate
+one. The passive basin is α ≥ 0.94; every rung shipped — 0.8, 0.5, 0.2, 0.0 —
+is outside it, and the easiest one topples in **0.34 s** with no action at all.
+The policy had 17 control steps to act in.
+
+**2. The reward's main axis runs BACKWARDS.** Pelvis z at reset *rises*
+monotonically as the blend gets HARDER — 0.614 m at α = 1.0 up to 0.637 m at
+α = 0.85 — because `blend_to_stand` drops the robot until its lowest point
+rests on the floor, and a more sprawled configuration carries its lowest point
+closer to the pelvis. `height = pelvis_z / STAND_Z` therefore reads "almost
+standing" LOUDEST where standing is least reachable. The `up` gate
+(height ≥ 0.90, u_z ≥ 0.90, both feet) is satisfied on height AND on upright
+by the α = 0.8 reset pose itself, and fails only on feet. **`standing` 2.19 was
+the reset pose decaying past a threshold, not a skill.**
+
+**3. Nothing was recorded, so none of it was readable.** `AsimovBody` has no
+`train_env_kwargs`, so `run.json` carries `{domain_rand, obs_noise}` and
+nothing else; every stage's blend and assist lived in `os.environ`, read inside
+`AsimovGetupEnv.__init__`. `robots/moss.py` already states the rule this
+breaks, verbatim: *"The env var is read HERE rather than inside the env for
+exactly that reason: an env that reads its own environment trains fine and
+leaves no record of what it trained on."* Every post-hoc render of these four
+runs took its knobs from the ambient shell, which is why the claim "rendered
+under its OWN training flags" cannot be checked, and is withdrawn.
+
+**And falling never terminated** (`_fall_gravity_z = 2.0`,
+`_fall_height = -1.0`), so an episode that topples at 0.34 s spends 96 % of its
+8 s lying down integrating `rise` and `stand` at whatever the floor pays. No
+return distinguishes a fall at 0.34 s from one at 7 s.
+
+**A reverse curriculum on the FALL rather than on the pose does not rescue it
+either.** Shove a standing Asimov (0.6 g at the pelvis, 0.5 s) and it reaches
+rest in **0.66 s**. Rewind to T before rest and command the stand pose: it
+recovers at T = 0.80 s — before the shove even ends — and **fails at
+T = 0.50 s, where the state still reads pelvis 0.612 m and u_z +1.00.** There
+is no passively recoverable band between standing and lying on this body. A
+reverse curriculum needs a region where the task is nearly free, and there
+isn't one, on either axis.
+
+**So the lever is neither a reward nor a donor: it is a REFERENCE.** A get-up
+is a sequence of qualitatively different contact sets — supine, roll, sit,
+quadruped, crouch, stand — and `height`, `u_z` and `feet` are all NON-MONOTONE
+along a correct one: a proper sit has u_z ≈ 0.3, a proper crouch height ≈ 0.5.
+No weighting of three non-monotone axes can shape a 6-phase motion, which is
+why four runs of reward surgery found four different ways to stop at phase one.
+The repo has already met this exact wall once and the way through is recorded:
+*"IK drew the 0.62 m kick reward search never found"*
+([[ik-root-trap-and-soft-constraints]]), and DeepMimic early termination on a
+5 → 15 → 30 cm ladder took that kick from 0.10 m to 0.62 m
+([[imitation-needs-not-tracking-termination]]). Don't ask it to discover the
+stages — author them, and pay it for tracking the one it is in.
+
+### Phase 3c — the get-up as an authored reference  `[x] ANSWERED 2026-10-04`
+
+**Steps 0 and 1 are done, and step 1 found the result that reframes the whole
+task: the learning problem is ONE dynamic transition, not a six-phase motion.**
+
+**Step 0 — the instrumentation, landed.** `AsimovBody.train_env_kwargs` now
+reads the get-up knobs and records them onto `run.json`, so a run says which
+rung it trained at; `AsimovGetupEnv` takes them as kwargs instead of reading
+`os.environ` inside itself. The fall cut is back, armed by having STOOD — an
+episode that never stands cannot fall, and one that stands and goes down loses
+the rest of its episode, which is the only thing that makes staying up worth
+more than reaching it. `held_s` reports the LONGEST unbroken hold rather than a
+sum, because `standing` already sums the gate and a sum cannot tell 40
+scattered frames from one 0.8 s hold. `tests/test_asimov_getup.py`, 9 tests,
+one of them a planted regression that disarms the cut and requires the episode
+length to come back.
+
+A measurement fell out of it immediately: at blend 0.8 the reset pose brushes
+the `up` gate for **6 frames of 400** under ZERO action, on the way down. That
+is `standing` 2.19 explained — the reset pose decaying past a threshold, no
+policy involved. Pinned as `test_the_gate_is_satisfiable_on_the_way_down`.
+
+**Step 1 — the reference, in `robots/asimov_getup_ref.py`.** Every row below is
+measured with randomisation off over a **6 s** window, and pinned by
+`tests/test_asimov_getup_ref.py` (18 tests). The window is the point: a 2 s
+window called a knee-1.00 crouch the deepest hold at 0.511 m, and it collapses
+at 3 s — a slow collapse and a hold are indistinguishable early, and the
+earlier "deepest hold 0.514 m" in this document was that artefact.
+
+| waypoint | root pitch | pelvis z | u_z | carried by | torque | equilibrium | servos reach it |
+|---|---|---|---|---|---|---|---|
+| `prone` | +1.57 | 0.007 | +0.01 | trunk | 26 % | yes | start |
+| `plant_forearms` | +1.57 | 0.020 | -0.02 | ankles + elbows | 69 % | no | **yes** |
+| `draw_knees_in` | +1.50 | 0.120 | -0.20 | elbows + knees | 61 % | no | **yes** |
+| `quadruped` | +1.45 | 0.211 | **-0.06** | ankles + knees + elbows | 58 % | yes | **yes** |
+| `pike` | +1.20 | 0.300 | **-0.37** | ankles + elbows | 66 % | yes | **yes** |
+| `rock_back` | +0.70 | 0.170 | -0.22 | ankles + elbows | 36 % | **no** | **yes** |
+| `fold` | +0.60 | 0.517 | +0.83 | **ankles alone** | 35 % | yes | **NO — 0.187** |
+| `crouch` | +0.30 | 0.562 | +0.95 | ankles | 16 % | yes | no |
+| `stand` | 0.00 | 0.608 | +1.00 | ankles | 14 % | yes | no |
+
+**The result.** Ramped from waypoint to waypoint by the position servos with no
+policy, no feedback and nothing learned, the robot follows this reference all
+the way to `rock_back` — and breaks on exactly one leg, `rock_back` -> `fold`,
+reaching 0.187 m against an authored 0.517 m. So the four runs that failed were
+not failing at a six-phase get-up. **They were failing at one transition**, and
+everything either side of it is a motion this robot has already been shown to
+make. `VERIFIED_THROUGH` records the boundary and
+`test_the_servos_alone_follow_the_reference_up_to_the_rock_back` asserts it from
+BOTH sides — the legs before it must still succeed, and the leg after it must
+still fail, or the claim is stale.
+
+**Five things about this body that an anatomically-authored get-up gets wrong,
+each measured, each of which would have cost a training run.**
+
+1. **There are no hands.** `left_wrist_yaw_link` carries a visual mesh and NO
+   collision geom, so a hand cannot touch the floor or bear load. The G1's
+   `_effectors` offers hands at (0.06, 0, 0) and copying it would have authored
+   four phases resting on thin air. The weight-bearing set is the pelvis,
+   waist, neck, hip links, the knee (a 0.13 m half-length capsule down the
+   whole shin), four 5 mm foot spheres per ankle, the shoulder rolls and the
+   **elbow**. Asimov plants FOREARMS.
+2. **It cannot squat.** `ankle_pitch` is limited to ±0.35 rad, so the shin
+   cannot tilt forward and the knees stay over the ankles. The deepest pose it
+   holds on its feet alone is `fold` at 0.517 m — 81 % of standing — and only
+   because the arms reach FORWARD to carry the centre of mass over a footprint
+   the ankle cannot reach under. Arms at the default it manages 0.545 m.
+   Everything below 0.517 m needs a non-foot contact.
+3. **It cannot sit up.** Twelve variants of the route that never turns over —
+   supine, sit with the knees drawn up, tuck the feet, push — every one sags
+   0.35 to 0.58 rad from the commanded pose: the hip servos cannot hold a
+   knees-up sit against gravity, and the sit pose alone demands **92 %** of
+   rated torque just to be approached.
+4. **It cannot rise from SUPINE at all.** Three scripted routes off its back,
+   and slowing the reference 8× (24 s), all end at pelvis 0.097 m with the hips
+   on the floor. A supine get-up therefore needs a ROLL to prone first, which
+   is a root rotation about the long axis that the pose tooling cannot even
+   express (`pose._pose` pitches about +Y and nothing else). **That is why the
+   reference starts prone**, and the roll is phase 3d.
+5. **`u_z` and `height` are both NON-MONOTONE along the reference.** `u_z` runs
+   +0.01 → **-0.37** → +1.00, because the robot must turn face down to get its
+   forearms under it; `height` dips at `plant_forearms`, because loading the
+   elbows is the move. Any reward paying either per step is paying the robot to
+   skip the phases that lift it. That is what the first four runs discovered,
+   four times, and two tests now assert it stays true.
+
+**The torque envelope is fine.** The elbows are the bottleneck at 58–66 % of
+rated in the quadruped and the pike; nothing held exceeds 69 %. The dynamic
+rock-back is unmeasured and is the thing to watch once a policy does it.
+
+### Phase 3d — train the one transition  `[ ]`
+
+The reference reduces the task, so train against the reduced one.
+
+**Step 2 — phase-indexed tracking from prone.** Reward = tracking the current
+waypoint's joints and contact set, plus a one-way bonus for advancing a
+waypoint (the progress-pay shape that solved the duck headstand). The phase
+clock advances on ACHIEVEMENT, not on time. Terminate on not-tracking,
+laddered loose → tight — that ladder, and not the reward, is what moved the G1
+kick 0.10 → 0.62 m. No assist force and no blend: the curriculum is the
+tracking tolerance. **Settles:** the histogram of waypoint reached. Anything
+that gets past `rock_back` is new.
+**And start the curriculum AT the hard leg** — reset at `pike` and require only
+`pike` → `stand`. Unlike the retired blend ladder every rung here is a
+configuration measured to hold for 6 s, which is exactly what an interpolation
+could not offer. Then extend backwards to `quadruped`, `draw_knees_in`, `prone`
+— each of those legs the servos already execute, so a policy that can do the
+rock-back should pick them up nearly free. **Settles:** success rate per start
+waypoint, and the one it falls off at.
+
+**Step 3 — fade the imitation.** Lower the tracking weight, raise
+stand-and-hold, so the shipped policy is not locked to the authored trajectory.
+Where the contract-legal 78/23 get-up comes from. **Settles:** success and time
+to stand from the cache. **NOT against "Menlo's own bar"** — there is no such
+bar, and quoting one was this track's own mistake. See the correction below.
+
+**Step 4 — the supine roll.** Fact 4 above makes this its own problem: a roll
+about the long axis, which needs a root quaternion the pose tooling cannot
+express. Either extend `pose._pose` past pitch, or author the roll directly as
+`qpos` and skip the IK. **Settles:** a prone pose reached from supine.
+
+**The donor is not dead, it is just not the fix.** Menlo's walk policy holds a
+stand at zero command, so it is a candidate warm start for step 3's tail. It
+was the wrong answer to "it cannot balance" because that premise was false.
+
+### Phase 3d, chain 1 — a NULL, and three instrument faults  `[x] 2026-10-04`
+
+`teach-asimov_getup_ref-69021a`, four rungs, 2.0 M steps, scored on the
+deterministic exports under each run's OWN recorded flags
+(`scripts/getup_report.py`, 16 episodes each — and the only reason that is
+possible is Step 0, since the rung used to live in `os.environ`).
+
+| stage | start | tol | furthest waypoint ACHIEVED | vs its start | vs the zero-action baseline |
+|---|---|---|---|---|---|
+| s1 | `pike` | 0.60 | `pike` 16/16 | +0 | same |
+| s2 | `quadruped` | 0.60 | `rock_back` 16/16 | +2 | better (baseline achieves +0) |
+| s3 | `prone` (cache) | 0.90 | `prone` 15/16 | +0 | same |
+| s4 | `prone` (cache) | 0.65 | `prone` 15/16 | +0 | same |
+
+**Nothing crossed into `fold`.** s2's +2 is real learning but it only reaches
+where the scripted servo ramp already stops. The one leg that matters was not
+crossed, and `reached_stand` was 0/16 everywhere.
+
+**It was reported as a success first, and that is the finding worth keeping.**
+The same chain was initially read as "reached `fold` 16/16, crossing the leg the
+servos cannot do" — which would have been the headline. Three separate faults in
+the instrument, each found by looking at a trace rather than a summary:
+
+1. **The metric reported the TARGET, not the achievement.** Achieving a
+   waypoint advances the clock to aim at the next, and the reported index was
+   the new target. "Reached `fold`" meant "achieved `rock_back`". An off-by-one
+   that inverted the conclusion.
+2. **The last waypoint could never be reached at all.** Achieve and advance
+   shared one branch, gated on `phase < len - 1`, so when the target WAS `stand`
+   the gate was false and nothing could record it. Every `reached_stand` 0/16 in
+   the table above was structurally impossible — from `crouch` a zero action
+   sits at pelvis 0.608 m, standing by every number in the phase-3c table, and
+   scored nothing.
+3. **Falling back was free.** A policy reached `rock_back` at step 13 and lay on
+   the floor for the remaining 7.7 s at pelvis 0.099 m, with a joint error of
+   0.326 against a 0.60 cut — so it counted as TRACKING and collected `track`
+   and `contact` every step. The identical structural fault the original get-up
+   env had, in a new place: 400-step episodes of income for having fallen.
+
+And a fourth, found by measurement rather than by a trace: **the mean joint
+distance between consecutive waypoints is 0.087 to 0.239 rad**, every pair
+inside even the tightest cut. So standing still counts as tracking the next
+waypoint, and since `pike` holds for 6 s unaided, "hold the pike for the whole
+episode" was a safe 400-step income with no risk. Achievement-only phase
+advance means the reference never PRESSES.
+
+**All four fixed, each with a planted regression** (`tests/test_asimov_getup_ref
+.py`, 45 tests with `test_asimov_getup.py`): the metric reports the achieved
+waypoint, achieving and advancing are separate branches, a fall below the
+achieved waypoint's height ends the episode, and a 2 s per-phase deadline bounds
+"slow is fine" — exempt on the last waypoint, where staying put IS the task.
+Disarming any one of them has to restore the old behaviour or the test is not
+testing it; two of the plants initially passed for the wrong reason because
+another fix masked them.
+
+**The measured baselines every rung is now scored against**, a constant stand
+command (zero action), randomisation off:
+
+| start | episode | achieved | `stand`? | held |
+|---|---|---|---|---|
+| `stand` | 400 (timeout) | `stand` | yes | 7.98 s |
+| `crouch` | 400 (timeout) | `stand` | yes | 7.90 s |
+| `fold` | 45 (cut) | `stand` | yes | 0.56 s |
+| `pike` | 22 (cut) | `pike` | no | 0 |
+| `quadruped` | 14 (cut) | `quadruped` | no | 0 |
+| `prone` | 400 (timeout) | `prone` | no | 0 |
+
+So `fold` is the first rung a constant command gets off the floor from, and
+`pike` the first it cannot — the same boundary phase 3c found by ramping the
+servos, measured a second and independent way.
+
+**Chain 2** (`teach-asimov_getup_ref-2f6e93`) runs the fixed env over six
+smaller rungs — `pike`, `quadruped`, `draw_knees_in`, `plant_forearms`, then the
+cache twice at 0.90 and 0.65. Chain 1's third rung jumped from the quadruped
+straight to the cache, moving the start two waypoints AND swapping one authored
+pose for a distribution of 220 real ones in a single step, and it lost
+everything s2 had learned. **Settles:** any episode achieving `fold`.
+
+### Phase 3d, chain 2 — the leg is still uncrossed, and the OBSERVATION is the suspect  `[x] 2026-10-04`
+
+`teach-asimov_getup_ref-2f6e93`, six rungs, 2.0 M steps, fixed env, scored the
+same way.
+
+| stage | start | furthest ACHIEVED | vs its start |
+|---|---|---|---|
+| s1 | `pike` | `rock_back` 16/16 | **+1** (chain 1 managed +0) |
+| s2 | `quadruped` | `pike` 5, `rock_back` 11 | +1 to +2 |
+| s3 | `draw_knees_in` | `quadruped` 16/16 | +1 |
+| s4 | `plant_forearms` | `quadruped` 16/16 | +2 |
+| s5, s6 | `prone` (cache) | `prone` 16/16 | **+0** |
+
+The four instrument fixes bought a waypoint at the hard rung. **`pike` -> `fold`
+is still uncrossed — two chains, 4.0 M steps, never once.** A 15-parameter CEM
+trajectory search from `pike` does not find it either (best ends at pelvis
+0.139 m), though that search was too small to be evidence of impossibility: it
+started from the PLACEMENT transient at 100 % torque rather than from the
+settled pike.
+
+**And the authored route asks for the one thing already measured impossible.**
+`pike` has knee 0.05 — legs nearly straight — so `pike` -> `fold` is a
+stiff-legged lift of the trunk about the HIP, which is the sit-up this body
+cannot do (92 % of rated torque, 0.485 rad of sag). The reference put the robot
+in the configuration it cannot recover from, and phase 3c's own fact 3 said so.
+
+**A FIFTH limit, found trying the route a person uses.** A half-kneel or lunge
+puts the lift on a leg already under the body, which avoids the hip problem
+entirely — and every one of 18 variants topples onto the kneeling hip at pelvis
+~0.16 m **while the servos still hold the joints** (drift 0.09–0.14). The cause
+is `ankle_roll`, which is **±0.10 rad — ±5.7°**. There is no lateral ankle
+authority to balance over a narrow base, so a get-up on this body must stay
+laterally SYMMETRIC. No lunge, no half-kneel, no step.
+
+**The escape that is ruled out:** Menlo train at
+`soft_joint_pos_limit_factor: 0.9` (their own `env.yaml`), so they are working
+inside the SAME limits or tighter. "Their joint ranges are wider than ours" is
+not the answer.
+
+#### The correction that reframes the track
+
+This track has been quoting **"Menlo's own get-up: 100 % from 8 start poses,
+1.70 s median"** as the bar, in `behaviors/asimov_tasks.py` and in phase 3d.
+**Neither number is Menlo's.** Track 14's own header says where they come from:
+100 % from 8 poses is `cyclotron` PR #7 (@eckartal), and 99.8 % at a 1.70 s
+median is `openhorizon-labs/asimov1-getup-safefall`. Two community attempts,
+and the header already records that **both are simulation-only and both break
+the contract**. Two results were conflated into one and attributed to the
+vendor, and then used as the success criterion for the contract-preserving
+version — which is exactly the failure `AGENTS.md` names first: *never invent a
+number somebody published.* Corrected in both places. **There is no published
+bar for a 78/23 get-up, which is the whole reason to do one.**
+
+**And the detail walked past for four runs and two chains is in the same
+sentence.** The one community get-up that works *needs a 5-step observation
+history — 375 inputs*. This env gives the policy a SINGLE 78-float frame: no
+history, no phase, no velocity beyond one joint-velocity block. A get-up is a
+sequence in which the correct action depends on where in the motion you are,
+and from one frame two phases with similar joint angles are nearly
+indistinguishable. **That is a sufficiency problem, not a reward problem, and no
+reward or curriculum can fix it.**
+
+**It is also already written down as Phase 2 of this track, and it was
+skipped.** Phase 2's settle condition reads: *"success rate from the supine
+cache at matched training steps, 78-obs against a history baseline. A negative
+result here is worth as much as a positive one and decides whether the
+contract-preserving version is possible at all."* Four reward runs and two
+reference chains were spent before that control was run. **Run it next:** the
+same six-rung curriculum with a history-augmented observation beside the 78-obs
+one, matched steps. If history crosses `pike` -> `fold` and 78-obs does not,
+that is Track 14's actual answer — and a negative result is a real contribution,
+because nobody has established whether a contract-preserving Asimov get-up is
+possible.
+
+### Phase 3d, chains 3 and 4 — the reward was paying for the failure, and the TAIL could never finish  `[x] 2026-10-04`
+
+Two more chains, and the diagnosis moved twice.
+
+**Chain 3 came out WORSE than chain 2, and the cause was mine.** I added a
+settled reset — place the start pose, let it come to its equilibrium, then begin
+— which is right. But the fall-back cut stayed keyed to the AUTHORED
+`settled_z`, measured with a different settle. The `pike` rung reset to 0.264 m
+against an authored 0.300, so the cut floor sat **24 mm below the start** and
+every episode died in **2 steps**. 5 at the quadruped, 20 at `draw_knees_in`. No
+policy learns a get-up in two control steps. The cut now anchors on the height
+the episode OBSERVES, with a 0.15 m margin, since the product reward and the 2 s
+stall deadline already do the anti-lying work.
+
+**The reward was paying 81 % for the failure state.** This is the one that cost
+the most. `fold` standing is pelvis 0.516 m, u +0.84. The SAME joint command,
+after the robot tips onto its forearms, is 0.197 m, u -0.35 — **mean joint
+difference 0.0516 rad**. The joints do not determine the pose on this body, the
+CONTACT MODE does. So a joint-only tracking reward paid `exp(-0.0516/0.25)` =
+**8.14 of a possible 10 per step for lying face down**, and since pushing off the
+forearms means EXTENDING the elbows away from the target pose, it actively
+charged for the one move that works. Tracking is now a PRODUCT of joint and body
+agreement — the failure state pays 0.91 — and the body terms are ONE-SIDED,
+because two-sided they scored `fold` WORSE than `pike` while the target was the
+waypoint between them: the reward punished overshooting toward the goal.
+
+The cleanest confirmation that it is contacts and not strength: **at 5x rated
+torque the result is bit-identical.** The servos are already at the angles they
+were asked for, so a stronger motor changes nothing.
+
+**And the reference's TAIL could never finish.** `fold` -> `crouch` -> `stand`
+**stands** — 0.608 m, u +1.00, held 4 s — at 0.25 s per leg:
+
+| `fold`->`crouch` | `crouch`->`stand` | result |
+|---|---|---|
+| 0.20-0.30 s | anything 0.20-0.80 s | **STANDS** |
+| 0.40 s | 0.40 s or slower | stands |
+| 0.50 s or slower | anything | falls, always |
+
+The reference shipped **0.60 s and 1.00 s** — outside the window entirely. The
+move is momentum-dependent: too slow and the robot settles at each step instead
+of carrying through, and sits down. Every pose in that tail holds for 6 s;
+nothing about them was wrong. **Six chains ran against a tail that physically
+could not finish**, because the timings were taken from an unrelated open-loop
+test's ramp lengths instead of being measured. `LEGS` is now measured.
+
+**The gap waypoint was also an invention.** `rock_back` recorded pelvis 0.170 m —
+BELOW the `pike` it follows — because its numbers came from where a chain
+happened to collapse. Harmless while tracking was joint-only; as a body target
+it paid the robot to fall. It is now RECORDED: shove `fold` forward and it
+crosses the whole 0.300-0.517 band in **0.12 s on its feet alone**, and the
+state at the middle of that crossing (pelvis 0.377, trunk folded horizontal,
+u +0.05) is the waypoint. The table is monotone for the first time.
+
+**Chain 4** ran the corrected economy over 7 rungs, starting AT `rock_back` —
+the reverse curriculum with a real rung at last, placed rather than settled
+because a transit state has no equilibrium to settle to. **Still +0 at every
+rung.** Four chains and ~9 M steps have not crossed `pike` -> `fold` once.
+
+#### The boundary, and what it rules out
+
+Walking the recorded fall and trying to recover from each state:
+
+**The last state that still stands is 0.08 s into the fall — trunk pitch 0.58 rad
+(33 deg), pelvis 0.521 m.** Beyond that nothing recovers, at rest or carrying the
+fall's own momentum. `rock_back` is at 87 deg.
+
+What has been tried against that band and failed: open-loop ramps at every
+timing from 0.08 s to 0.60 s (the pelvis never once rises above the pike's own
+height); CEM in two formulations, 100 samples x 20 iterations, from the settled
+state and from the gap state; an arm-driven push sweeping the shoulder through
+its 230 deg of travel; and **20x rated torque, which is bit-identical.**
+
+The ankle sits ON its ±0.35 rad stop through the whole fall while the hip and
+knee keep 0.35-0.49 rad of margin, which looked like the answer — pressing into
+a mechanical limit is exactly why more torque does nothing. **The causal test
+refutes it:** widening the ankle alone, to 0.50 / 0.70 / 0.90 / 1.20 rad, makes
+recovery WORSE at every point, because the looser ankle also destabilises
+`fold` and changes the fall. The ankle is on its stop and is not the cause.
+
+**Still open, and the honest statement of it:** every recovery measured so far
+is SCRIPTED and starts from REST. The gap is crossed in 0.12 s when falling, so
+the rise is a throw and not a lift, and a search that resets at the gap has
+thrown away the momentum that is the mechanism. That is the remaining untested
+shape.
+
+### Phase 3d — IT STANDS, and the delay is what made it ship-shaped  `[x] 2026-10-04`
+
+`teach-asimov_getup_ref-d17563-s1` — **the first standing result in this track.**
+
+From the `fold` waypoint (pelvis 0.517 m, on its feet, trunk 33 deg forward) the
+policy rises to **0.610 m at uprightness +1.00 on the feet alone** and holds the
+**full 7.76 s episode, 16/16 seeds**. Contract-preserving throughout: 78 obs /
+23 actions, `obs[6:9]` still zero.
+
+**And it is robust to the command delay, which took finding.** The chain before
+it scored `12/12 reached stand, median held 7.76 s` — both numbers true, both
+misleading alone. `reached stand` counts TOUCHING standing height, and the
+median hid a clean bimodal split that the per-episode spread exposed:
+
+| condition | episodes | held |
+|---|---|---|
+| WITH a one-step command delay | 5 | **1.3-2.0 s, falls** |
+| without | 11 | 7.76 s, full episode |
+
+Perfectly separated, no exceptions, **reproduced on two independently trained
+chains**, and isolated by forcing the delay on: 0/12 held. One control step is
+20 ms — the CAN-bus latency Menlo's own randomisation models — so that stand
+would not have survived the robot.
+
+The delay was ALREADY being sampled 50/50 in training and that was not enough.
+From a single 78-float frame the policy cannot tell which episode it is in —
+`last_action` is what it ASKED for, not what was applied — so it has to use one
+controller for both, and it settled on the one that is optimal at zero delay.
+Forcing the delay removes the choice. A controller with margin at 20 ms is
+stable at 0; the reverse is what had been failing.
+
+| | with 20 ms delay | without |
+|---|---|---|
+| trained at the inherited 50/50 | **0/12 hold** | 11/16 |
+| **trained with it forced** | **16/16 hold** | **16/16** |
+
+`force_lag` is recorded on the run, because a delay-robust policy and one
+trained without are not the same controller and nothing else in the file says
+which it is.
+
+**What is still not done.** Every rung below `fold` is **0/12**: `rock_back`,
+`pike`, `quadruped`, `draw_knees_in`, `plant_forearms` and both `prone` rungs.
+The `pike` -> `fold` transition remains uncrossed after five chains, so this is
+a robot that stands up from a deep forward crouch and not yet one that gets up
+off the floor.
+
+**Two engineering fixes the same session, both found by Jonathan looking at the
+screen rather than by any number I was printing:**
+
+* *"why is it floating?"* — episode resets placed the robot with `geom_rbound`,
+  a BOUNDING-SPHERE radius: `plant_forearms` floated **50 mm**, `prone` sat
+  **25 mm buried**. Now within 1 mm, from MuJoCo's own contact distances.
+* *"its going at 99 steps a sec, the computer throttling?"* — no: **37 % CPU**,
+  which is a trainer waiting. The reset I had added cost **655 ms, 24 steps'
+  worth**, against episodes of 6-100 steps, because it re-ran a deterministic
+  settle every episode across 32 envs. Cached: **14.4 ms, 46x faster**, and the
+  2.7 M-step chain that had taken hours now finishes in one sitting.
+
+### Phase 3f — the curriculum was eating its own first rung  `[x] 2026-10-04`
+
+Five chains read as "the hard transition is not being learned". Scoring **every
+stage from the SAME easy start** — `fold`, the one stage 1 can already do —
+showed something else:
+
+| stage | trained from | reaches standing | median hold |
+|---|---|---|---|
+| s1 | `fold` | 12/12 | **7.76 s** |
+| s2 | `rock_back` | 12/12 | 3.30 s |
+| s3 | `pike` | 12/12 | **0.44 s** |
+| s4 | `quadruped` | 12/12 | 0.32 s |
+| s5 | `draw_knees_in` | 12/12 | 0.32 s |
+| s6 | `plant_forearms` | 12/12 | 0.18 s |
+| s8 | `prone` | 12/12 | **0.24 s** |
+
+It never forgot how to REACH standing — 12/12 at every stage. It forgot how to
+STAY there: **a 94 % collapse by the third rung**, never recovered, and a 2.7 M
+step chain ending on a quarter of a second.
+
+Each rung warm-started from the last and trained ONLY on its own, harder start,
+so after stage 1 the policy never practised standing again. Catastrophic
+forgetting — and invisible in the per-rung scores, because every rung is scored
+at its OWN start, where it genuinely is improving. Part of what was being read
+as "the gap is hard" was "the policy no longer knows how to stand".
+
+**The fix.** A rung is a SET of start states, not one: each stage keeps every
+start it has already learned and adds the new one, drawn per episode.
+
+```
+fold -> fold,rock_back -> fold,rock_back,pike -> ... -> ...,prone
+```
+
+Start states are cached per rung so the extra ones cost nothing, and
+`test_the_curriculum_starts_at_the_one_unverified_leg` now asserts the sets are
+strictly growing — a rung that drops a start it already learned fails.
+
+**The measurement that found it is the transferable part:** score every stage at
+a FIXED early start, not only at its own. No per-rung metric would ever have
+shown this, because each rung looks fine where it is measured.
+
+### Phase 3e — the `pike` -> `fold` gap: everything ruled out so far  `[x] 2026-10-06 — SUPERSEDED by 3g`
+
+Retained as a ledger of what the AUTHORED route ruled out. Its conclusion — that
+the robot cannot do this — was wrong, and Phase 3g says why: the obstacle was the
+route and three harness bugs, not the machine. Every row below is still a real
+causal test of the authored route.
+
+The stand works and ships. The get-up does not, and this is the ledger — every
+row a causal test, not a guess, so the next person does not repeat one.
+
+| hypothesis | test | verdict |
+|---|---|---|
+| not enough torque | scale the motors 1x -> 20x on a motion-demanding command | **bit-identical at every scale** |
+| the reward | failure state paid 8.14/10 for lying face down | real, fixed (0.91) |
+| the tail could not finish | timing scan | real, fixed (0.25 s legs, stands) |
+| the gap waypoint was invented | it recorded 0.170 m, BELOW the pike | real, replaced with a recorded state |
+| the observation is too thin | 5-frame history vs 1, matched steps | **null — identical waypoint for waypoint** |
+| their joint ranges are wider | `soft_joint_pos_limit_factor: 0.9` in Menlo's `env.yaml` | ruled out |
+| `ankle_pitch` range | widen 20 deg -> 69 deg, alone | **worse** |
+| `hip_pitch` range | widen 90 deg -> 160 deg, alone | `com - foot` unchanged to 3 d.p. |
+| an assist force | 0 -> 0.8 g upward on the pelvis | **worse** — it unloads the feet |
+| floor friction | checked | 1.2 slide, fine |
+| a half-kneel / lunge | 18 variants | all topple — `ankle_roll` is ±0.10 rad, no lateral authority |
+| walking the feet in | six unload-draw-replant cycles | the feet move **backward**; `com - foot` pinned at 0.56 |
+| a rocking get-up from supine | 5 variants, tuck/swing/plant | peak pelvis 0.124 m from a 0.112 start |
+| arms swung BACK as a counterweight | sweep shoulder to +0.85 | nothing; it pushes the body FORWARD |
+| arms swept FORWARD (the sign was wrong) | sweep shoulder to -3.05 | **the right direction** — `com - foot` 0.618 -> 0.519 — and a fifth of what is needed |
+| trajectory search | CEM, two formulations, 120x25 | best was a SOMERSAULT until the objective required a foot on the floor; then nothing |
+| MPPI from the three floor rungs | 30 iters x 400 samples x 100 steps, sigma 1.6 | **null, and the null is not evidence** — see below |
+| the action clip was ours, not theirs | 4.0 -> 13.0, the whole joint range commandable | **worse** — `fold` stopped holding (0.242 m at u -0.43 vs 0.517 / +0.83) |
+
+**MPPI, and why its nulls prove nothing (2026-10-04).** `rock_back`, `pike` and
+`quadruped` all came back "never lifted", two of them with a PEAK BELOW THE
+START, and `pike`'s best score (0.163) below its own starting score (0.206) — a
+search that cannot match standing still. The control nobody had run says why:
+**action 0 commands STANDING**, because the contract is
+`ctrl = DEFAULT_POSE + 0.25 * action` with `use_default_offset: true`. At the
+pike that is up to 1.649 rad (95 deg) from the joint the reset just settled, so
+every episode opens with the servos yanking the whole body toward standing, and
+MPPI's zero-centred initial mean searched inside that lunge. Its nulls describe
+the harness, not the reachability.
+
+The same control deflates the positive result as well: **zero action from `fold`
+alone reaches 0.602 m**, against the trained policy's 0.610 and MPPI's "solved"
+0.664. `fold` -> stand moves TOWARD the default pose, which is where the action
+space already points, so it was never evidence that the optimiser works.
+
+**The clip was a real defect and not the blocker.** `RobotSpec.action_clip`
+defaults to the DUCK's 4.0 while Menlo publish `clip_actions: null`, so this
+robot could only ask for +/-1.000 rad from standing: 76 % of its joint range on
+average, 32 % on a wrist, and six of the nine waypoints out of reach on 2-6
+joints each. But `_joint_err` is a MEAN over 23 joints, so the cost is a
+0.02-0.04 rad floor and an 0.84-0.92 ceiling on the tracking term — a tax. And
+widening it to 13.0 (derived from `jnt_range`, so the whole physically reachable
+set is commandable) made `fold` stop holding, because every verified hold and the
+one working transition were measured on the CLIPPED pose and the authored pose is
+a different, unstable one. Reverted; the numbers are pinned by
+`test_every_waypoint_is_commandable_enough_to_track`. **The open-loop chain dies
+at `rock_back` under BOTH clips** — which is the one line of this entry that
+points anywhere: the route past the pike is the problem, not the reach.
+
+**The warm start, and the 7071x amplifier under it (2026-10-04).** The thing six
+chains were actually fighting is that **action 0 commands STANDING**
+(`ctrl = DEFAULT_POSE + 0.25 * action`, `use_default_offset: true`), so on the
+floor every rollout opens as a lunge. 2 s of action 0 collapses every rung to
+z 0.009 and earns 0.20-0.56 of the tracking term, where each rung's own holding
+action earns 0.77-0.93. The holding action was never hidden: `jpos` is in
+observation slots 9-31, so it is `obs[9:32] / ACTION_SCALE` under the slot
+permutation — one layer, never found by PPO from a zero-mean init.
+
+Cloned as an ONNX teacher (`scripts/make_hold_teacher.py`) it took three tries,
+and each failure is recorded in that file:
+
+| teacher | mean \|da\| per joint/step | `action_rate_penalty` |
+|---|---|---|
+| command the CURRENT pose | — | ratchets to the floor, no stiffness |
+| snap to the nearest waypoint (hard `argmin`) | 1.60 | **-431** |
+| rate-limit through `OBS_LAST_ACTION` | teacher 0.001 / clone 1.80 | recursive, clone oscillates |
+| **softmax blend, tau 0.01** | teacher 0.001 / clone 1.15 | **still -277** |
+
+The last row is the finding. The teacher was smooth and the clone was not, three
+designs running, because `distill` writes `obs_rms.var = obs.var(axis=0) + 1e-8`
+and 14 of the 23 `last_action` slots are joints NO waypoint ever moves — action
+exactly 0 in every collected sample. Those slots land at exactly 1e-8, and
+`export_onnx` baked `1 / sqrt(1e-8 + 1e-8)` = **7071x** into the graph. The
+moment anything writes a real value there it arrives as a z-score of thousands
+and clips at `clip_obs`, so the network reads 100.0 on 14 of its 78 inputs.
+`train.py` HAD a guard for this — and tested `var < 1e-8` against the value
+`distill` writes, catching **0 of 16** slots. A strict `<` against the producer's
+own floor.
+
+Fixed in `OnnxWalkPolicy` (a dead slot passes through: 0 maps to 0 either way,
+so nothing that worked changes) and in the warm-start guard. Same weights,
+re-exported:
+
+| from | mean \|da\| | rate penalty | return |
+|---|---|---|---|
+| prone | 1.148 -> **0.019** | -276.9 -> **-1.2** | |
+| quadruped | 1.212 -> **0.002** | -295.5 -> **-2.5** | **+307** |
+| pike | 1.235 -> **0.006** | -286.0 -> **-1.9** | **+322** |
+
+For scale, the trained stand commands 0.055, and from `pike` the old best earned
+**0.0 track, 0.0 contact, return -0.2** by dying in 6 steps. The economy on the
+floor was never the reward's shape — it was that nothing survived long enough to
+be paid, and the one warm start that did survive was reading clipped garbage on
+a fifth of its inputs. **Every policy this repo exported from a clone carried
+that amplifier.**
+
+Also measured and NOT the cause: a 1.2 M-step fine-tune from the first (jerky)
+clone came back 1/16 at a 0.24 s hold against the staged chain's 7.76 s, because
+`initFrom` ALONE is a single flat run on all seven rungs — the chain wants
+`initFrom` + `startStage`, which `viz_server` documents as how a trick inherits
+a skill it cannot learn alone.
+
+**MPPI again, with the search centred where it should have been (2026-10-04).**
+Re-run from the `pike` with the sampling mean initialised to the action that
+HOLDS the pike rather than to zeros — 300 samples x 15 iterations, 2.0 s horizon.
+The search is now demonstrably working: the robot stays at the pike (ends
+0.260 m against the old run's 0.076) and the best score climbs monotonically,
+0.121 -> 0.129 -> 0.134 -> 0.140. And the answer is the same:
+
+    pelvis 0.263 -> peak 0.267 -> end 0.260   u end -0.46
+    VERDICT: never lifted
+
+**4 mm of peak in 2 s from 4500 rollouts.** The earlier nulls were void because
+a zero-centred mean searches inside a lunge; this one is not void, and it says
+the same thing, which is what makes it worth recording. Note the best score
+(0.140) still ends BELOW the start's (0.206): height is held and uprightness
+decays -0.37 -> -0.46, so what the optimiser finds is a slightly worse pike.
+
+What it does NOT settle: the horizon is 2.0 s and MPPI is still a local
+optimiser that cannot plan through a contact-mode change — the same limitation
+already recorded for CEM below. A contact-implicit method remains the open
+suggestion.
+
+**Two unrelated optimisers agree on 4 mm (2026-10-04).** The last thing the gap
+had not been given is a healthy economy AT the pike. Every one of the eight
+chains trained that rung while the policy collapsed on arrival — from `pike` the
+best of them earned **0.0 track, 0.0 contact, return -0.2**, dying in 6 steps.
+After the warm start and the exporter fix a policy HOLDS the pike and earns
++322 an episode, so the rung was retrained under that condition: 900k steps
+warm-started from `1039ef-s8`, `start_phase` restricted to `pike,quadruped`
+(`teach-asimov_getup_ref-290702`). Final terms `track 696, contact 392,
+advance 30, up 0.0, action_rate -26`, `ep_rew 380` — a dense, positive,
+well-scaled objective, which is what nine previous attempts did not have.
+
+The pike peak went **0.298 -> 0.302 m**. Four millimetres. A hold-centred MPPI
+found **4 mm** from 4500 rollouts on the same rung. A gradient method with 900k
+steps and a sampling method with a fair baseline, agreeing to the millimetre, is
+the strongest statement this ledger has about the pike route: it is not
+under-trained, under-paid, or badly initialised. It does not lift.
+
+**And it cost the stand**, which is the other half of the lesson. Restricting the
+start set removed the rehearsal, so the policy forgot everything it was not
+practising: `fold`'s stand **7.40 s -> 0.00 s**, `plant_forearms` 0.250 -> 0.163,
+`draw_knees_in` 0.266 -> 0.210. "A curriculum must rehearse" was already written
+down here, and this is the measured cost of setting it aside for one experiment.
+`1039ef-s8` stays the pick.
+
+**READ THIS BEFORE THE STRUCTURAL ENTRIES BELOW — THE GET-UP IS POSSIBLE AND HAS
+BEEN DONE (2026-10-04).** Jonathan asked the obvious question — "you would make a
+robot that can't stand up?" — and checking the sources rather than our own
+measurements settles it two ways.
+
+**Menlo themselves do not claim a get-up.** Their operating guide
+(docs.menlo.ai/asimov/1/operate/drive/stand-up) is Damp -> Stand -> Walk with
+the robot "hanging from its gantry hook with both feet flat on a clear, level
+floor", "keep the robot supported until it is in Walk", and "never damp a
+free-standing robot — it falls". No fall recovery anywhere. So the niche is real.
+
+**But a third party has already done it on the STOCK model.**
+`openhorizon-labs/asimov1-getup-safefall` on Hugging Face: PPO in mjlab (MuJoCo
+Warp) on "Menlo's `asimov-1/sim-model` MJCF" with no structural changes, get-up
+from "any fallen posture (back, front, side, sitting, kneeling)", **99.8 %
+success, 1.70 s median (p90 2.92 s)**, cross-checked on a "second engine (CPU
+MuJoCo)" — which is the engine this repo uses. Simulation only; it has never run
+on hardware. Its observation is **[1, 375]: the last FIVE frames stacked**, and
+its actions are the same 23 joint offsets. That is what breaks the 78-float
+deployment contract, and it is the only thing that does.
+
+**So the structural entries below are wrong where they conclude impossibility,
+and right only about STAGING.** "There is no equilibrium between `quadruped` and
+`fold`" is a correct measurement and a false premise: a 1.70 s get-up is a
+DYNAMIC motion that never stands still, so it does not need an intermediate
+state to hold. Every conclusion here of the form "no rung can be inserted,
+therefore the transition is closed" assumed a staged, quasi-static route.
+Reading "the pike does not lift" as "the robot cannot rise" was the error, and
+all the optimiser nulls are nulls about the pike ROUTE, not about the task.
+
+**What the comparison actually says is scale and method, not physics:**
+
+| | ours | theirs |
+|---|---|---|
+| steps | ~3 M per chain | mjlab on GPU, orders of magnitude more |
+| observation | 78, ONE frame | 375, five frames stacked |
+| reward | tracking an authored reference through a pike | a direct get-up |
+| route | staged, hand-authored waypoints | none |
+
+The history control recorded above ("5 frames == 1, waypoint for waypoint,
+NULL") was run inside the reference-tracking curriculum on the pike route — a
+formulation we now know does not work for either arm — so it does not transfer.
+**Re-run it in the direct formulation before concluding anything about the
+78-obs contract.** That, and not another search over the pike, is the next
+experiment.
+
+**THREE LADDERS, ONE REASON (2026-10-05).** Every attempt to stage the get-up
+has now failed, and the measurements say it is the same cause each time: the
+rungs are not holdable.
+
+| ladder | rungs from | 6 s hold test |
+|---|---|---|
+| `blend_to_stand` | interpolating the fallen pose toward standing | alpha 0.8 is ONE-FOOTED (other foot 5 cm up), lands both feet only at height 0.885 / upright 0.83 — under the 0.90/0.90 gate — and is at 0.292 by t = 1.0 s WITH half its weight carried |
+| authored waypoints | hand-drafted poses | the pike holds, but its trunk reaches 98 deg against the 50 deg the trained stand recovers from |
+| **fall states** (`asimov_getup.fall_ladder`) | pushing the robot over and sampling the trajectory | **every rung collapses to 0.005-0.007 m within 1 s**, commanded to its own pose |
+
+The fall ladder was built on the premise that a rung does not need to be stable,
+only REACHABLE, and that a get-up is a fall backwards. The premise is wrong, and
+the 6 s test is what shows it: a fall trajectory consists of the states the robot
+is FALLING THROUGH. Reaching one going down says nothing about holding it going
+up — contact and dissipation are not time-reversible. Trained from `fall_7`
+(trunk 0.589, 11 deg of tilt, both feet, zero velocity) the episode length sat at
+**31 steps for 835 k steps** of PPO: 0.62 s, exactly the time it takes to fall.
+
+What survives all three: the only holdable states below standing are the seven at
+trunk 0.516-0.606, every one at the `ankle_pitch` limit. **There is exactly one
+usable rung below standing and it is `fold`.** A staged curriculum below it
+cannot be built, because there is nothing to stage ON. The get-up has to be a
+single dynamic move from the floor into `fold`'s basin, which is what six
+independent optimisers have failed to find — and which is consistent with the one
+policy known to work doing it in 1.70 s.
+
+**`fold` IS THE FLOOR OF THE STANDABLE REGION (2026-10-04, corrected).**
+Searching leg configurations placed and commanded to their own pose, judged on
+the PHYSICS for 6 s with no episode rules in the loop:
+
+| bar | passes |
+|---|---|
+| 1.2 s, feet-only, upright > 0.5 | 54 of 945 |
+| **6 s** | **7** — lowest at trunk **0.516 m** |
+
+Every one of the seven sits at `ankle_pitch` **-0.35, the joint limit**, and
+0.516 / 0.639 = **81 % of standing** — exactly the figure
+`.claude/skills/add-a-robot/SKILL.md` already published ("a +/-0.35 rad ankle
+means it cannot squat below 81 % of standing"). The ankle range is the binding
+constraint and the number reproduces to the percent.
+
+**A FIRST VERSION OF THIS ENTRY WAS WRONG** and is worth keeping as the
+correction it is. It searched 700 poses with the root pitch FIXED AT 0, found
+only standing surviving 6 s, and concluded "no feet-only equilibrium exists
+below standing". The lowest equilibria need 14-40 deg of forward lean, so the
+grid could not contain them. The conclusion that SURVIVES is narrower and more
+useful: there is no equilibrium between `quadruped` (trunk 0.211) and `fold`
+(0.516) — a 0.31 m band with nothing standable in it — so a reverse curriculum
+still has no rung to insert, and `fold` works because it sits exactly on the
+floor of the standable region.
+
+Measured at the states the policy sees, every rung from `prone` to `rock_back`
+has elbows or knees down with `com - foot` 0.53-0.66, and then `fold` has zero
+non-foot contacts at 0.193. The get-up still has to leave a statically stable
+4-contact state and arrive, in one dynamic move, at >= 0.516 m on its feet.
+
+**The knee-rotation route is closed by 9 MILLIMETRES of ankle range.** The
+entry below suggested rotating up about the KNEES rather than planted feet. It
+does not work, and the reason is not what a first look said.
+
+NOT the reason: "the shin has no collision geometry". `ankle_pitch_link` is
+visual-only, but it is a short CONNECTOR in the ankle's pitch->roll cluster, not
+the shin — and the same pattern holds for `hip_roll`, `shoulder_pitch`,
+`shoulder_yaw`, `neck_yaw` and `wrist_yaw`, every one a stub inside a multi-DoF
+joint whose volume lies within its neighbours' hulls. Omitting their collision
+is ordinary practice, not a defect. The shin is `knee_link`, and it carries a
+capsule (r 0.04, half-length 0.09 at z -0.13) covering ~0.26 m of the 0.28 m
+segment. It can bear load.
+
+THE REASON: posed to kneel (hip 0, knee at its 1.5 rad limit), the lowest point
+of the **foot** sits at **+0.002 m** and the lowest point of the **shin** at
+**+0.011 m**. The foot is 9 mm lower, so the robot stands on its feet in what
+should be a kneel. `ankle_pitch` is limited to +/-0.35 rad (20 deg) against a
+human's ~50 deg of plantarflexion, so the foot cannot fold out of the way. The
+margin is nine millimetres of a hardware joint limit — which is Menlo's number,
+from the revision pinned because it aligned the ranges to the hardware.
+
+**And widening the ankle does NOT buy a kneel (counterfactual, 2026-10-04).**
+Asked directly, because 9 mm is a small margin. Stock `ankle_pitch` is
++/-0.35 rad (20 deg); the shin only becomes the lowest part of the leg at
+**0.90 rad (52 deg)** — foot 0.018, shin 0.002 — so roughly 2.6x the hardware
+range is needed before a kneel is even geometrically available.
+
+It still does not kneel. With the ankle at 0.90 rad, of 50 (thigh angle x trunk
+lean) combinations, 4 stay upright 1.2 s and **2 survive 6 s — both resting on
+the FEET, neither on the shins**. A kneel is reachable as a placement and
+collapses within a second under its own command: the support polygon is the
+shins, the mass is above the hips behind their front edge, and it tips.
+
+What the wider ankle DOES buy is squat depth: the lowest 6 s feet-only
+equilibrium moves from trunk **0.516 m to 0.477 m**. That is **39 mm of the
+305 mm gap** between `quadruped` (0.211) and the standable floor — so even a
+2.6x ankle does not make the gap reachable, which is the useful part of the
+answer. The ankle range sets how low this robot can stand, and it is not what is
+stopping the get-up.
+
+Nothing here is shippable: +/-0.35 rad is Menlo's number, from the revision
+pinned because it aligned the joint ranges to the hardware. This is a
+measurement of what the hardware would need, and the answer is "more than an
+ankle".
+
+A second artefact worth recording because it nearly became a finding: widening
+`geom_margin` to 0.02 m to see near-contacts also reports LINK-TO-LINK pairs,
+and `hip_pitch~hip_yaw` on each side sits permanently within 20 mm. Counting
+those as floor contacts read as "it sits on its hips". At that pose there are
+**zero** floor contacts. Filter contacts by `geom_bodyid == 0` before calling
+anything a ground contact.
+
+What the adjacent posture CAN do: from a heel-sit (feet and hips down, trunk
+vertical, trunk 0.52-0.54) the trained stand rises to **0.580 m at u +0.99 and
+holds** — but that pose is already at `fold`'s height, so it is a restatement of
+the rung that works, not a new one.
+
+**THE CLOSING MEASUREMENTS (2026-09-12), and they settle the item.**
+
+### Phase 3h — the stable set, and THREE retractions  `[x] 2026-10-07`
+
+Which poses between the floor and standing can this robot hold? Place a pose,
+command it, require the trunk still there 6 s later. Answered four times now,
+and the first three answers were artefacts of the sweep that produced them.
+
+| answer | feet floor | why it was wrong |
+|---|---|---|
+| "nothing holds below 0.516 m" | 0.516 | feet-only contact required, arms pinned |
+| "two plateaus, a 15 cm BALLISTIC gap" | 0.516 | four filter faults; retracted in the test file |
+| arm 0.146-0.440, feet 0.471-0.606, 31 mm gap | 0.471 | narrow stance only |
+| "arm 0.134-0.440, feet 0.399-0.606, **41 mm OVERLAP**" | 0.399 | **validated at an action clip of 13.0, which nothing trains or deploys at** |
+| **arm 0.134-0.280 (56), feet 0.416-0.606 (78), 136 mm GAP** | **0.416** | current — 134 rungs, built at the robot's own clip |
+
+**Retraction 2: `MIRRORED` was missing six stems.** `_search_rungs` builds
+every pose through `joints(...)`, and `hip_roll`/`hip_yaw` were not in the
+mirror tuple, so one value LEANED the robot (stance width unchanged at
+0.215 m, midline shifted +0.214) where it reads as a splay. Both sweeps
+therefore only ever searched a narrow, sagittal-plane stance, where the support
+set is a LINE. Auditing it found `shoulder_roll`, `shoulder_yaw`, `ankle_roll`
+and `wrist_yaw` missing too; `shoulder_roll` was provably broken, since
+`DEFAULT_POSE` holds it -0.050/+0.050 and passing it its own default moved the
+RIGHT shoulder. Every stem on this robot negates. The tuple is now all eleven
+and `test_MIRRORED_is_complete_rederived_from_the_model` re-derives it.
+
+**Retraction 3, and it is the one that cost a training run: the sweep
+certified rungs at a clip nothing uses.** `_search_rungs` hardcoded
+`action_clip=13.0` while every trainer and the deployment run at
+`RobotSpec.action_clip` (4.0). Of the 221 rungs it passed at 13.0, **only 82
+hold at 4.0**. `teach-asimov_getup_floor-cdd31c` then started its episodes on
+poses the policy physically cannot hold — all 64 of stage 2's rungs demanded
+more than its clip — and scored **0/36 from the floor at every one of its five
+stages**, identical to commanding nothing, with every per-stage training number
+improving the whole time.
+
+Raising the TRAINER to 13.0 is the wrong direction and was already tried and
+rejected on 2026-10-04 (the note by `asimov_walk.ACTION_SCALE`): it broke
+`fold`, which stopped holding at all, because every verified waypoint was
+measured as a CLIPPED pose. So the clip is the robot's everywhere, the search
+now derives it from the spec, and
+`test_no_curriculum_stage_starts_on_a_rung_its_own_clip_cannot_hold` fails if
+either half of that drifts again.
+
+**What survives, and it is the useful part.** The splay is worth MORE at the
+real clip, not less:
+
+| feet-only rungs | n | lowest |
+|---|---|---|
+| hips square | 7 | 0.529 m |
+| **splayed** | **71** | **0.416 m** |
+
+**113 mm**, against the 53 mm it looked worth at 13.0. Without the splay there
+is no feet-only pose below the crouch at all.
+
+**And it is cheap on hardware (phase 4, for this plateau).** Sampled at the
+PHYSICS step over all 78 feet rungs that hold: hip_roll peaks at a median
+**2 % of rated**, max 19 %, and **none exceeds rated** — against a walk
+baseline already running ankle_pitch, ankle_roll and shoulder_roll at 100 %.
+A wide stance is not what will stop this working on a real Asimov.
+
+**The generalisable lesson, now five times on this one task.** Every wrong
+answer came from an instrument that could not express, or did not match, the
+thing being asked about: root pitch pinned at 0, then feet-only contact
+required, then a 0.15 m height floor, then zero hip roll, now a clip the rest
+of the repo does not use. Four of the five were in code every version of the
+grid called.
+
+**Credit:** Jonathan asked why the robot never pushes off its arms, then
+whether the get-up could be staged the way a human does it, then — after the
+chain came back null — what we could do with everything learned. The third
+question is what sent the clip under a microscope.
+
+### Phase 3i — are the rungs TRAVERSABLE?  `[x] 2026-10-07`
+
+Measured at the robot's own clip, with a self-traverse control (ramp each rung
+to ITSELF) gating the result, because the first run of this was invalid: it
+used the default clip, under which 10 of 23 ladder rungs could not hold
+themselves, and every "break" was the clip.
+
+* **The arm plateau traverses open loop**: 0.136 -> 0.267 m, **7 consecutive
+  legs**, position servos only, no policy, at every tempo from 0.15 s to
+  0.90 s a leg.
+* **The handover never crosses**: 0.267A -> 0.417F breaks at all five tempos,
+  and so do three of the feet-plateau legs above it.
+* Joint-space distance does NOT predict the breaks (passing legs mean 3.83 rad
+  L1, breaking legs 4.32, fully overlapping), so the breaks are not an artefact
+  of which rungs the ladder picked.
+
+**So the bottom of the get-up needs no learning at all** — it is a scripted
+servo ramp — and the learning problem is the 136 mm handover plus the stand
+above it. An open-loop failure is not an untrainable one: the handover is
+dynamic, which is exactly what a policy is for and what a ramp cannot do.
+
+### Phase 3j — IT GETS UP EVERY TIME  `[x] 2026-10-07`
+
+`teach-asimov_getup_clip-79ef4d` (`--pick`), inside the 78-obs contract, one
+frame, 23 actions, 50 Hz. Scored by `verify_run` with observation noise and the
+action delay on, PAIRED against `teach-asimov_getup_clip-0e31e5` on the same
+288 episodes:
+
+| | 0e31e5 | **79ef4d** | discordant | exact two-sided p |
+|---|---|---|---|---|
+| **rose at all** | 278/288 (96.5 %) | **288/288 (100 %)** | **10 vs 0** | **0.0020** |
+| still up at the buzzer | 234/288 (81.3 %) | 243/288 (84.4 %) | 35 vs 26 | 0.31 — NULL |
+
+Zero action rises 0/288. **The rise is solved; the hold is not**, and that
+split is the whole result: the marginal numbers at 36 and 72 episodes said the
+opposite twice, and only the paired test at 288 separated them.
+
+**What actually moved it, and what did not.** Four things were fixed; one
+mattered for the score and the others for whether any result here is
+believable at all.
+
+* **The DAgger script drove every student rollout on an UNNORMALISED policy.**
+  `distill.fit` trains on the VecNormalize view and leaves the stats for
+  `export_onnx` to bake in; `PPO.load(...).predict(obs)` feeds the net raw
+  observations. Measured on 0e31e5, which stands 26/36 under `verify_run`:
+  raw **0/8**, `policy.onnx` **8/8**, PPO + the stats by hand **8/8**. So every
+  student state DAgger ever aggregated came from a policy that cannot stand,
+  which is the likeliest explanation for plain DAgger "hurting" — it had never
+  actually been tested on this task. `test_a_distilled_student_must_be_driven_
+  through_its_normalizer` pins it.
+* **The recipes did not pin the knobs the only working run used.**
+  `asimov_getup_clip` set neither the 13.0 action clip (the teacher exceeds
+  4.0 on 15.5 % of its frames) nor the 1-step command lag — and WITHOUT the
+  lag that same policy scores 15/36 instead of 26/36. A relaunch was silently
+  a different experiment. Both pinned now.
+* **The tracking reward's height term was two-sided and flat.** `dz` was
+  `abs()`, so a robot AHEAD of the demonstration was charged exactly as much
+  as one sagging below it — against AGENTS.md's own rule that body terms must
+  be one-sided — and `ROOT_Z_STD = 0.10` made a 2 cm sag cost 18 %. Both
+  fixed. **It is an honest bug fix and it was NOT the lever**: on its own it
+  scored 236/288 against 234/288, p = 0.90.
+* **4 M more steps on the fixed reward** is what carried the rise to 288/288,
+  and it did not collapse, where the same continuation on the unfixed reward
+  fell to 0/36 by 6 M.
+
+**The hold failure, diagnosed for the first time.** 59 of 72 episodes stand and
+then go down, and rendering it shows it is **not a topple**: the trunk drifts
+0.613 -> 0.452 m while uprightness stays above +0.95, over a full second. The
+servos are not the limit — during the sink the commanded knee climbs 0.383 ->
+0.645 rad and peak torque is **12.8 Nm against 45 rated**, with joint speeds
+under 0.8 rad/s. The reference is not asking for it either: it holds 0.619 m
+and knee 0.447 throughout. **The policy commands the sag**, and the reward let
+it: `up` is a boolean cliff paying nothing until the robot is already below the
+threshold, and `track` paid 6.75 -> 5.55 across the entire drift.
+
+**Two ideas retired with measurements rather than runs:**
+
+* **A worst-joint factor** would not help: worst-joint error after standing is
+  median 0.248 rad on episodes that HOLD and 0.237 on episodes that SINK. It
+  does not separate them, so any sigma costs reward everywhere and
+  discriminates nothing.
+* **Clips that start where it falls.** The teacher holds from the student's own
+  post-stand state in **89 of 89**, so those states are recoverable and the
+  supervision exists — but fine-tuning on a mixed clip set scored 49/72 against
+  55/72. A null.
+
+**Still open:** the hold. 45 of 288 episodes still rise and then sag, nothing
+here has run on an Asimov, and the sim2real evidence remains theirs.
+
+### Phase 3k — THE STAGED GET-UP, and the one leg left  `[~] 2026-10-08`
+
+**The result.** Hand the rising policy a settled `pike` and it stands
+**15/16**. Doing the whole thing itself from `prone` it stands **18/36**. The
+push-up that gets it there — `prone` -> `plant_forearms` -> `draw_knees_in` ->
+`quadruped` -> `pike` — plays OPEN LOOP on the position servos, no policy at
+all, at a **0.215 m** foot span the whole way. So the staged get-up Jonathan
+asked for in Phase 3 is not a compromise: it beats the end-to-end policy, and
+its floor half is safe by construction because nothing is learned there.
+
+**A number to retract.** "Rises 288/288" was summed across all EIGHT
+curriculum stages, including the ones that start upright. On the deliverable —
+from `prone`, deployment cuts only — `teach-asimov_getup_clip-79ef4d` rises
+**18/36**. Score at the horizon the deliverable is defined at.
+
+**Where it actually dies** (`scripts/where_it_fails.py`, 24 episodes):
+
+| furthest waypoint | episodes |
+|---|---|
+| `stand` | 13 |
+| **`rock_back`** | **8** |
+| earlier | 3 |
+
+and at the moment the trunk stops climbing, `left_ankle_pitch` is pinned
+against its stop in **17 of 24** episodes while actuator saturation appears in
+at most 3. **A joint-range wall, not a torque wall** — consistent with 3h's
+finding that more ankle range buys 56 mm and then saturates: the stop is not
+too close, the ROUTE is wrong.
+
+**What the staging does not fix yet.** Rendered, the policy throws the pike
+away — trunk 0.280 -> 0.094 m in under half a second — drops back to the floor
+and rises out of a **1.029 m** lunge. That lunge is the entire remaining
+problem, and it is now ONE leg with a proven narrow entry.
+
+**Two ways the narrowing was got wrong first.**
+
+1. *A flat cut is a wall, not a gradient.* `teach-asimov_getup_tidy-f4b58f`
+   trained under a 0.45 m span cut and scored **0/36** with `ep_len` **28
+   steps = 0.56 s** — every episode died on the sprawl before it was paid for
+   anything, and the span barely moved (0.919 vs the donor's 1.029).
+2. *`initFrom` cancels the curriculum.* `POST /teach {"initFrom": ...}` is a
+   fine-tune: ONE run under the **final** stage's env. Both `tidy` and the
+   first launch of `rise` therefore trained entirely at their tightest cut and
+   never saw their gentle first stage. **Send `startStage: 1` WITH `initFrom`**
+   to keep the chain and the donor. Verify by the run name: a chain writes
+   `…-s1`, a fine-tune writes one bare name.
+
+**The cut had to go, and the second failure says why.** Stage 1 of
+`teach-asimov_getup_rise-126f42` — pike start, imitation off, a SLACK 1.10 m
+cut — rises **16/16** and holds **14/16**, exactly the donor's 16/16 and
+14/16. So moving to a pike start and turning imitation off costs nothing.
+Stage 2 then cut at 0.85 m and **collapsed to the do-nothing floor**: the `up`
+term hit 0.0 at 98 k steps and never came back, `ep_len` climbed 28 -> 400,
+and the return settled at **35.5 against a zero-action 39.8**. The policy had
+not failed to narrow — it had correctly learned **not to stand**, because its
+own rise spans 0.99 m and every attempt therefore ended the episode.
+
+A termination is a cliff with no gradient at 0.99 m. The replacement is a
+CONTINUOUS charge — `span_cost` per metre above `span_target`, one-sided, off
+by default — with the hard cut kept at 1.30 m as a guard rail. It is priced
+off the measured economy, not chosen: the rise earns ~13.5 a step and doing
+nothing earns 0.1, and
+`test_the_span_charge_never_makes_lying_down_the_better_deal` fails the build
+if any stage's weight would make a wide stand worth less than the floor.
+
+**The first charged ladder is a NULL on the weight, not a finding about the
+robot.** All four stages of `teach-asimov_getup_rise-8cec81` rise **16/16**
+from the settled pike — the donor's own 16/16 — so the staged task costs
+nothing. The peak foot span did not move at all: **0.978 / 0.978 / 1.004 /
+0.991** against the donor's 0.989. But the charge was never material. At the
+heaviest weight (16) it cost **227 of 5700.7 an episode, 4.0 %**, because the
+robot is wide for only **38 steps of 400**: it peaks at 0.99 m for a moment
+and then stands at **0.366 m, BELOW the 0.40 m target**, so standing itself
+costs nothing. Nothing was pressured, so nothing moved, and "the width is
+load-bearing" remains unearned.
+
+`test_the_span_charge_never_makes_lying_down_the_better_deal` now prices the
+charge per EPISODE off that measured rollout and asserts BOTH directions — the
+heaviest stage must cost more than 10 % of income, and must still leave a rise
+worth more than lying down. It fails the 3-16 ladder for being unmeasurable
+and a 400 weight for eating its own task. The rebuilt ladder is **40 / 80 /
+140 / 200**, charging 17-84 %; at 238 the charge would exceed the whole income
+and lying down would be correct again.
+
+**The charged ladder, done properly: the width is PAID FOR, not habit.**
+`teach-asimov_getup_rise-53b0ae` charges 17-84 % of income — material, and
+measured to be so. The span barely moves and then the task breaks:
+
+| charge (% of income) | rose | up at the end | peak foot span |
+|---|---|---|---|
+| donor | 16/16 | 14/16 | 0.989 |
+| 40 (17 %) | 16/16 | 11/16 | 0.964 |
+| 80 (33 %) | 16/16 | 12/16 | 0.965 |
+| 140 (58 %) | 15/16 | 15/16 | 0.967 |
+| 200 (84 %) | **9/16** | **3/16** | **0.897** |
+
+The policy would rather surrender 84 % of its income than bring its feet
+inside 0.9 m. For THIS route the sprawl is load-bearing. It does **not**
+follow that no narrow route exists — this is gradient descent from a
+sprawling initialisation, so what it measures is the depth of a local
+optimum.
+
+**And open-loop trajectory search cannot settle the existence question.** Two
+CEM searches from the settled pike — 2560 MIRRORED candidates (narrow by
+construction) and 2560 asymmetric ones with the span charged — reached trunk
+0.193 m and 0.273 m, never upright. Both are **uninformative**, because the
+CONTROL fails: the same search with no width constraint at all, free to find
+the lunge, reaches only **0.132 m** where the trained policy reaches 0.62.
+It finds the lunge's WIDTH (1.017 m) and not its crossing. An open-loop
+4-knot trajectory has no feedback, and crossing a ballistic gap and then
+balancing is a closed-loop problem — "open-loop holds topple" is already on
+record for the duck and the G1. The existence question can only be answered
+by a controller, so a search that cannot stand is the wrong instrument.
+
+One earlier version of that search DID report a crossing — 0.615 m at a
+0.214 m span — and it was false: scored on peak trunk height, it had thrown
+its hips in the air and was lying on its elbows face down, `upright` **-0.61**,
+four contacts, none of them a stand. Score the held pose, weighted by
+uprightness, never the peak.
+
+**Known weakness, stated up front:** the sprawl is BRIEF. The robot peaks at
+0.99 m for a moment and then stands at ~0.37 m, so a per-step charge
+integrates to little — -48 an episode at `span_cost` 3.0 against an `up` term
+of 2646. If the span has not moved by the 16.0 stage, the next thing to try is
+a superlinear charge, not a bigger linear one.
+
+**Running:** `teach-asimov_getup_rise-53b0ae-s1` — from the settled `pike`,
+imitation OFF (the harvested clips are the teacher's and every one sprawls
+0.929 m, so tracking them while charging for span is a reward fighting
+itself), span CHARGE ratcheting 40 -> 80 -> 140 -> 200 against a 0.40 m stance,
+warm-started from
+the proven stage 1. The floor is priced: zero action returns **39.8** against
+the donor's **5422.8**, so the curve is measuring the rise.
+
+**Settles it:** rises from the settled pike in >= 15/16 with a peak foot span
+under 0.40 m, against the donor's 1.026 m.
+
+**Also fixed here:** `train_env_kwargs` did not record `start_rung`,
+`max_span`, `launch_span`, `fall_depth` or `free` on the `getup_clip` task —
+the FIFTH instance of a knob that trains while `run.json` says nothing — and
+pinned `action_clip` to a constant that OVERRODE the stage's own value.
+`test_every_knob_a_recipe_SETS_is_a_knob_the_run_RECORDS` now walks every
+recipe and names any knob whose value does not move the recorded dict, so the
+guard no longer depends on somebody remembering the knob's name. Four 🎓 chips
+also routed to the wrong recipe (or to none) because their own phrase was not
+among their keywords; `asimov_getup_floor` was swallowing the handover chip.
+
+### Phase 3m — WHY THE NARROW GET-UP DOES NOT CLOSE  `[x] 2026-10-09`
+
+**Both ends are solved; the middle needs the width.** `prone -> pike` plays
+open loop on the servos at a **0.215 m** foot span, and `fold -> stand` is
+**24/24 at 0.409 m** (`teach-asimov_getup_ref-3e895f-s8`, `--pick`) where
+zero action is 0/24 and the cloned teacher needs 1.03. Between them, trunk
+**0.10 -> 0.52 m**, nothing narrow works.
+
+**The bound, from the only data that crosses.** Across all 24
+demonstrations, peak foot span in that band: narrowest **0.917 m**, median
+0.929. Under 0.80 m: **0 of 24**. Under 0.40: **0 of 24**.
+
+> **⚠ SUPERSEDED 2026-10-12 — this is about the TEACHER, not the robot.**
+> `teach-asimov_getup_turn-540bc4` crosses the same 0.25-0.52 m band at a
+> median peak span of **0.392 m** — 23/24 under 0.80 m, 13/24 under 0.40 m —
+> and is NARROWEST (0.300 m) at 0.35-0.45 m, the middle of the supposedly
+> impossible band. Read these 0.917 m numbers as "nothing in that teacher's
+> data crossed narrow", never as a bound on the body. Phase 3n has the
+> per-bucket measurement; the wide moment is the LAUNCH at 0.10-0.18 m.
+
+**The mechanism, measured off the model.** The robot has **one** joint
+between pelvis and torso — `waist_yaw`, ±90° of TWIST and **zero bend** — so
+trunk pitch is pelvis pitch and only the hips can change it. At `pike` the
+CoM sits **560 mm ahead of the feet**. Three ways out, all closed:
+
+| route | measurement |
+|---|---|
+| rotate the body back over the feet | needs ~112°; hips+ankle supply far less |
+| step a foot forward under the mass | pelvis inverted → the leg swings **751-1095 mm INTO THE AIR** |
+| walk the hands back | CoM does not move — 553-572 mm at every shoulder angle |
+
+And any lift at the pelvis dangles the trunk: assist at 0.85 from `pike`
+reaches fold's HEIGHT at uprightness **-0.86**, and from the seat at
+**-0.62 to -0.81**, airborne both times.
+
+**Nothing is stable down there.** Of **1682** poses that settle onto both
+feet below 0.46 m, **0 hold for 6 s**.
+
+**What was tried and failed**, so nobody repeats it: span charged to 84 % of
+income (0.989 -> 0.897, then the rise broke); pelvis assist 0.0-1.5; a
+falling-state curriculum (indistinguishable from zero action); 5120
+open-loop trajectory searches (invalid — the unconstrained control failed
+too); training from `pike`, from every authored waypoint below `fold`, and
+from a settled seat at 0.107 m with and without a rotation reward.
+
+**Two instrument faults found by asking "are you sure?"** The `rotate`
+reward term paid **0.00 at a weight of 40** — its baseline latched onto the
+standing pose at construction and never reset per episode, so the experiment
+it existed for would have trained on nothing. And a quoted "the legs can
+only hold the trunk at 19.7° of lean" came from a 60-config sweep with ONE
+valid result; properly sampled it is 0.0°. Both are now pinned by tests that
+A/B against the original bug.
+
+**NOT proven impossible** — only that nothing here, and nothing in the
+teacher's data, does it under 0.917 m. The open options are hardware-shaped:
+ankle travel beyond ±20°, or a waist PITCH joint. Both are findings to send
+to Menlo, which was the point of the exercise.
+
+### Phase 3n — THE HOLD: it stands and stays, and the answer was ARCHITECTURAL  `[x] 2026-10-10`
+
+**What ships.** `teach-asimov_getup_turn-540bc4` (the s11 stage of
+`ASIMOV_GETUP_TURN`) **handing off to Menlo's own shipped walk policy**
+(`asimov1-shipped`) the moment it is up and roughly settled. Scored by
+`scripts/getup_acceptance.py --handoff --episodes=200`, 200 supine starts:
+
+| gate | s11 + handoff | threshold |
+|---|---|---|
+| rises | **200/200** | >= 91.7 % |
+| stays (standing at the buzzer) | **180/200 (90 %)** | >= 83.3 % |
+| home_deg (mean joint err vs the idle pose) | **1.102 deg** | <= 10 |
+| home_max_deg (worst single joint) | **3.626 deg** | <= 20 |
+| jam_rad (median radians outside a limit) | **0.009** | <= 0.010 |
+| recovers (shoved episodes still up) | **0.994** — 180 of the 181 shoves | >= 0.75 |
+| span_m (median PEAK foot span) | 0.549 — **FAIL** | <= 0.40 |
+
+Six of seven. The one failure is discussed under "the span gate is suspect"
+below, and may be the wrong gate rather than the wrong policy.
+
+**These are the 200-episode numbers; the 24-episode ones first published on
+2026-10-10 (20/24, span 0.589, recovers 1.00 on 20 shoves) were a noisier
+view of the same policy — see "the gate could not settle a comparison".**
+
+**"Reliably" had to be given a number before anything could be fixed.**
+Four separate asks for "more reliable" had produced four runs judged on
+different quantities. `scripts/getup_acceptance.py` is now the single gate:
+it builds each run's env from its OWN `replay_kwargs` (the train-loop rule),
+**pops `handoff_pay`** because a training terminal is not a deployment cut,
+and prints pass/fail per clause. `scripts/getup_pulse.py` +
+`.claude/skills/getup-pulse/` score the LIVE checkpoint mid-run against a
+priced zero-action floor, so a chain can be stopped at 1 M instead of 4 M.
+
+#### The two things that were wrong with "standing", both invisible to a pose test
+
+**It was HOPPING** (found by Jonathan, from the player, by saying he could
+not see it get up). 23/24 "stands" included **1.04 s airborne in 8 separate
+flights**, lowest geom of a 32 kg robot at **105 mm** of clearance.
+`GROUND_ENV` charges per step for zero floor contacts. Full rule in
+`AGENTS.md`, "A stand is not a get-up".
+
+**It was never BALANCED.** While passing `standing_report` the CoM was
+outside its own support polygon **74 % of the time** (median -22 mm, p10
+-131 mm), and every lost stand ran the same way: uprightness steady at
+**+0.98** while the CoM-to-feet gap grew 200 -> 320 mm. Not a topple — a
+translation off the feet while vertical. `asimov_getup_ref.support_margin`
+(signed distance to the hull of MuJoCo's **contact points**) is the missing
+clause; `BALANCE_ENV` charges it, gated on already being up.
+
+#### Eleven runs, and what each one bought
+
+Nine of the eleven were negatives. They are listed so nobody pays for them
+twice — **but every verdict in this table was read off the 24-episode gate,
+which "the gate could not settle a comparison" below shows had 0.03 power at
+a 2-episode difference.** The large ones (13 -> 7, 13 -> 6, 0/12) are
+differences the gate could see; treat anything within a few episodes as
+unresolved rather than settled.
+
+| run | the change | outcome |
+|---|---|---|
+| `090c10` | + `push_bw 0.15` (random shoves once up) | **worse**: stays 13 -> 7, and 0.37 vs 0.68 at zero shove |
+| `0bac89` | + `calm_cost 10` charged for the whole hold | **worse**: 13 -> 6/24 — it priced the CORRECTIONS |
+| `854928` | `calm` windowed to the 1 s after arrival | 4/24 stays; home 10.98 deg |
+| `2d7bae` | per-joint `home` (mean of per-joint exponentials) | **arithmetically wrong**: one 50 deg joint scores BETTER (9.57) than the same error spread over many (8.27). Reverted |
+| `8af71b` `421fd5` `77a21e` | `swing_pay` 2 / 40 / 40, product-with-rising, then per-step budget | farmed (1807/episode by waving while flat), then unlearnable, then saturated on random flailing |
+| `020e20` `a14685` | `ground`/`limit` **re-priced** 6 -> 1.4 and 50 -> 3.7 | the weights had been sized on s10, where the behaviour was already clean, and were 10-100x too big on this parent |
+| `b6263c` | monotone sweep amplitude only | 100.5 deg sweep, **0/12 rises** |
+| `453237` | `handoff_pay 14` | ties s11 — but see the confound below |
+
+**Seven of those nine warm-started from `9697b8-s5`, which rises 0 of 12.**
+That is the from-scratch chain's stage 5, not s11. A warm start from a parent
+that cannot do the task cannot measure an addition to the task, so their
+`rises 0/12` is the parent's number, not the term's. What the one clean
+comparison in that set does say: `540bc4` sweeps **101.8 deg** and rises
+**12/12**; `a14685` sweeps **100.5 deg** and rises **0/12** — the same sweep,
+opposite outcomes. **A paid swing term buys no sweep beyond the 101.8 deg the
+working policy already uses**, which is the measured answer to "is the arm
+swing unpaid?": it is not unpaid, it is already there.
+
+#### THE ANSWER: hand off, do not train the hold
+
+The causal chain, measured: the rise arrives at the top at **0.89 m/s** of
+trunk speed, against a *passive* stance that absorbs **0.22**. The ankles
+saturate at their +-20 deg stops, the arms become load-bearing (forcing them
+to neutral took 13/24 -> **0/24**), eight joints sit outside their limits.
+No per-step charge fixes that, because the arriving momentum is the rise.
+
+So stop asking the get-up to be a balance controller and give the robot to
+one. `HANDOFF_ENV` pays a terminal bonus for arriving in a state the shipped
+walker **catches**, and the lab/renderer switch policies there for real
+(`Behavior.handoff_fn` / `handoff_policy`). Tuned in the lab's own env with
+`domain_rand` ON, **earlier is better** — 0.60 m/s and 4 steps of dwell gives
+**22/24** — because a walker is an ACTIVE controller and the 0.22 m/s ceiling
+was measured on a passive one.
+
+**The catch basin**, 128 handoffs, 97 caught: **trunk speed is the only
+strong separator (1.19 sd)**. Hence `HANDOFF_SPEED = 0.60`, `HANDOFF_DWELL =
+4`, and a score ramping 0 at 0.79 m/s to 1 at 0.20.
+
+#### The span gate is suspect
+
+Caught handoffs have **WIDER** feet (0.422 m) than dropped ones (0.345), so
+the 0.40 m `span_target` may be working against the only thing that makes the
+hold reliable. The gate currently measures the **peak** span during the rise
+(0.589-0.617); the **final stance** is 0.227-0.298 and passes comfortably.
+**Open, and it decides whether this is 6/7 or 7/7:** does "narrow" describe
+the stance it ends in, or the whole trajectory? Phase 3m's bound (nothing in
+the teacher's data crosses under 0.917 m) is about the FLOOR transit, which
+this policy does not use.
+
+#### Jonathan's two biomechanical ideas, measured
+
+- **"Swing its arms up as it stands"** — correct, and I got it wrong first:
+  I called it a flail from 6 rows of one seed. Measured properly (2120
+  samples), **symmetric shoulder swing is the top single correlate of rising,
+  +0.287**. It is also already happening: 101.8 deg of the 121 deg available.
+- **"Arms straight overhead while lying down, then swing them forward"** —
+  the kip is worth **+53 mm** of trunk height and turns uprightness -0.02 ->
+  +0.02, but **overhead is mechanically impossible**: driven against the
+  floor the shoulder jams at **71.4 deg**. My first measurement of this was
+  invalid because it teleported the arms to +-170 deg THROUGH the floor.
+
+#### Five instrument faults, all found today
+
+1. **`scripts/verify_run.py` was dead** — `NameError: _R` on every
+   invocation, so every stage of every chain had silently been judged on its
+   final checkpoint alone.
+2. **`getup_acceptance.py` scored every run in one hardcoded env**, breaking
+   the train-loop's first rule. Now per-run from `replay_kwargs`.
+3. **`jam_rad` compared a reward to an angle** — it read `_limit_charge()`,
+   which is scaled by 50. Now measured in radians directly.
+4. **The handoff-trained policy was first scored with its own TRAINING
+   terminal live**: `ep_len` 110 instead of 400, so the 4 s shove landed in
+   only 4/24 episodes. Score at the deliverable's horizon with only the
+   deployment's cuts.
+5. **The lab reported `running: True` for 16 minutes at 0 of 3,000,000
+   steps.** `getattr(self, "_prev_swing_z", <default>)` returns `None` when
+   the attribute EXISTS and is `None`, so `float - None` killed the trainer
+   on step 1. The unit test passed because it seeded the very value it was
+   checking.
+
+#### The duck-shaped lookup, three times in one day
+
+Three separate places asked a non-duck body a duck-shaped question, and all
+three failed SILENTLY or fatally rather than refusing:
+`env_kwargs_for_behavior` (a finished Asimov get-up re-seated in the WALK
+env — **28 behaviours across 4 bodies** affected), `handoff_fn` read off
+`env.behavior` (fired 0 of 1750 lab frames), and `handoff_recenter` read the
+same way (**ran the duck's 61-obs walker on the 78-obs Asimov and deleted
+the body from the stage**). The rule and the fix are in `AGENTS.md`.
+
+#### The gate could not settle a comparison — and nobody noticed for a day
+
+`scripts/getup_acceptance.py` scored **24 paired episodes** and printed seven
+pass/fail clauses, which reads as a decision procedure. Eleven runs were
+judged "beats s11" or "fails to beat s11" on it. An exact McNemar needs **6
+discordant pairs all in one direction** to reach p<=0.05; 24 episodes
+produced **4** (1-3, p = 0.625). Power to detect the 20/24-vs-22/24
+difference actually being asked about: **0.03**.
+
+| paired episodes | power at this effect size |
+|---|---|
+| 24 (the default all day) | 0.03 |
+| 48 | 0.18 |
+| 96 | 0.43 |
+| 200 | 0.80 |
+
+Re-run at 200, the `handoff_pay` comparison **changed sign**: 22-vs-20 for
+the new policy became 171-vs-180 for s11. So the earlier reading was not
+merely underpowered — its DIRECTION was an artifact. **A gate that answers
+"does this policy meet the bar" is not a gate that answers "is this policy
+better than that one"**, and the second question costs about an order of
+magnitude more episodes. The gate now takes `--episodes=N`, prints the
+discordant count it would have needed, and quotes the paired difference with
+its interval instead of a bare "null".
+
+#### THE MODE SWITCH COULD NOT SHIP — and now it can  `[x] 2026-10-11`
+
+The two-policy architecture rests on one predicate, and
+`_getup_handoff_due` asked `standing_report` (world-frame trunk height +
+MuJoCo's **contact list**) and `_trunk_speed` (world-frame **linear**
+velocity). An Asimov has none of the three: Menlo's 78-obs layout is gyro
+`[0:3]`, projected gravity `[3:6]`, command `[6:9]`, joint positions
+`[9:32]`, joint velocities `[32:55]`, last action `[55:78]` — **no linear
+velocity at all**. So the selector that makes the whole thing work was
+simulator-only, which defeats the point of staying inside their contract.
+
+**Uprightness alone looked like the answer and was a trap.** Over 15,458
+steps / 40 episodes (supine+prone), IMU uprightness separates standing from
+down at **4.58 sd** and reproduces the privileged test on **99.0 %** of
+frames — while trunk speed, the unobservable clause, is the WEAKEST
+separator at 0.75 sd, and 97.7 % of upright frames already satisfy it (the
+4-tick dwell does that clause's work). Scored end to end it cost **11 of 48
+rises** (48 -> 37, stays 42 -> 31), because the switch LATCHES: the 1 % of
+errors sit on the decision boundary, and one false fire hands a floored
+robot to the walker with no way back.
+
+**The frames that fool the IMU are not kneels.** Separated at 4.5-5.9 sd
+they are the robot **propped on its forearms with the ankles cocked**, torso
+already vertical, still pushing up — elbows **-0.38/-0.44 rad** against
+~0.00 when truly standing, `ankle_pitch` **-0.46/+0.75** against ~0.00.
+Knees do not make the top six. Both are encoder channels.
+
+**So the shippable switch is three channels**, with thresholds chosen on a
+COST rather than on agreement (a false fire loses the episode; a false miss
+costs 20 ms, so 10:1):
+
+```
+uprightness > 0.925  AND  |elbow| < 0.400  AND  |ankle_pitch| < 0.525,
+held 4 ticks                       (`getup_acceptance.obs_switch_due`)
+```
+
+false-UP **1.04 % -> 0.07 %** for false-DOWN 0.85 % -> 3.41 %, and
+*slightly worse* overall agreement (98.5 % vs 99.0 %) — which is the lesson:
+**agreement was the wrong objective for a latching switch.**
+
+Scored end to end against the privileged selector, 96 episodes with seeds
+20-95 out of sample (thresholds fitted on 0-19):
+
+| | privileged | deployable |
+|---|---|---|
+| rises | 96/96 | **96/96** |
+| stays | 85/96 | 82/96 |
+| recovers | 1.000 (85 shoves) | **1.000 (82 shoves)** |
+| span_m | 0.571 | 0.558 |
+
+`scripts/getup_acceptance.py --obs-switch`. The 3-episode `stays` gap is
+**unresolved** — only the marginals were captured, and 96 episodes gives
+~0.4 power at that effect size; the paired per-episode comparison is the
+outstanding work. Everything else is identical.
+
+#### PRONE IS SOLVED — and the fix was the AXIS, not the weight  `[x] 2026-10-13`
+
+`teach-asimov_getup_turn-967072` (`--pick`): s11's economy **plus
+`roll_pay=100`** on `POSE=supine,prone`, warm-started from `540bc4`. Scored
+48 episodes per posture with the handoff, paired on the same seeds:
+
+| | parent `540bc4` | **`967072`** | paired |
+|---|---|---|---|
+| PRONE rises | 12/48 | **47/48** | discordant **0-35**, p = 0.000 |
+| PRONE stays | 11/48 | **42/48** | discordant 1-32, p = 0.000 |
+| SUPINE rises | 48/48 | 48/48 | 0-0 |
+| SUPINE stays | 42/48 | 42/48 | 5-5, p = 1.000 — a real null, no forgetting |
+| reaches `f_z` >= 0.70 from prone | 6/24 | **24/24** | median `f_z` **+0.995** |
+
+**6 of 7 gate clauses pass on BOTH postures** (prone: home 1.029/3.213 deg,
+jam **0.009**, recovers 0.977 of 43 shoves; supine: 1.139/3.895, 0.009,
+1.000 of 42). The only failure is peak foot span, 0.541/0.548 — the same
+clause the old deliverable failed at 0.549, and the one the catch basin says
+is the wrong gate.
+
+**The one change that mattered was which axis gets paid.** `rotate_pay` pays
+UPRIGHTNESS, which is ~0 for prone, supine AND side alike — it is
+structurally blind to a roll, and that is why four earlier prone attempts
+were nulls. `roll_pay` pays **`f_z`**: the world-z component of the torso's
+FORWARD axis, the quantity Menlo's own `label_fallen_states` takes the argmax
+of, running -1 face down to +1 face up. Monotone best-so-far (a rate would be
+farmable by rocking, as `swing` was at 1807 an episode), with a small
+per-step `on_back` so a dynamic roll cannot overshoot back onto its face for
+free — `ROLL_HOLD_W` 0.02, priced so it pays ~400 over a supine stretch
+against standing's ~2,100 and so cannot teach the robot to lie down. At the
+0.5 it was first written as, it would have.
+
+**What made it findable**, in order, because none of it was a guess:
+1. Jonathan's push-back — "I can't believe they would make a robot like this"
+   — which overturned phase 3m's band bound (see the retraction above).
+2. The value of the roll, measured before authoring one: from a genuinely
+   supine pose the EXISTING policy stands **40/40**.
+3. The anchor, priced before the curriculum: **random actions reach supine
+   0/24 and zero action 0/24**, but the parent reaches it **6/24** — so the
+   roll is trainable only WARM-STARTED, never from scratch.
+4. The realisation that the parent's ~25 % prone successes already WERE
+   rolls (6/24 reaching supine against a ~25 % rise rate), so the term paid
+   a mechanism that already existed rather than inventing one.
+
+**And a sixth set-but-not-recorded bug, caught by the launcher.** The first
+launch sent `ROLL=100`, and `asimov_walk.train_env_kwargs` has a THIRD
+kwargs dict — the plain `getup` task's own — which had not been edited; the
+run recorded no `roll_pay` and trained the earlier posture-only null under a
+new name. `getup_launch.py` now **refuses** when a knob it sent is absent
+from `run.json`, instead of printing a readback and trusting someone to read
+it.
+
+#### Prone resisted THREE interventions before that — and why  `[x] 2026-10-11`
+
+The supine-trained pick, scored 48 episodes per posture (`--pose=`):
+**supine 48/48 rises, side_left 48/48, sitting 18/48, prone 12/48** — and
+prone is **220 of the 477** harvested poses, so roughly half the fall
+distribution recovers a quarter of the time. (side_left and sitting hold
+only **5** distinct poses, so those two resample 5 starts and are indicative
+only; supine 240 and prone 220 are the measurable classes.)
+
+| attempt | prone rises | paired verdict |
+|---|---|---|
+| the pick, supine-trained (`540bc4`) | 12/48 | — |
+| `POSE=supine,prone` (`b6188e`) | 13/48 | p = 1.000, 7 discordant — NULL with power |
+| + `ROTATE=200` (`d40841`) | 9/48 | p = 0.344, 10 discordant — NULL, point estimate WORSE |
+
+Neither harmed supine (48/48 throughout), so there is no catastrophic
+forgetting — the posture simply is not being learned.
+
+**What the route trace says, and it rules out the obvious explanation.**
+Of 48 prone episodes: **48/48 roll off the face into the side band, and
+0/48 ever gain height while face-down.** So phase 3m's mechanically-blocked
+push-up route is not what is happening and the `span` term is not the
+blocker. The 13 successes carry the roll to uprightness **+1.00** (peak
+trunk 0.632 m); the 35 failures **stall on their side at +0.17** (peak trunk
+0.187 m) and oscillate there until the episode ends.
+
+So the gap is one transition: **completing the roll from the side onto the
+back.** The stall state is visited EVERY episode, so it is sampled — yet the
+cache holds **5 side_left and 3 side_right** poses, so it is barely
+represented as a START state. The untried lever is therefore a curriculum
+one (re-harvest side poses; the harvester is `load_cache(..., rebuild=True)`)
+rather than another reward knob, and `rotate` — priced honestly on this
+parent at **+0.829 per unit** of success-vs-stall differential — already
+failed as the reward answer.
+
+**AND THE OPEN-LOOP PROBE SAYS THE ROUTE EXISTS**
+(`scripts/probe_prone_openloop.py`, 2026-10-12). The authored reference IS a
+prone get-up — its own `prone` waypoint note says a supine rise is impossible
+on this robot and "needs a ROLL to prone first" — and driven through the
+servos with **no policy at all**, from 40 harvested prone cache poses:
+
+| | |
+|---|---|
+| arrives at `pike` height (0.300 +-0.04 m) | **33/40** |
+| still at 0.300 m after a 6 s commanded hold | **0/40** |
+| **still off the floor after 6 s** | **39/40**, at ~0.253 m on both feet + both forearms |
+
+So prone is **not** a mechanical dead end and the four training nulls were not
+the robot refusing. Two corrections fall out of it:
+
+* **`pike`'s recorded `settled_z = 0.300` is a COLD-PLACEMENT number.** This
+  module verifies `equilibrium` waypoints by placing them fresh and holding;
+  ARRIVING there dynamically from prone settles ~40 mm lower and stays there
+  (control 0.293 -> 0.259, min 0.254; the 40 poses 0.289 -> 0.253). Same class
+  as the recorded "fold 0.517 is clip-4-cold only, 0.242 at the clip every run
+  uses". A drift to a lower STABLE pose is not a collapse, and the probe now
+  reports the two separately.
+* **The handover pose is therefore 0.253 m on feet+forearms, not `pike`.**
+  Anything trained to take over must be trained from THAT state — "train from
+  the task's own states", the rule the 7.5 M-step falling-cache run broke.
+
+**RETRACTED 2026-10-12 — the band bound this rested on does not hold.**
+I wrote up prone as blocked by the `pike -> fold` gap and "hardware-shaped",
+quoting phase 3m's *narrowest teacher crossing 0.917 m, 0 of 24 under 0.80 m*.
+Jonathan pushed back — "I can't believe they would make a robot like this" —
+and he was right. Measured on the WORKING supine policy, peak foot span **per
+trunk-height bucket**, get-up phase only, 24 rises:
+
+| trunk band (m) | peak span median | max |
+|---|---|---|
+| 0.10-0.18 | **0.524** | **1.061** |
+| 0.18-0.25 | 0.430 | 0.785 |
+| 0.25-0.35 | 0.369 | 0.435 |
+| **0.35-0.45** | **0.300** | 0.458 |
+| 0.45-0.52 | 0.359 | 0.466 |
+| 0.52-0.58 | 0.446 | 0.576 |
+
+The 0.25-0.52 m band is where this robot is **NARROWEST (0.300 m)**, and
+crossing it is routine: median 0.392 m in-band, **23/24 under 0.80 m and
+13/24 under 0.40 m** where phase 3m reported 0 of 24. That bound is a
+property of the distilled TEACHER's demonstrations leaving `pike`, not of the
+robot — and this repo's own separate finding, **"the sprawl IS the launch"**,
+already said the wide moment is the push off the floor (0.10-0.18 m), which
+these buckets confirm. Phase 3m's band claim contradicted it and the wrong
+one got propagated.
+
+**So prone is not hardware-blocked and no design finding should be sent to
+Menlo on this basis.** What the evidence supports instead: the scripted
+`pike` route is simply a BAD route, and four nulls were four attempts to make
+it work. The authored reference asserts a supine rise is impossible on this
+robot and that one must "ROLL to prone first" — and the trained policy
+falsifies that at **96/96 from supine**. So the untried fix for a face-down
+fall is the INVERSE of the authored premise: **roll prone -> supine, then run
+the route that already works.**
+
+**THE ROLL: its value is measured and large, but scripting it FAILED.**
+`scripts/probe_roll_to_supine.py` takes each harvested prone pose, turns the
+root 180 deg about the long axis, settles it, and scores the existing policy:
+
+| start | policy rises | stays | zero action |
+|---|---|---|---|
+| prone, as harvested | 8/40 | 7/40 | 0/40 |
+| the same poses, crudely ROLLED | **19/40** | 17/40 | 0/40 |
+| harvested supine (CONTROL) | **40/40** | 38/40 | 0/40 |
+
+A crude flip lands only **4/40 genuinely supine** (the rest settle back onto a
+front or a side, because the limbs are still in their prone configuration) and
+already doubles the rise rate. **A roll that truly delivers the robot onto its
+back is worth 40/40 with nothing retrained** — that is the payoff, measured.
+
+`scripts/search_prone_roll.py` then tried to AUTHOR one: a parameterised
+twist-and-push (the body allows no reach-across — `shoulder_roll` adducts only
+to zero), scanned over direction, waist twist, push, hip scissor, knee tuck,
+**tempo** and an optional wind-up. Best over 32 candidates x 6 poses:
+**1/6 onto the back** (tempo 0.30 s, roll left). Not a working roll.
+
+Two traps on the way, both already in this repo's ledger:
+* **The first scan returned 0/6 for all 32 candidates** — a uniform result
+  means the HOOK is dead, not that the variable does not matter. `ACTION_SCALE`
+  is 0.25 and the clip 4.0, so every target is capped at **+-1.0 rad from
+  `DEFAULT_POSE`**; the grid asked for waist 1.45 and shoulder 2.6 and all of
+  it collapsed to the same commanded motion. `reach()` now computes the
+  commandable box and the scan samples FRACTIONS of it.
+* **A quasi-static ramp cannot roll.** 1.6 s smoothstep to a held pose: 0/6.
+  Tempo matters (0.30 s is the best of 0.16/0.30/0.60/1.20) — "a reference has
+  a tempo" — though it only reaches 1/6.
+
+**So the roll is the right target and RL is the tool, not authoring.** It is a
+far better-posed problem than the four prone reward attempts: the goal state is
+cheap to detect (the body-axis classifier), the payoff behind it is measured at
+40/40, and the episode is short. A 32-point hand grid inside a 23-dim action
+space is not evidence that no roll exists — only that this family of five
+parameters does not contain one.
+
+**And the span gate is reading the get-up, not the walker** (checked because
+it would have been convenient otherwise): peak span 0.572 before the handoff
+against 0.459 after. The failing clause is the launch, which is a real thing
+about this motion.
+
+**The 7 that miss pike height are diagnosed, not merely counted:** all 7
+arrive too LOW (0.187-0.224 m), none overshoot, and **6 of 7 have the HEAD on
+the floor** alongside feet and forearms, where 29 of the 33 arrivals rest on
+feet+forearms only. A head-planted prone pose cannot clear itself with the
+authored push-up.
+
+**And scoring the probe is where it nearly went wrong:** judged on STANDING it
+called its own control a failure at peak trunk 0.301 m — which is `pike`'s
+0.300 m to a millimetre. `VERIFIED_THROUGH` is `pike`, not `stand`; the
+reference was never meant to stand, because the staged design is "servos push
+up, policy stands from pike" (15/16 vs 18/36 end to end). Judge a reference
+against the waypoint it is VERIFIED to, and read `VERIFIED_THROUGH` rather
+than assuming the last waypoint. Following it PAST that point drives the robot
+through unverified `rock_back`/`fold`/`stand` and back onto the floor, which
+is why the first run of this probe reported "final posture: prone" for all 40
+while peaking at pike height.
+
+**An instrument fault worth copying out:** `rotate` first measured as paying
+**0.000**, which looked exactly like the phase-3m baseline bug. It was the
+MEASUREMENT: calling `env._compute_reward()` a second time per step reads
+zero for every MONOTONE best-so-far term (`rotate`, `tuck`, `progress`),
+because they mutate their own baseline — while per-step terms (`stand`,
+`rise`) read fine, which is what made a working term look dead. **A stateful
+reward can only be read where it is summed** (`env.reward_sums`).
+
+#### What is still open
+
+- the span gate above — the only failing clause;
+- ~~the handoff retrain was never an isolated test~~ **— RUN, and it is a
+  NULL (`teach-asimov_getup_turn-f3f8b3`, 2026-10-10).** The first attempt
+  (`453237`) was confounded: `getup_launch.py` sends the COMPLETE knob set
+  defaulted OFF, so naming four knobs also turned OFF the four that MADE s11
+  (`ground 6, balance 40, home 30, limit 50`) — five knobs moved in an
+  experiment written up as one. Re-run with s11's exact economy plus
+  `handoff_pay 14`, at 200 paired episodes: **stays 171/200 against s11's
+  180/200**, discordant 27-18, p = 0.233, paired difference **+0.045 in s11's
+  favour, 95% CI -0.021…+0.111**. No evidence either way, and no reason to
+  switch. At 24 episodes the same pair read 22 vs 20 the OTHER way — see
+  below;
+- phase 4 (the hardware envelope) is untouched, and nothing here has run on
+  an Asimov.
+
+### Phase 3g — IT GETS UP  `[x] 2026-10-06`
+
+`teach-asimov_getup_clip-0e31e5` (`--pick`), inside the 78-obs contract, one
+frame, 23 actions, 50 Hz. Scored on the 24 harvested fallen starts x 3 seeds
+**with observation noise and the 20 ms action delay on**:
+
+| | rise | up at 8 s | median unbroken stand |
+|---|---|---|---|
+| the clone alone, no RL | 70/72 (97 %) | 11/72 (15 %) | 1.37 s |
+| + 3 M-step fine-tune | 66/72 (92 %) | **40/72 (56 %)** | **5.15 s** |
+
+The route: distil `openhorizon-labs/asimov1-getup-safefall` (Apache-2.0, proven
+in THIS repo's MuJoCo) onto our 78 floats, then fine-tune with PPO. Every
+earlier phase of this track failed on exploration — `standing` was never
+sampled, so its value was never learned. The clone reaches standing 24/24, which
+is what makes the warm start work where eight from-scratch chains did not.
+
+**What actually blocked it was three bugs of mine, none of them the robot.**
+
+| bug | how it read | the measurement that caught it |
+|---|---|---|
+| the collector never wrote `env.last_action`, so `obs[55:78]` was 0.0 in all 104 000 samples | best fidelity yet (0.000228 rad^2) and **0/24** get-ups | 23/24 with the slot zeroed, 0/24 with it live; normalizer var 1e-8 on 23 of 23 |
+| the per-env action clip reached only the reset pose, not `step` or the action space | the 13.0-vs-4.0 A/B was BYTE-IDENTICAL, written up as "the clip does not matter" | teacher exceeds 4.0 on 15.5 % of frames, 0.0 % past 13.0 |
+| `track` priced JOINTS ONLY | `ep_rew` 216 -> 2942 looked like learning; rise fell 24/24 -> 15/24 | a robot lying on the floor with the reference's joints scores **10.0 of 10.0**; doing nothing earned 2775 a episode against the riser's 788 |
+
+All three are guarded now: `distill.dead_slots` raises before training,
+`walk_env._act_clip` is one attribute behind all three clip sites, and `track`
+is a product of the joint match and the ROOT match (the demonstration stores all
+30 of `qpos` and the root was being discarded). Each guard was A/B'd against a
+planted regression.
+
+**Where the remaining 44 % goes, measured.** Action error on HELD-OUT teacher
+states, split at the stand: rise **0.000702** rad^2 (6.4x this repo's 0.00011
+"stops falling" bar), hold **0.000064** (under it). So the clone's hold is
+already faithful ON THE TEACHER'S STATES and fails on its OWN — it arrives
+standing in a configuration the teacher never visited. That is covariate shift
+located at the hold, which is why RL on the student's own distribution moved it
+15 % -> 56 % and why plain DAgger did not: mixing 73 k mostly-floor student
+states raised the aggregate MSE 0.000176 -> 0.000470 and the result tracked it
+(rise 24/24 -> 20/24). Targeted DAgger on post-stand states only is the untried
+version.
+
+**A 4 M-step continuation is a NULL** (`teach-asimov_getup_clip-8346d3`):
+44/72 vs 40/72 up at 8 s is 9-vs-5 discordant pairs on the same episodes, exact
+two-sided p = 0.424, paired hold difference +0.22 +/- 0.66 s. The marginal
+median moved 5.15 -> 6.67 s and disagrees with the paired test; the paired test
+is the one that counts. At 72 episodes this eval cannot resolve under ~15
+points, so more steps on this recipe is no longer a measurable lever.
+
+**Still open:** 44 % of starts rise and then topple; nothing here has run on an
+Asimov; and the sim2real evidence remains theirs, not ours.
+
+### Phase 3b — the first plan, SUPERSEDED  `[x] 2026-10-04`
+
+The original plan for this phase was Menlo's own recipe read off their write-up:
+thousands of fallen poses, a **fading assist force** early that is gone by the
+end, then weaker motors, rough ground and pushes; rewards favouring smooth
+motion and **penalising arm strain**. Four runs built on it (`be7733`, `08bdf5`,
+`990c5d`, `66ee20`) and the results are in the table above.
+
+Kept as a record rather than deleted, because two of its three ideas turned out
+to be right and one wrong, and which is which is the useful part:
+
+* **Fallen poses as the reset distribution: right**, and still what phase 3d
+  does.
+* **Penalising arm strain: right in spirit, wrong on this body.** The forearms
+  are LOAD-BEARING here and `quadruped` and `pike` cannot be reached without
+  them at 58–66 % of rated elbow torque. A penalty tuned to stop it "leaning on
+  the arms more than it needs to" was charging it for the only phase that
+  lifts it.
+* **The fading assist force: wrong, as applied.** It was a constant upward pull
+  on the pelvis for the whole episode, which changes the DYNAMICS the policy
+  learns in and reduces the normal force at the feet — making balance harder
+  while making rising easier — and the curriculum then stepped it to zero
+  between runs that warm-started from each other.
+
+Superseded by phase 3d, which trains against a reference instead of a reward.
+
+### Phase 4 — the hardware envelope  `[ ]`
+
+Peak torque per joint against rated, seconds at the clamp, joint-velocity
+peaks and ROM margin — sampled at the PHYSICS step, not the control step
+(`AGENTS.md`, "Measure the servos, not the score"). **Settles:** a get-up that
+never exceeds rated torque, against the walk baseline's three joints already
+at 100 %.
+
+### Phase 5 — the handoff  `[x] 2026-10-10 — IN SIM, and it is the LOAD-BEARING part`
+
+Get-up -> the shipped walk policy as one sequence, which is what makes it
+useful rather than a trick. **Settled:** `teach-asimov_getup_turn-540bc4`
+rises 200/200 and hands off to `asimov1-shipped`; **180 of 200** are still
+standing at the buzzer and **180 of the 181 shoves that land** are survived
+(a shove is applied only once the robot is actually up). It turned out not to be
+the packaging step but the ANSWER to phase 3n's hold problem — the rise
+arrives at 0.89 m/s and a passive stance absorbs 0.22, so the hold needs an
+active controller rather than another reward term. Read phase 3n first.
+
+### Phase 6 — package it the way they consume it  `[ ]`
+
+`policy.onnx` + `env.yaml` + `agent.yaml` in cyclotron's `--share` layout.
+**Settles:** it loads and runs in `cyclotron.sh --view <org>/<model>`, which
+is the gate the existing community get-up fails.
+
+### The honest constraint
+
+This is a hard exploration problem and this harness trains on a Mac CPU;
+upstream uses 4096 envs on an A6000. The mitigation is this repo's own
+doctrine — ladder the physics so the skill is cheap to FIND rather than
+burning samples on blind search — and if it still needs the real thing,
+phases 1-3 port to an mjlab cfg and retrain on the official stack. That is
+the same prototype-here, retrain-there path the README describes for the duck.

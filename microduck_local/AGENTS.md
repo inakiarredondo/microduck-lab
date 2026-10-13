@@ -185,7 +185,31 @@ does; this file covers how not to fool yourself.
   is a 0.2-weight preference, and a joint on its stop has its column
   dropped.
 
-## Launch training through the LAB, never straight from the CLI
+## If it MOVES the robot, it happens where he can SEE it
+
+**This rule says MOVES, not "trains", and the wording is the point.** It used
+to say "launch training through the lab", and on 2026-10-04 that let hours of
+work hide in plain background shells — CEM trajectory searches, timing scans,
+recovery sweeps, an assist-force study — every one of them stepping the physics
+for minutes at a time with nothing on the stage but finished runs lying on the
+floor. Jonathan asked twice why he could not see anything. None of it was
+"training", and all of it was the robot moving. **"It isn't training" is not an
+exemption.**
+
+| what you are doing | how it becomes visible |
+|---|---|
+| training a policy | `POST /teach` (below) |
+| a search, sweep or optimisation over motions | pose it as a `/teach` job if you can; otherwise cap it at a minute and **render the best candidate** with `render-rollout` before you report |
+| a one-off probe that prints numbers | fine unattended — but if the CONCLUSION is about motion, render it first |
+| a battery or paired A/B | the stated exception (`MICRODUCK_RUNS_DIR`) — say so out loud when you start |
+
+Two further things that are part of the same rule, both learned the hard way:
+
+* **Say where it is running, with the URL, as you start it** — not afterwards.
+* **A job that finishes inside one turn was never seen.** The lab reaps the
+  trainee the moment it ends, so a 30-minute chain launched and reported in the
+  same turn leaves an empty stage. Warn up front, and check back DURING the run
+  rather than only at the end.
 
 **A run started with a bare `uv run train-*` is invisible.** The human who
 asked for it cannot watch it, cannot see the reward breakdown move, cannot
@@ -283,14 +307,30 @@ of 63, and a base-locked policy measured 23.7 degrees of chassis turn instead
 of 0.3. The second and third of those happened AFTER the guard existed,
 because it covered some of the flags and read as covering all of them.
 
-### Eight ways a measurement here has lied, and the check for each
+### Nineteen ways a measurement here has lied, and the check for each
 
 The first four happened on 2026-09-25, in one session, to numbers that were
 then reported as findings; the fifth on 2026-09-28, and it cost a 48-seed
 battery; the sixth on 2026-09-29, and it survived one; the seventh was under
 all of them the whole time; the eighth was every number in this file agreeing
-while the robot was being damaged. None was a subtle statistical problem; each
-was an instrument that could not answer the question it was pointed at.
+while the robot was being damaged. **Nine to fourteen are from the Asimov
+get-up on 2026-10-05/06, where the three things actually blocking the task were
+all instrument faults and not the robot** — and where a clone with the best
+fidelity the robot had ever had scored 0 of 24. None was a subtle statistical
+problem; each was an instrument that could not answer the question it was
+pointed at.
+
+The thread through nine to fourteen, worth naming because it is the one that
+keeps recurring: **an instrument agrees with the half of the world it can see.**
+A loss computed on dead data, a reward priced on joints alone, a return summed
+over a length the policy controls, a median read instead of a paired
+difference — each was internally consistent and each was blind in exactly the
+place the failure lived.
+
+**Seventeen to nineteen are from the Asimov get-up's HOLD, on 2026-10-10**,
+and they share a different thread: **a scorer that cannot run, or runs the
+wrong world, reports neither an error nor a result — it reports the one
+number it could still compute.**
 
 **1. Measuring through your own reimplementation instead of the production
 path.** A probe built `MossPickEnv(...)` directly, so `MICRODUCK_MOSS_PICK_RUNG`
@@ -415,6 +455,180 @@ worse, because the stalls are CONTACT stalls: delaying the arm's arrival
 lengthens the window it spends pressed on the bin. Seconds at the clamp is what
 kills a servo, so both were rejected on their own measurement.
 
+**9. A loss computed on the same data that is broken cannot see the break.**
+A distillation harness stepped the physics by hand and never wrote
+`env.last_action`, so all 23 floats of `obs[55:78]` were exactly 0.0 in 104 000
+samples. The fit converged to **0.000228 rad²** — an 11.6x improvement, the best
+clone fidelity this robot has had — and the student stood **23/24** when driven
+with the slot still zeroed and **0/24** the moment it carried the real previous
+action, which is what the contract puts there. The loss was computed on the dead
+data too, so no number anywhere in training moved.
+→ *Diff the training data's per-slot variance against the deployed env's before
+blaming capacity or sample count.* `distill.dead_slots` raises on it now, with
+the slots that are flat on purpose declared by the caller. This is item 2's
+class, one layer deeper: there, a dead slot read as a legitimate zero; here, the
+OBJECTIVE was blind to it, which no amount of staring at the loss curve fixes.
+
+**10. A metric the policy can improve by stopping.** `ep_rew` climbed 216 → 2942
+and `ep_len` 33 → 223 across a 2 M-step fine-tune, which reads as textbook
+recovery. It was the policy learning to lie on the floor: the `track` reward
+priced JOINTS ONLY, so a fallen robot commanded `DEFAULT_POSE` — action 0, what
+an untrained network emits — straightens its legs, matches a STANDING reference
+joint for joint, and scored a perfect **10.0 of 10.0**. And because the fall cut
+is armed by `_stood`, a policy that never stands is never cut, so it banked the
+full episode: **2775 a episode against the riser's 788**. Standing was the only
+way to lose the rest of your episode.
+→ *Price the do-nothing policy before reading any training curve.* One
+zero-action rollout gives the number every curve has to beat; if it wins, the
+curve is measuring the economy and not the learning. And **check which outcomes
+your termination is asymmetric about** — a cut armed by success pays failure in
+episode length. (Both halves of this were already in this file: "ep_rew is a
+SUM" and the `_stood` arming rationale in `AsimovGetupEnv.step`. They were
+written down and still not applied, which is why they are repeated here as a
+procedure rather than a fact.)
+
+**11. A byte-identical A/B means the HOOK is dead, not that the variable does
+not matter.** A per-env action clip was plumbed at 13.0 against the body's 4.0
+and the two arms came out byte-identical. That was correctly called a dead hook
+and then incorrectly written up as "the clip is not the cause". It had never
+been applied: `walk_env.step` still clipped at `self.robot.action_clip`, and the
+gym action space is a THIRD site that SB3 clips to before `step` ever runs. The
+teacher being cloned exceeds 4.0 on 15.5 % of its frames.
+→ *Grep every site the variable is supposed to reach before concluding anything
+about the variable.* A knob with N enforcement points is N chances to be a
+no-op, and "this knob is dead" and "this variable has no effect" are different
+findings — only the first was measured.
+
+**12. A knob nothing reads trains a different experiment under the right
+name.** Three runs were launched with `env={"..._ASIMOV_GETUP_TOL": "0.90"}`.
+The real name has `TRACK_` in it, so all three trained at the recipe's default
+0.25 while being described, in writing, as 0.90 runs. `run.json` was the only
+place it showed.
+→ */teach refuses an unknown `MICRODUCK_*` key now and names the nearest real
+one.* For anything outside that path, read the knob back off `run.json` before
+describing a run — which is the whole reason `train_env_kwargs` exists.
+
+**13. A marginal median against a paired difference.** A 4 M-step continuation
+moved the median unbroken stand 5.15 → 6.67 s, which looks decisive. Paired on
+the SAME 72 episodes it was 9-vs-5 discordant pairs, exact two-sided
+**p = 0.424**, difference **+0.22 ± 0.66 s**. The distribution is bimodal, so a
+few episodes crossing the 8 s line moved the median a long way without moving
+the mean at all.
+→ *When both arms see the same episodes, compare them paired.* Marginal
+summaries of a bimodal outcome will disagree with the paired test, and the
+paired test is the one that counts. See also "How much can the benchmark
+actually resolve?" — at 72 episodes this eval cannot see under ~15 points, so
+"no difference" meant "no difference this instrument can resolve".
+
+**14. Evaluating under the curriculum's own cuts — and the diagnostic print
+itself.** Scoring a get-up while honouring the training env's terminations gave
+**12/24**; the same rollouts scored at the buzzer gave **23/24**. A cut fired in
+24 of 24 episodes at a median of step 352, mid-rise — `track_err` and the stall
+deadline are curriculum devices that do not exist on a robot. Separately, a
+first ablation changed three things at once (the dead slot, a 0/1-step action
+delay drawn per episode, and the terminations) and had to be redone as a clean
+2x2 before any of them could be attributed. And the claim "the demonstration is
+only 0.60 s long" — which nearly condemned the reference as truncated — came
+from printing `len(clip[0])`, the 30 qpos COLUMNS; the clips are 137-172 frames.
+→ *Score at the horizon the deliverable is defined at, with only the
+deployment's own cuts.* Change one thing per arm, and treat a diagnostic print
+as an instrument that needs checking like any other — it was my own output, not
+the code, that was wrong.
+
+**15. Scoring a policy on the distribution its TEACHER visits, and calling it
+the task.** This is the biggest one, because it was the session's headline. A
+get-up distilled from `openhorizon-labs/asimov1-getup-safefall` and fine-tuned
+scored **66/72 rise, 40/72 up at 8 s** and was written up as the task solved.
+Those 72 episodes were 24 fallen starts **harvested from the demonstration it
+was cloned from** — the states its own teacher's motion passes through. Driven
+through the FLOOR get-up instead, the same ONNX scores **17/36 rose, 8/36 up**,
+and the from-scratch chain that had been called a failure at 4/36 scores
+**20/36 rose, 4/36 up** on the same episodes: an 11-point gap under a 23-point
+resolution, which is a tie. Both beat zero action (0/36 rose, peak 0.134 m), so
+both rises are real and neither STAND is solved. Nothing was wrong with either
+measurement; they were measurements of two different tasks, compared as if they
+were one. The same fault in the verifier itself: guard 6 priced the do-nothing
+policy in the env a run RECORDED, and never on the floor-only deliverable it
+printed underneath — so in the training env (`start_rung='mix'`, which can
+begin an episode already on a plateau) doing nothing "rose" **13/36**, and a
+reader pairing the deliverable's 20/36 against that number would have concluded
+the rise was worth almost nothing.
+→ *Name the start distribution in every claim, and score the candidates through
+ONE env.* A number is only comparable to another number drawn from the same
+episodes. When a policy's evaluation set was built from its own teacher, it is
+measuring imitation, not the task. (And when the guard that would have caught
+this was finally added, it compared a gap in percentage POINTS against `_mde`'s
+PROPORTION — `56 < 0.23`, false for every possible gap including zero. It
+printed "resolution 0" and passed, which is exactly what a working guard looks
+like. **Both sides of a resolution comparison must be in the same units**, and
+a new guard gets planted against before it is believed.)
+
+**16. One trainer exported and the other did not, so half the bodies were
+invisible in the lab.** The palette lists a run only
+`if (run / "policy.onnx").exists()`. `train_behavior.py` (the duck tricks) has
+always ended with `export(out, out / "policy.onnx")`. `train.py` — the path
+every G1, MOSS, MARS and Asimov task takes — ended with
+`print("export with: uv run export-walk …")` and no export. So one trainer's
+runs appeared and the other's did not, and reaching one of the invisible ones
+meant guessing a directory name you had no way to see. Measured 2026-10-06,
+runs with a checkpoint and no export: **g1 52 of 91, moss 73 of 164**, every
+stage but the last of the Asimov get-up chains, and **0 of the duck tricks** —
+a family of 30 Asimov runs read as "5 runs", and the from-scratch get-up chain
+whose entire purpose was to be watched could not be put on the stage at all.
+
+That is a measurement fault and not only a UX one: **"what have we already
+tried?" was being answered off a 69 % sample** by a list that gave no sign it
+was filtering. Jonathan found it, not me, and the report was "how come these
+training runs didn't automatically show up in the list". What hid it from me
+for a whole session is that I only ever tested the DUCK path, which
+self-exports — the end-to-end run I used as proof did not touch the broken
+code at all.
+→ *When one of two siblings does something, ask why the other does not, and
+test BOTH.* A test on either trainer alone passes here. `train.py` now exports
+on a clean finish, guarded so a contract refusal cannot throw away finished
+training; `viz_server.start_export` also exports every stage as it finishes,
+off the sim loop, which covers the salvage path where the process dies AFTER
+writing its artefacts (the case that cost a 2.7 M-step chain). A chain exports
+per STAGE because `--pick` names the stage worth using, and on the G1 kick
+chain that was stage 3 of 4. `scripts/export_missing.py --match <name> | --all`
+backfills; two `hist5` runs were correctly refused, having trained at 390 obs
+(78 x 5 frames) outside the contract.
+
+**17. The per-checkpoint scorer had been dead for days, so every stage was
+judged on its last checkpoint alone.** `scripts/verify_run.py` exists to score
+EVERY checkpoint of a run against a priced zero-action floor — which is how a
+chain finds out that stage 3 of 4 was the good one (`--pick`). It raised
+`NameError: name '_R' is not defined` on every invocation: a module alias used
+in two scorer bodies and imported in neither. It ran as a stage of
+`scripts/watch_training.py`, printed its traceback into a log nobody re-read,
+and the acceptance script that ran AFTER it still printed a verdict — so the
+output always ended in a number and always looked complete.
+→ *A multi-stage report must fail the whole report, or print `SCORER DID NOT
+RUN` where the numbers would have been.* A traceback followed by a verdict
+reads as a verdict.
+
+**18. The policy was scored with its own TRAINING terminal still armed.**
+`handoff_pay` ends the episode the instant the robot reaches a handoff-ready
+state — correct in training, where the point is to pay for arriving there.
+Left in the EVAL env it cut `ep_len` from 400 to **110**, and the acceptance
+gate's 4-second shove then landed in only **4 of 24** episodes instead of 20.
+The run looked worse than its parent on recovery because three quarters of the
+recovery test never happened.
+→ *Score at the horizon the deliverable is defined at, with only the
+deployment's own cuts.* `getup_acceptance.py` now pops `handoff_pay` out of
+`replay_kwargs` explicitly, and names the reason in a comment, because the
+next training-only terminal will look just as innocent.
+
+**19. A gate compared a REWARD to an ANGLE and called the result radians.**
+The acceptance clause `jam_rad <= 0.010` was reading `_limit_charge()`, which
+is the per-step *charge* — joint excess multiplied by `limit_cost`, i.e. 50.
+Everything it judged was off by whatever weight that run happened to train
+with, so the same posture passed or failed depending on a knob that has
+nothing to do with posture.
+→ *A threshold in physical units must be fed a quantity in physical units, and
+the unit is worth asserting in the name AND the code.* If a scorer reaches into
+a reward function, it is measuring the economy, not the robot.
+
 **The habit that catches all of it: plant the regression.** Every test added
 that day was run against a deliberately broken version first — the axis
 coverage test against a front camera reporting nothing (0% at rung 2), the
@@ -491,6 +705,26 @@ until [ "$(curl -s localhost:8788/teach/status \
 do sleep 30; done
 ```
 
+**And `running: True` does not mean it is TRAINING.** The lab owns the
+subprocess, so it answers truthfully about the process — not about progress.
+On 2026-10-10 a run sat at **0 of 3,000,000 steps for 16 minutes** reporting
+`running: True`, because the env constructed fine and `step` raised on its
+first call in every episode (a per-episode baseline left at `None`, and
+`getattr(self, "_prev", 0.0)` returns `None` when the attribute EXISTS and is
+`None`). The vec env swallowed it into an endless reset loop; nothing was
+written to `progress.jsonl` at all.
+→ *Require `steps` to be INCREASING, not merely `running`.* `job.steps` is in
+the same payload, and a job that has not moved in two minutes is dead no
+matter what `running` says:
+
+```bash
+# is it ALIVE, or merely running?
+S=$(curl -s localhost:8788/teach/status | python3 -c 'import json,sys;print((json.load(sys.stdin).get("job") or {}).get("steps") or 0)')
+sleep 120
+T=$(curl -s localhost:8788/teach/status | python3 -c 'import json,sys;print((json.load(sys.stdin).get("job") or {}).get("steps") or 0)')
+[ "$T" -gt "$S" ] || echo "STALLED at $S — read runs/<name>/train.log"
+```
+
 The CLI trainers are for BATTERIES and A/Bs — paired-seed comparisons, sweeps,
 anything whose output is a number rather than a behaviour. Use
 `MICRODUCK_RUNS_DIR` for those so scratch runs stay out of the palette. If a
@@ -565,6 +799,31 @@ artifact has not been reported — write it into the record as well as the doc.
 Every rule below exists because it was broken on 2026-09-03 and cost a day
 of wrong conclusions. Two results were published from four-seed batteries
 and later reversed; several "measured off" verdicts turned out to be noise.
+
+**And it was broken again on 2026-10-10, across ELEVEN comparisons, by a gate
+that looked rigorous.** `scripts/getup_acceptance.py` scores 24 paired
+episodes and prints seven pass/fail clauses — which reads as a decision
+procedure, so eleven runs were judged "beats s11" or "fails to beat s11" on
+it. An exact McNemar needs **6 discordant pairs all in one direction** to
+reach p<=0.05; 24 episodes produced **4** (split 1-3, p = 0.625). Power to
+detect the 20/24-vs-22/24 difference actually being asked about: **0.03**.
+200 paired episodes gives 0.80.
+
+| paired episodes | power at this effect size |
+|---|---|
+| 24 (the default) | 0.03 |
+| 48 | 0.18 |
+| 96 | 0.43 |
+| 200 | 0.80 |
+
+So a whole day of "this helped" / "this did nothing" was read off an
+instrument blind to the effect, and nothing in its output said so. **Before
+a pass/fail gate is allowed to settle a COMPARISON, compute the smallest
+difference it can see** — the gate now prints how many discordant pairs its
+episode count would need, and takes `--episodes=N`. A gate that answers
+"does this policy meet the bar" is not automatically a gate that answers "is
+this policy better than that one", and the second question costs roughly an
+order of magnitude more episodes than the first.
 
 1. **Count the EVENTS, not the runs.** An 8-seed x 300 s 1v1 battery holds
    ~50-130 kicks but only ~20 goals and 3-8 FALLS. The same brain measured
@@ -1463,6 +1722,33 @@ redundant — a module that parses can still fail on a bad relative import.
    with an exactness test (`tests/test_eval_brain_jobs.py`); a battery you
    can shard is also a battery you can trust.
 
+
+8. **A borrowed robot's contract is proven by ITS policy, not by a test.**
+   When a body arrives with a shipped policy, the observation layout is
+   published and must be mirrored, not inferred — and the only evidence the
+   mirror is right is that their own policy walks HERE. A wrong permutation
+   still produces actions from the graph and the robot still moves; it just
+   falls over, and every number taken afterwards describes a different robot.
+   MEASURED on Asimov 1: `Menlo/asimov1-locomotion-0818` does 0.44 m/s at a
+   0.5 command and 0.68 at 0.8 in this repo's MuJoCo, deterministically, with
+   no falls on six commands — and the env reproduces the bare driver to
+   within spawn noise (4.21 m against 4.40 m). Two traps while measuring it,
+   both of which read as failures and were not: **wrapped yaw** (a 0.6 rad/s
+   turn held for 10 s is 4.79 rad, which prints as -1.49 and looks like a
+   stall) and **world-frame displacement under a randomised spawn yaw** (the
+   robot walked 4.26 m at 0.43 m/s in the wrong compass direction, which was
+   simply its own forward). Measure in the robot's own frame, and unwrap.
+   The full route is `.claude/skills/add-a-robot/SKILL.md`.
+
+9. **"Legged bodies topple open-loop" is a fact about the duck and the G1,
+   not about legs.** Both fall in about a second holding the default pose
+   through their servos, which is where the rule came from. Asimov 1 holds
+   it for 2 s with no policy at all (pelvis 0.639 -> 0.607, upright): 32 kg
+   on 150 N*m/rad servos in a statically stable bent-knee stance. The
+   generalisation was wrong, and a test asserting it fails on the next
+   robot — see `HOLDS_OPEN_LOOP` in `tests/test_body_conformance.py` and the
+   cost recorded there. Before reusing a fact about "a legged body", check
+   which bodies it was measured on.
 ## Adding a behavior (the main community extension point)
 
 1. Add a `Behavior` to the trick module it belongs in under
