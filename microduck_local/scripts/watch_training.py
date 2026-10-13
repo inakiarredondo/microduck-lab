@@ -108,16 +108,21 @@ def main() -> None:
     reports = (("stow_report.py",) if task == "stow"
                else ("pick_report.py", "reward_budget.py"))
     if str(task).startswith("getup"):
-        # The duck/MOSS reports do not know this env; `verify_run` is the
-        # report for it.
-        reports = ()
+        # The duck/MOSS reports do not know this env. `verify_run` prices the
+        # checkpoints; `getup_acceptance` is the GOAL GATE — rises, stays,
+        # comes home, no jam, narrow, and recovers from a shove no passive
+        # stance survives. Added 2026-10-10 after a whole day of launching,
+        # hand-polling and re-deriving these numbers by hand per stage,
+        # while this skill existed the entire time.
+        reports = ("getup_acceptance.py",)
     for script in reports:
         p = HERE / script
         if not p.is_file():
             continue
         print(f"----- {script} -----", flush=True)
-        subprocess.run(["uv", "run", "python", str(p),
-                        str(d / "policy.onnx"), str(SEEDS)],
+        argv = ([str(d.name)] if script == "getup_acceptance.py"
+                else [str(d / "policy.onnx"), str(SEEDS)])
+        subprocess.run(["uv", "run", "python", str(p), *argv],
                        cwd=HERE.parent, check=False)
         print(flush=True)
 

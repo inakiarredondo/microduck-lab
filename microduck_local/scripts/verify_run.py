@@ -133,6 +133,15 @@ def _score(onnx: Path | None, run: Path, episodes: int, deployment: bool,
     """Rise, hold and the cuts, for a policy or (onnx=None) for ZERO ACTION."""
     import onnxruntime as ort
 
+    # The ONE definition of a stand, imported HERE as well as in `_make_env`:
+    # it was only imported there, so every call to this function died on
+    # `NameError: _R` before scoring a single episode. The whole point of this
+    # script is that it scores EVERY checkpoint rather than just the final
+    # export — so while it was broken, every Asimov get-up stage was judged on
+    # its last checkpoint alone, which is the exact fault its own docstring
+    # warns about.
+    from microduck_local.robots import asimov_getup_ref as _R
+
     sess = (ort.InferenceSession(str(onnx), providers=["CPUExecutionProvider"])
             if onnx is not None else None)
     per_seed = max(1, episodes // len(seeds))
@@ -165,7 +174,8 @@ def _score(onnx: Path | None, run: Path, episodes: int, deployment: bool,
                 # The stand gate, off the MODEL's own standing height rather
                 # than a hard 0.55 — a number carried across bodies is a
                 # number that describes the wrong robot.
-                last = (z > 0.86 * stand_z) and (u > 0.85)
+                # the ONE definition — see asimov_getup_ref.standing_report
+                last = _R.is_standing(env)
                 cur = cur + 1 if last else 0
                 streak = max(streak, cur)
                 if (term or trunc) and not fired:
@@ -201,11 +211,19 @@ def _score(onnx: Path | None, run: Path, episodes: int, deployment: bool,
     }
 
 
-def _score_with(onnx: Path, run: Path, kwargs: dict, episodes: int,
+def _score_with(onnx: Path | None, run: Path, kwargs: dict, episodes: int,
                 seeds=(0, 1, 2)):
-    """`_score`, with the env kwargs given rather than read off the run."""
+    """`_score`, with the env kwargs given rather than read off the run.
+
+    `onnx=None` scores ZERO ACTION, the same way `_score` does. It had no such
+    path for a day, so the FLOOR-ONLY deliverable — the headline number this
+    whole script exists to protect — was the one number never priced against
+    doing nothing. Guard 6 was applied to the training env and not to the
+    deliverable, which is guard 6's own failure mode one level up.
+    """
     import onnxruntime as ort
 
+    from microduck_local.robots import asimov_getup_ref as _R
     from microduck_local.robots import spec as S
 
     rj = json.loads((run / "run.json").read_text())
@@ -214,26 +232,34 @@ def _score_with(onnx: Path, run: Path, kwargs: dict, episodes: int,
             or body.default_task)
     cls = body.env_class(task)
     kw = {k: v for k, v in kwargs.items() if v is not None and k != "task"}
-    sess = ort.InferenceSession(str(onnx), providers=["CPUExecutionProvider"])
+    sess = (ort.InferenceSession(str(onnx), providers=["CPUExecutionProvider"])
+            if onnx is not None else None)
     per = max(1, episodes // len(seeds))
     rose = buz = 0
     holds, peaks, n = [], [], 0
     for sd in seeds:
         env = cls(domain_rand=False, obs_noise=True, action_delay=True,
                   seed=sd, **kw)
+        stand_z = float(getattr(env, "_stand_z", None)
+                        or getattr(env, "stand_z", 0.639))
         for ep in range(per):
             obs, _ = env.reset(seed=sd * 1000 + ep)
             best = float(env.data.xpos[env.trunk_body_id][2])
             cur = streak = 0
             last = False
             for _ in range(int(env.max_steps)):
-                a = sess.run(
-                    None, {"obs": obs.reshape(1, -1).astype(np.float32)})[0][0]
+                if sess is None:
+                    a = np.zeros(env.nj, np.float32)
+                else:
+                    a = sess.run(
+                        None,
+                        {"obs": obs.reshape(1, -1).astype(np.float32)})[0][0]
                 obs, _r, t, tr, _i = env.step(np.asarray(a, np.float32))
                 z = float(env.data.xpos[env.trunk_body_id][2])
                 u = float(-env._projected_gravity()[2])
                 best = max(best, z)
-                last = z > 0.55 and u > 0.85
+                # the ONE definition — see asimov_getup_ref.standing_report
+                last = _R.is_standing(env)
                 cur = cur + 1 if last else 0
                 streak = max(streak, cur)
                 if (t or tr) and bool(getattr(env, "_stood", False)):
@@ -335,10 +361,20 @@ def main() -> int:
               f"{100 * mde:.0f} — that is a tie, not a better checkpoint. "
               f"policy.onnx (the final model) is a fair artefact here.")
     if best["return_median"] <= base["return_median"]:
+        # TWO readings, and this used to assert the first one. A policy earning
+        # no more than the zero-action baseline can mean the reward is inverted
+        # (a fallen robot out-earning a standing one — measured on this task at
+        # 2775 against 788) OR simply that the policy learned nothing. Which it
+        # is cannot be read off this comparison: it needs the return a COMPETENT
+        # policy gets in the same env. Saying "the economy is inverted" of a
+        # stage where a working policy scores 36.8 and this one scores 2.1 is
+        # a wrong diagnosis stated with confidence.
         print(f"  *** THE BEST POLICY DOES NOT BEAT DOING NOTHING "
               f"({best['return_median']:.1f} vs {base['return_median']:.1f}). "
-              f"The reward economy is inverted; the run measured the economy, "
-              f"not the learning.")
+              f"Either the reward is inverted or the policy learned nothing — "
+              f"this comparison cannot tell which. Score a policy KNOWN to do "
+              f"the task in the same env: if it earns far more, the economy is "
+              f"fine and this run failed; if it does not, the economy is.")
     print(f"  resolution: {best['n']} episodes sees differences of about "
           f"{100 * mde:.0f} percentage points or more. A smaller gap than that "
           f"is not a result.")
@@ -393,9 +429,29 @@ def main() -> int:
         kw = dict(best["env_kwargs"] or {})
         kw["start_rung"] = ""
         f = _score_with(onnx, run, kw, a.episodes)
+        z = _score_with(None, run, kw, a.episodes)
         print(f"  {f['rose']}/{f['n']} rose, {f['at_buzzer']}/{f['n']} up at "
               f"the buzzer, hold median {f['hold_median_s']:.2f}s "
               f"(max {f['hold_max_s']:.2f}s), peak {f['peak_median_m']:.3f} m")
+        print(f"  zero action, SAME episodes: {z['rose']}/{z['n']} rose, "
+              f"{z['at_buzzer']}/{z['n']} up, peak {z['peak_median_m']:.3f} m")
+        # The rise is only a result if it clears the do-nothing policy by more
+        # than this instrument can resolve. The training-env baseline does not
+        # settle this: it is a DIFFERENT episode set, and comparing across two
+        # distributions is the marginal-vs-paired error.
+        # `_mde` returns a PROPORTION, as its only other call site assumes.
+        # Comparing a points-scaled gap against it made this guard unfireable
+        # at any gap -- a dead guard reads exactly like a passing one.
+        mde = _mde(f["n"])
+        gap = (f["rose"] - z["rose"]) / max(1, f["n"])
+        if gap < mde:
+            print(f"  *** the RISE is not a result: {100 * gap:+.0f} points "
+                  f"over zero action, under the {100 * mde:.0f}-point "
+                  f"resolution. This policy is not measurably better than "
+                  f"commanding nothing on the task it is supposed to do.")
+        else:
+            print(f"  the rise clears zero action by {100 * gap:+.0f} points "
+                  f"(resolution {100 * mde:.0f}).")
         if f["at_buzzer"] * 2 < best["at_buzzer"]:
             print(f"  *** the training env's {best['at_buzzer']}/{best['n']} is "
                   f"NOT the deliverable. Quote {f['at_buzzer']}/{f['n']}.")
