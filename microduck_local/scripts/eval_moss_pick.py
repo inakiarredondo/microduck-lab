@@ -15,8 +15,7 @@ import sys
 import numpy as np
 import onnxruntime as ort
 
-from microduck_local.robots.moss_env import (DEFAULT_PROP, MossPickEnv,
-                                             eval_env_kwargs)
+from microduck_local.robots.moss_env import DEFAULT_PROP, MossPickEnv, eval_env_kwargs
 
 
 def main() -> None:

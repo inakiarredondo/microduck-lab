@@ -31,7 +31,9 @@ y +0.207..+2.960: it covers NONE of the run-over zone, so using it there is a
 re-aim of the rest pose, not a free win.
 """
 import math
+
 import numpy as np
+
 from microduck_local.robots import moss
 from microduck_local.robots.moss_pinch import MossKinematics
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 from pathlib import Path
 
@@ -51,6 +52,37 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=260, help="control steps an episode")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--action-clip", type=float, default=13.0,
+                    help="the collection env's clip. 13.0, not the spec's 4.0: "
+                         "the teacher exceeds 4.0 on 15.5 %% of its frames and "
+                         "0.0 %% past 13.0, so a 4.0 env truncates the student "
+                         "rollouts while the labels it is fitted to do not "
+                         "exist inside that clip. teach-asimov_getup_clip-0e31e5 "
+                         "— the only run on this task that stands — used 13.0.")
+    ap.add_argument("--post-stand-only", action="store_true",
+                    help="on STUDENT iterations keep only the samples from "
+                         "after the robot first stood. Plain DAgger aggregates "
+                         "everything and HURT: 73 k mostly-floor student states "
+                         "raised aggregate MSE 0.000176 -> 0.000470 and rise "
+                         "fell 24/24 -> 20/24. The failure is not on the floor: "
+                         "the clone's action error is 0.000702 rad^2 on the "
+                         "rise and 0.000064 on the hold, and 29 of 36 episodes "
+                         "stand and THEN fall. This collects where it breaks.")
+    ap.add_argument("--pin-student", action="store_true",
+                    help="roll out --student-from on EVERY student iteration "
+                         "instead of the freshly fitted clone. Without this, "
+                         "iterations 2+ collect on the clone they just fitted "
+                         "— which on the first targeted run stood 1/40 and "
+                         "9/40, so DAgger went straight back to aggregating a "
+                         "policy that cannot stand (clone rise 16/24 against "
+                         "the donor's 35/36). The distribution worth "
+                         "correcting is the DEPLOYED one, and it does not "
+                         "change between iterations.")
+    ap.add_argument("--student-from", default=None,
+                    help="seed the first student-driven iteration from an "
+                         "existing run's model instead of the fresh clone. The "
+                         "distribution that matters is the DEPLOYED policy's, "
+                         "and the fine-tuned policy is not the clone.")
     a = ap.parse_args()
 
     sys.path.insert(0, str(THEIRS))
@@ -62,8 +94,27 @@ def main() -> int:
     from microduck_local.robots import spec as S
 
     spec = json.loads((THEIRS / "policies/getup_policy_spec.json").read_text())
-    env = S.get("asimov1").env_class("getup_clip")(
-        domain_rand=False, obs_noise=False, seed=a.seed)
+    # THE COLLECTION ENV MUST CARRY THE STUDENT'S OWN FLAGS. Built with bare
+    # defaults it is a different env from the one the student trained in, and
+    # the student then fails in it for reasons that have nothing to do with
+    # the policy: teach-asimov_getup_clip-0e31e5 scores 34/36 rose and 26/36
+    # still up under its recorded flags, and stood **0 of 8** here before this
+    # was fixed — which, with --post-stand-only, silently collected NOTHING.
+    # `getup_report.py` states the rule: evaluating a policy under flags it did
+    # not train with does not look like an error, it looks like a result.
+    env_kw = dict(domain_rand=False, obs_noise=False, seed=a.seed)
+    if a.student_from:
+        _meta = json.loads(
+            (HERE / "runs" / a.student_from / "run.json").read_text())
+        for _k, _v in (_meta.get("env_kwargs") or {}).items():
+            if _k in ("track_tol", "history", "force_lag", "getup_label",
+                      "getup_blend", "getup_assist", "ref_speed", "start_phase"):
+                env_kw[_k] = _v
+        print(f"collection env carries {a.student_from}'s flags: "
+              f"{ {k: v for k, v in env_kw.items() if k not in ('seed',)} }",
+              flush=True)
+    env_kw["action_clip"] = a.action_clip
+    env = S.get("asimov1").env_class("getup_clip")(**env_kw)
     m, d = env.model, env.data
     pol = R.Policy(str(THEIRS / "policies/getup.onnx"), spec, m)
 
@@ -83,23 +134,80 @@ def main() -> int:
         """Their q_target, expressed in OUR action convention."""
         return (pol.target - W.DEFAULT_POSE) / W.ACTION_SCALE
 
+    def load_student(run_dir: pathlib.Path):
+        """A policy driven the way DEPLOYMENT drives it.
+
+        `PPO.load(...).predict(obs)` feeds the net RAW observations, and
+        `distill.fit` trains the student on the NORMALISED view
+        (`export_onnx` bakes the stats in later). Measured on
+        teach-asimov_getup_clip-0e31e5, which stands 26/36 under verify_run:
+
+            PPO.predict on raw obs                      stood 0/8
+            policy.onnx (normaliser baked in)           stood 8/8
+            PPO.predict + VecNormalize stats by hand    stood 8/8
+
+        So every student rollout this script has ever collected was taken on
+        an unnormalised policy — states no deployment visits. That is almost
+        certainly why plain DAgger "hurt" (aggregate MSE 0.000176 -> 0.000470,
+        rise 24/24 -> 20/24): it was aggregating a broken policy's states, not
+        a student's. DAgger has not actually been tested on this task.
+        """
+        import pickle
+
+        from stable_baselines3 import PPO as _PPO
+        net = _PPO.load(str(run_dir / "model"), device="cpu")
+        with open(run_dir / "vecnormalize.pkl", "rb") as fh:
+            vn = pickle.load(fh)
+        mu, va, cl, eps = vn.obs_rms.mean, vn.obs_rms.var, vn.clip_obs, vn.epsilon
+
+        def predict(o):
+            n = np.clip((o - mu) / np.sqrt(va + eps), -cl, cl).astype(np.float32)
+            return net.predict(n, deterministic=True)[0]
+        return predict
+
     OBS, ACT = [], []
     student = None
+    if a.student_from:
+        print(f"iteration 0 collects on the TEACHER as always — it is the base "
+              f"the clone is fitted from, and a post-stand filter applied to a "
+              f"student iteration 0 can keep almost nothing. {a.student_from} "
+              f"drives from iteration 1.", flush=True)
     for it in range(a.dagger_iters):
-        n_over, n_tot, stood = 0, 0, 0
+        n_over, n_tot, stood, n_kept = 0, 0, 0, 0
         for ep in range(a.episodes_per_iter):
             env.reset(seed=int(rng.integers(1 << 30)))
-            i = int(rng.integers(len(env._clip_starts)))
-            d.qpos[:] = env._clip_starts[i]
-            d.qvel[:] = 0.0
-            d.xfrc_applied[:] = 0.0
-            mujoco.mj_forward(m, d)
+            if student is None:
+                # TEACHER rollout: the physics is stepped by hand below, no
+                # env cut can fire, so picking the start directly is harmless
+                # and this is the path that produced the working clone.
+                i = int(rng.integers(len(env._clip_starts)))
+                d.qpos[:] = env._clip_starts[i]
+                d.qvel[:] = 0.0
+                d.xfrc_applied[:] = 0.0
+                mujoco.mj_forward(m, d)
+            # STUDENT rollout: do NOT override qpos. `reset` already lands on a
+            # clip start AND sets the reference phase to match it; writing a
+            # different start in afterwards leaves the two desynchronised, the
+            # track_tol cut fires on step 1, and 8 episodes yielded 8 samples
+            # with the student "never standing". It stands 26/36 under its own
+            # flags — the harness was the whole story.
             pol.reset()
             obs = env._get_obs()
+            stood_yet = False
             for k in range(a.steps):
                 pol.step(d)                      # teacher sees the true state
                 lab = teacher_action()
-                OBS.append(obs.copy()); ACT.append(lab.copy())
+                # TARGETED DAgger. On a student rollout the floor states are
+                # the ones that diluted the set last time; the failure lives
+                # AFTER the stand. Teacher-driven iteration 0 is always kept
+                # whole — it is the base the clone is built from.
+                zz = float(d.xpos[env.trunk_body_id][2])
+                uu = float(d.xmat[torso].reshape(3, 3)[2, 2])
+                stood_yet = stood_yet or (zz > 0.55 and uu > 0.9)
+                keep = (student is None) or (not a.post_stand_only) or stood_yet
+                if keep:
+                    OBS.append(obs.copy()); ACT.append(lab.copy())
+                    n_kept += 1
                 n_tot += 1
                 n_over += int(np.abs(lab).max() > env._act_clip)
                 if student is None:              # iteration 0: TEACHER drives
@@ -121,14 +229,28 @@ def main() -> int:
                         mujoco.mj_step(m, d)
                     obs = env._get_obs()
                 else:                            # DAgger: the STUDENT drives
-                    sa, _ = student.predict(obs, deterministic=True)
+                    sa = student(obs)
                     obs, _r, term, trunc, _i = env.step(np.asarray(sa, np.float32))
-                    if term or trunc:
+                    # Roll THROUGH the curriculum cuts, exactly as
+                    # `verify_run._score_with` does, and stop only once the
+                    # robot has stood and then gone down. The track_tol cut is
+                    # a training device that "does not exist on a robot";
+                    # honouring it here ended episodes after ~13 steps, so the
+                    # student "never stood" and a post-stand filter collected
+                    # nothing — from the very policy that stands 26/36.
+                    if (term or trunc) and bool(getattr(env, "_stood", False)):
                         break
             z = float(d.xpos[env.trunk_body_id][2])
             u = float(d.xmat[torso].reshape(3, 3)[2, 2])
             stood += int(z > 0.55 and u > 0.9)
         who = "teacher" if student is None else "student"
+        if a.post_stand_only and student is not None:
+            print(f"[iter {it}] post-stand filter kept {n_kept} of {n_tot} "
+                  f"samples ({100*n_kept/max(n_tot,1):.1f} %)", flush=True)
+            if n_kept == 0:
+                print(f"[iter {it}] *** the student never stood — the filter "
+                      "kept NOTHING and this iteration adds no data ***",
+                      flush=True)
         print(f"[iter {it}] collected on the {who}'s states: {n_tot} pairs, "
               f"{stood}/{a.episodes_per_iter} ended standing; "
               f"labels past the env's +/-{env._act_clip:g} clip: "
@@ -139,6 +261,14 @@ def main() -> int:
         # a float64 label raises "Found dtype Double but expected Float".
         obs_a = np.asarray(OBS, np.float32)
         act_a = np.asarray(ACT, np.float32)
+        if obs_a.ndim != 2 or len(obs_a) < 256:
+            raise SystemExit(
+                f"[iter {it}] only {len(obs_a)} samples aggregated — refusing "
+                "to fit. With --post-stand-only this means the student almost "
+                "never stood, so there is nothing to correct AT the stand; "
+                "collect more episodes or drop the filter. (Fitting anyway "
+                "crashes inside dead_slots with a scalar variance, which is "
+                "how this was found.)")
         out = HERE / "runs" / (a.run_name if it == a.dagger_iters - 1
                                else f"{a.run_name}-it{it}")
         # `twist_cmd` is zero for a get-up on purpose — nothing is commanded.
@@ -148,8 +278,12 @@ def main() -> int:
                           allow_dead=("twist_cmd",))
         print(f"[iter {it}] fitted {len(obs_a)} pairs -> {out.name}  "
               f"action mse {mse:.6f} rad^2", flush=True)
-        from stable_baselines3 import PPO
-        student = PPO.load(str(out / "model"), device="cpu")
+        if a.student_from and (it == 0 or a.pin_student):
+            # the distribution that matters is the DEPLOYED policy's, and the
+            # fine-tuned policy is not the fresh clone
+            student = load_student(HERE / "runs" / a.student_from)
+        else:
+            student = load_student(out)
 
     print(f"\ndone: runs/{a.run_name}")
     return 0

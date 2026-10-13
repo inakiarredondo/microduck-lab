@@ -19,8 +19,7 @@ import onnxruntime as ort
 #: millimetres.
 DISTURBED_M = 0.005
 
-from microduck_local.robots.moss_env import (MossApproachEnv,
-                                             eval_env_kwargs)
+from microduck_local.robots.moss_env import MossApproachEnv, eval_env_kwargs
 
 
 def main() -> None:

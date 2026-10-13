@@ -48,7 +48,7 @@ def main() -> int:
         raise SystemExit(f"their runner is not fetched: {THEIRS}")
     sys.path.insert(0, str(THEIRS))
     import mujoco
-    import run_policy_mujoco as R          # noqa: E402  (their code, their layout)
+    import run_policy_mujoco as R  # noqa: E402  (their code, their layout)
 
     spec = json.loads((THEIRS / "policies/getup_policy_spec.json").read_text())
     model = R.build_model(str(HERE / ".cache/asimov_1/xmls/asimov_1.xml"),

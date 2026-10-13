@@ -13,8 +13,8 @@ pose validated on its own rather than along the path that has to reach it.
 So the test here is the whole delivery — ramp from the lift, open, settle,
 and ask whether the can is IN THE BIN.
 """
-import numpy as np
 import mujoco
+import numpy as np
 
 from microduck_local.robots import moss
 from microduck_local.robots.moss_env import MossStowEnv

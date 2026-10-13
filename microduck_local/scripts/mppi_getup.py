@@ -22,9 +22,6 @@ import argparse
 
 import numpy as np
 
-from microduck_local.robots import asimov_getup_ref as R
-from microduck_local.robots import asimov_walk as W
-
 
 def make_env(start: str):
     from microduck_local.robots import spec as S

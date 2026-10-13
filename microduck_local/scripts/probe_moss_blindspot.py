@@ -19,8 +19,8 @@ memory is not a sensing failure.
 """
 import collections
 import json
-import os
 import math
+import os
 import sys
 from pathlib import Path
 
