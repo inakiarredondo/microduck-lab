@@ -229,6 +229,237 @@ class AsimovGetupEnv(AsimovWalkEnv):
     #:                 has to cross the gap and catch the crouch plateau.
     #:   "arm"/"feet"  the whole plateau, for scoring and for a wider start mix.
     START_RUNG_ENV = "MICRODUCK_ASIMOV_GETUP_START_RUNG"
+    #: Env var for `max_span` below.
+    SPAN_ENV = "MICRODUCK_ASIMOV_GETUP_MAX_SPAN"
+    #: Env var for `launch_span` — the span allowed INSIDE the launch window
+    #: only. The hybrid: keep the narrow stance everywhere the robot is
+    #: slow and supported, and permit the sprawl only in the one moment that
+    #: demonstrably needs it.
+    LAUNCH_SPAN_ENV = "MICRODUCK_ASIMOV_GETUP_LAUNCH_SPAN"
+    #: Env var for `fall_depth` — how far down the fall `start_rung="falling"`
+    #: may reset. 0 = only states still at `fold`'s height, 1 = all the way to
+    #: `pike`. THE curriculum axis for the one leg nothing can learn from a
+    #: static start.
+    FALL_DEPTH_ENV = "MICRODUCK_ASIMOV_GETUP_FALL_DEPTH"
+    #: Env var for `span_cost` — a CONTINUOUS charge per metre of foot span
+    #: above `span_target`, as opposed to `max_span`, which TERMINATES.
+    #:
+    #: The distinction is the whole lesson of 2026-10-08. A termination is a
+    #: cliff: `teach-asimov_getup_rise-126f42-s2` cut at 0.85 m while the
+    #: policy's own rise spans 0.99, so every attempt to stand ended the
+    #: episode and standing became strictly worse than lying still. Measured,
+    #: the `up` term went to 0.0 at 98 k steps and never returned, `ep_len`
+    #: climbed 28 -> 400, and the return settled at **35.5 against a
+    #: do-nothing floor of 39.8**. The policy had not failed to narrow; it had
+    #: correctly learned not to get up. A cost has a gradient at 0.99, which
+    #: is the one place a cut at 0.85 has none.
+    SPAN_COST_ENV = "MICRODUCK_ASIMOV_GETUP_SPAN_COST"
+    #: Env var for `span_target` — the width below which the charge is zero.
+    SPAN_TARGET_ENV = "MICRODUCK_ASIMOV_GETUP_SPAN_TARGET"
+    #: Env var for `ground_cost` — a charge per step with NO part of the
+    #: robot touching the floor.
+    #:
+    #: Measured on `teach-asimov_getup_turn-6a1490-s7`, the first policy here
+    #: that stands from the floor: of its 3.4 s rise, **1.04 s is spent with
+    #: zero floor contacts**, in 8 separate flights, the lowest geom of a
+    #: 32 kg robot reaching **105 mm** of clearance. It is not pushing up, it
+    #: is HOPPING up, and then it stands — 0.00 s airborne after it arrives.
+    #:
+    #: Nothing in the economy forbade it. `stand`, `rise` and `progress` pay
+    #: trunk height, `rotate` pays uprightness and `tuck` pays the feet coming
+    #: under the mass, and a bounce buys all five at once for one impulse,
+    #: where a push-up buys them against gravity for a second. The cheapest
+    #: route through that reward is ballistic, so the policy found it. This is
+    #: the charge that makes the supported route the cheap one, and it is the
+    #: difference between a stand and a SAFE stand: a 32 kg body that lands
+    #: from 105 mm lands on hardware too.
+    #:
+    #: A charge, not a termination, for the reason SPAN_COST_ENV records: a
+    #: cut at the moment of flight would make every attempt to rise end the
+    #: episode, and lying still would win.
+    GROUND_ENV = "MICRODUCK_ASIMOV_GETUP_GROUND"
+    #: Env var for `balance_cost` — a charge per step for the centre of mass
+    #: being OUTSIDE the support polygon while the robot is on its feet.
+    #:
+    #: The clause a stand was missing. Measured on
+    #: `teach-asimov_getup_turn-380ec2`: while "standing" by
+    #: `standing_report`, the CoM is outside the polygon **74 % of the
+    #: time** (median -22 mm, p10 -131 mm), and every lost stand has one
+    #: trace — uprightness holds at +0.98 while the gap from the feet grows
+    #: 200 -> 320 mm and the trunk slides down. It is not toppling over, it
+    #: is translating off its feet while vertical.
+    #:
+    #: Nothing paid for staying over them. `tuck` pays the CoM-to-feet gap
+    #: closing, but it is MONOTONE BEST-SO-FAR — it pays for touching a
+    #: value once, never for holding it — and `standing` pays the same per
+    #: step for a balanced robot and a toppling one. So the policy banked
+    #: the rise and let go.
+    #:
+    #: Gated on being UP (upright past `STAND_UPRIGHT`, nothing but feet
+    #: down), so it is exactly zero for the whole rise and cannot charge the
+    #: get-up it exists to finish — the failure recorded in "A ramped
+    #: penalty can eat its task".
+    BALANCE_ENV = "MICRODUCK_ASIMOV_GETUP_BALANCE"
+    #: Env var for `home_pay` — a per-step PAY for sitting in the robot's own
+    #: default pose while upright. The get-up has to END somewhere usable.
+    #:
+    #: Measured 2026-10-09 on `teach-asimov_getup_turn-dd413e`. The pose it
+    #: reaches is **19 deg from the home stand on average and 57 deg at the
+    #: worst joint**: `waist_yaw` +56.8 (home 0, and it is the ONLY joint
+    #: between pelvis and torso), the hips scissored -53.6/+51.4 against
+    #: home's -8.6/+8.6, `left_ankle_pitch` +20.9 against home's -17.2 — the
+    #: full width of a 20 deg range, on the wrong side.
+    #:
+    #: It is not balancing, it is JAMMING: that pose puts **eight joints
+    #: outside the model's limits at once** (both ankle pitches, both ankle
+    #: rolls, a knee, both shoulder rolls, an elbow) and rests on the
+    #: constraint forces. `_refuse_illegal_joints` will not even load it. So
+    #: it freezes — no range left in any direction — then slides off anyway,
+    #: and nothing can follow it. On hardware it would not exist.
+    #:
+    #: The target is not invented: the home stand IS `robot.default_pose`
+    #: (0.0 deg from the authored `stand` waypoint), and under ZERO action
+    #: the servos hold it **8.00 s of 8**, trunk 0.608, uprightness +1.00,
+    #: CoM **+47 mm inside** the support polygon. The place to hand a walk
+    #: policy the robot already holds itself up.
+    HOME_ENV = "MICRODUCK_ASIMOV_GETUP_HOME"
+    #: Joint error, radians, at which the home pay has decayed to 1/e. Sized
+    #: against the measured gap: the policy sits at 0.33 rad mean error, so
+    #: 0.20 leaves real gradient where it actually is rather than a flat
+    #: floor it can never climb off.
+    HOME_TOL = 0.20
+    #: Env var for `limit_cost` — a charge per radian a joint sits OUTSIDE
+    #: its own range. MuJoCo's limits are soft, so a policy can push through
+    #: a stop and stand on the constraint force; nothing here charged for it
+    #: and the first policy to stand did exactly that, on eight joints.
+    LIMIT_ENV = "MICRODUCK_ASIMOV_GETUP_LIMIT"
+    #: Env var for `push_bw` — random SHOVES, in bodyweights, applied to the
+    #: trunk once the robot is standing.
+    #:
+    #: THE STATE THAT WAS NEVER SAMPLED. Across 38 M steps of this curriculum
+    #: the robot was never disturbed: `xfrc_applied` carried the vertical
+    #: ASSIST and nothing else. So "it stands but does not correct" was never
+    #: a reward problem — a recovery is a state no rollout ever contained,
+    #: and an unsampled state's value is never learned. Jonathan watched it
+    #: and said *it doesn't look like it's doing any correction*; he was
+    #: right, and nothing in the economy could have fixed it.
+    #:
+    #: A push lands only once `is_standing` holds, because a shove during the
+    #: rise is just noise on a motion that is already hard. Direction is
+    #: uniform in yaw and magnitude uniform in [0.5, 1.5] x `push_bw`, so the
+    #: policy cannot learn one canned answer; they repeat through the episode
+    #: so a single long stand is many recovery samples rather than one.
+    PUSH_ENV = "MICRODUCK_ASIMOV_GETUP_PUSH"
+    #: Env var for `calm_cost` — a charge per m/s of HORIZONTAL trunk speed
+    #: above what a stance can absorb, while the robot is on its feet.
+    #:
+    #: THE RISE IS A LUNGE, and this is the measurement that says so. At the
+    #: instant it first satisfies `is_standing`, the trunk is moving
+    #: **0.89 m/s** sideways (p90 1.06) with **5.15 rad/s** of angular speed
+    #: — against a servo-held home stand that absorbs **0.22 m/s** and falls
+    #: at 0.29. It arrives four times too fast. Inside the same 24 episodes
+    #: the split is clean: the ones that stayed up arrived at 0.60-0.87 m/s,
+    #: the ones that fell at 0.88-0.98.
+    #:
+    #: This is why three stages of pose work bought so little. `balance`
+    #: pays the CoM being over the feet, `home` pays the joints being in the
+    #: default pose — and neither can be held by a body that arrives with a
+    #: metre per second of momentum and a 20 deg ankle to stop it with. It
+    #: also explains the jam (bracing), the saturated ankles (absorbing),
+    #: and why handing off to the servos at the standing instant makes
+    #: things WORSE, 13/24 -> 3/24: no passive stance absorbs 0.89 m/s.
+    #:
+    #: One-sided above `CALM_FREE`, like `_span_charge`: a quiet arrival
+    #: pays nothing, so this is not a target to be optimised toward and
+    #: cannot pay for refusing to move during the rise. Gated on being on
+    #: its feet, so the rise itself is never charged.
+    #: Env var for `swing_pay` — a pay for SWINGING THE ARMS UP during the
+    #: rise, both the same way, which is momentum the legs cannot make.
+    #:
+    #: Jonathan's suggestion, 2026-10-10: *I wonder if it would also help if
+    #: it swung its arms up as it's trying to stand up.* Measured on
+    #: `teach-asimov_getup_turn-540bc4` over 2120 samples of the rise, it
+    #: ALREADY does — and nothing pays for it:
+    #:
+    #:   symmetric swing (both arms one way)  2.75 rad/s   corr with trunk
+    #:                                                     rising **+0.287**
+    #:   anti-symmetric flail (one up one down) 2.57 rad/s  corr **+0.162**
+    #:
+    #: The symmetric component is both the larger motion AND nearly twice
+    #: the correlate of the trunk going up. `arm_push` pays load x upward
+    #: speed — PUSHING OFF THE FLOOR — and says nothing about swinging; so
+    #: the one arm motion most associated with rising has been unpriced for
+    #: this whole curriculum.
+    #:
+    #: Why it should matter here specifically: this robot arrives at
+    #: standing with 0.89 m/s it cannot absorb through a 20 deg ankle. Arm
+    #: swing is angular momentum generated ABOVE the ankle, which is the one
+    #: source of rising impulse that does not have to be paid for later by
+    #: the feet.
+    #:
+    #: Gated to the RISE (below the stand bar, not yet standing) and
+    #: one-sided, so holding still costs nothing and a stand is never paid
+    #: for waving.
+    #: Env var for `handoff_pay` — train the get-up to DELIVER the robot to
+    #: Menlo's walker, instead of to stand alone for eight seconds.
+    #:
+    #: THE JOB CHANGED. Everything before this trained the policy to be its
+    #: own balance controller for a whole episode, and that is why it jams:
+    #: measured, its standing pose puts EIGHT joints outside their limits and
+    #: sits 49 deg from the default pose, because holding itself up is the
+    #: only tool it has. It does not need that tool. Menlo ship a walker that
+    #: holds the idle stance, and handing to it beats our policy on every
+    #: axis (20/24 vs 13/24 standing, 3.7 deg from idle vs 49.1, 100 % shove
+    #: recovery vs 75 %).
+    #:
+    #: So the real deliverable is a CATCHABLE HANDOFF STATE, and the catch
+    #: basin says which one. Over 128 handoffs, 97 caught (76 %):
+    #:
+    #:   at handoff      caught   dropped   separation
+    #:   trunk speed      0.409     0.793     1.19 sd   <- decides it
+    #:   foot span        0.422     0.345     0.87 sd   (WIDER is caught more)
+    #:   trunk z          0.609     0.545     0.63 sd
+    #:   uprightness      0.988     0.889     0.48 sd
+    #:
+    #: Speed is the only strong separator, which is also why `calm` failed
+    #: as a retrofit: it charged the HOLD, and the hold was never the task.
+    #:
+    #: The episode ENDS at the handoff and pays
+    #: `handoff_pay x steps_remaining x score`, so arriving catchable is
+    #: worth exactly what standing perfectly for the rest of the episode
+    #: would have been — and arriving fast is worth a fraction of it. That
+    #: self-balances: a terminal bonus that does not replace the forgone
+    #: income just teaches the policy to avoid the terminal.
+    HANDOFF_ENV = "MICRODUCK_ASIMOV_GETUP_HANDOFF"
+    #: Trunk speed, m/s, at which the walker stops catching — the median of
+    #: the handoffs it DROPPED. Score is 0 here and 1 at `HANDOFF_GOOD`.
+    HANDOFF_DROP = 0.79
+    HANDOFF_GOOD = 0.20
+    #: Standing, slower than this, for this many steps — the same condition
+    #: `behaviors.asimov_tasks` hands the lab, defined ONCE here so the
+    #: reward and the deployment cannot drift apart.
+    HANDOFF_SPEED = 0.60
+    HANDOFF_DWELL = 4
+    SWING_ENV = "MICRODUCK_ASIMOV_GETUP_SWING"
+    #: A kip happens at the START of a get-up or not at all, so the swing is
+    #: only paid inside this window, in seconds.
+    SWING_WINDOW_S = 2.0
+    CALM_ENV = "MICRODUCK_ASIMOV_GETUP_CALM"
+    #: Horizontal trunk speed, m/s, that costs nothing — measured, not
+    #: chosen: it is what a servo-held home stand demonstrably absorbs
+    #: (survives 0.15 BW for 0.15 s = 0.22 m/s, falls at 0.20 BW = 0.29).
+    CALM_FREE = 0.22
+    #: How long after it first stands the arrival charge applies, seconds.
+    #: Beyond this the robot is holding, not arriving, and a charge there
+    #: prices the corrections — measured, that cost 13/24 -> 6/24.
+    CALM_WINDOW_S = 1.0
+    #: Seconds a shove lasts, and the gap between them.
+    PUSH_HOLD_S = 0.15
+    PUSH_EVERY_S = (0.8, 1.8)
+    #: How far outside the polygon still counts, metres. Past this the robot
+    #: is gone and a bigger number is not more information — it would just
+    #: make one bad step dominate an episode.
+    BALANCE_CAP = 0.15
     HEAD_ENV = "MICRODUCK_ASIMOV_GETUP_HEAD"
     ARM_PUSH_ENV = "MICRODUCK_ASIMOV_GETUP_ARM_PUSH"
     ARM_EFFORT_ENV = "MICRODUCK_ASIMOV_GETUP_ARM_EFFORT"
@@ -297,6 +528,88 @@ class AsimovGetupEnv(AsimovWalkEnv):
     #: all, which is the thing the first run never did. Faded by the
     #: curriculum rather than continuously, so each rung is a run you can
     #: look at; the last rung is 0.0 and is the only one that counts.
+    #: Env var for `prologue`. "pushup" makes the first ~1.3 s of EVERY
+    #: episode play the authored push-up — prone, plant_forearms,
+    #: draw_knees_in, quadruped, pike — through the position servos, ignoring
+    #: the policy, and hand over at `pike`.
+    #:
+    #: Two reasons, and the second is why it is in the env rather than a
+    #: script. (1) That half of the get-up needs no policy: it plays open loop
+    #: at a 0.215 m foot span, so training it is wasted compute and letting a
+    #: policy near it is wasted risk. (2) It happens in STEPPED time, so the
+    #: lab shows it — a `reset` that placed the robot at `pike` was invisible,
+    #: and every run for a week reset above the push-up, which is why nobody
+    #: watching the stage ever saw one.
+    #:
+    #: It also changes the handover: the policy inherits the pike the robot
+    #: ARRIVED at, carrying its real velocity, instead of one placed at rest.
+    #: Env var for `rotate_pay` — what a NEW BEST uprightness is worth.
+    #:
+    #: Measured 2026-10-09: the get-up's blocker is ROTATION, not height. At
+    #: `pike` the trunk is 112 deg from vertical and the hips+ankles supply
+    #: ~59; there is no back pitch joint, so lifting the pelvis only dangles
+    #: the trunk (assist at 0.85 reaches fold's HEIGHT at uprightness -0.86).
+    #: And yet `progress` pays monotone trunk HEIGHT and nothing pays
+    #: uprightness at all — the reward was blind to the one axis the task
+    #: turns on. Monotone like `_progress`, for the same reason: a per-step
+    #: rate is farmable by rocking, a new best is not.
+    #: Env var for `tuck_pay` — what bringing the FEET UNDER THE MASS is
+    #: worth, as monotone reduction in the horizontal CoM-to-feet distance.
+    #:
+    #: Measured 2026-10-09 on the policy that learned to sit up. It ends
+    #: upright (+0.95) on its feet at 0.11 m and then stops, and the reason
+    #: is in the joints: the knee sits at **-1 deg, its 0 deg stop**, legs
+    #: straight out, with the CoM **300 mm from the feet**. It is a long sit.
+    #: 86 deg of knee travel is available and completely unused.
+    #:
+    #: Nothing paid for using it. Tucking the feet in LOWERS the trunk and
+    #: costs uprightness for a moment, so `rise`, `stand`, `progress` and
+    #: `rotate` all charge for the one move that makes standing possible.
+    #: This pays it: monotone, like `_progress` and `_upright_gain`, because
+    #: a per-step rate would be farmable by shuffling the feet back and forth.
+    TUCK_ENV = "MICRODUCK_ASIMOV_GETUP_TUCK"
+    ROTATE_ENV = "MICRODUCK_ASIMOV_GETUP_ROTATE"
+    #: ROLL ONTO THE BACK — pay the one transition the whole prone problem
+    #: reduces to. Measured 2026-10-12: from a genuinely SUPINE pose the
+    #: shipped get-up stands **40/40**; from prone it manages 8/40. A crude
+    #: 180 deg root flip lands only 4/40 genuinely supine and already lifts it
+    #: to 19/40. So "get onto the back" is worth 40/40 with nothing retrained,
+    #: and hand-authoring it failed — a parameterised twist-and-push scanned
+    #: over direction, waist, push, scissor, knee, TEMPO and a wind-up reached
+    #: 1/6 at best (`scripts/search_prone_roll.py`).
+    #:
+    #: The signal is Menlo's own classifier's axis, not uprightness:
+    #: `f_z = xmat[2,0]` of the torso, the world-z component of its FORWARD
+    #: axis, which runs -1 (face down) to +1 (face up) and is exactly what
+    #: `asimov_getup.label` takes the argmax of. Uprightness is useless here —
+    #: it is ~0 for prone, supine AND side alike, and reading it as a roll
+    #: indicator is how an earlier probe reported "rolled onto its side" for
+    #: poses the classifier calls prone.
+    ROLL_ENV = "MICRODUCK_ASIMOV_GETUP_ROLL"
+    #: `f_z` at or above this counts as on the back. The classifier needs
+    #: `f_z` to be the argmax of (f_z, -f_z, -l_z, l_z); 0.70 implies it.
+    ROLL_DONE = 0.70
+    #: Paid PER STEP while on the back, as `standing`'s sibling — the
+    #: monotone gain below pays for TOUCHING supine and something must pay
+    #: for being there, or the roll overshoots back onto its face for free.
+    #:
+    #: SMALL ON PURPOSE, and the arithmetic is the reason. Measured income on
+    #: this parent: a prone SUCCESS earns ~9,170 an episode (`stand` 1,664 +
+    #: `rise` 476 + ...), a prone FAILURE ~16. At `roll_pay` 100 this gives
+    #: 2.0 a step, so ~400 over a long supine stretch — decisive against
+    #: failing, and nowhere near the ~2,100 standing pays, so it cannot teach
+    #: the robot to lie on its back instead of getting up. At the 0.5 this
+    #: started as it would have been 50 a step and done exactly that.
+    ROLL_HOLD_W = 0.02
+    PROLOGUE_ENV = "MICRODUCK_ASIMOV_GETUP_PROLOGUE"
+    #: The authored push-up, in order. `pike` is the handover.
+    PROLOGUE_ROUTE = ("prone", "plant_forearms", "draw_knees_in",
+                      "quadruped", "pike")
+    #: Seconds per leg of the ramp, and the dwell after each. MEASURED: the
+    #: route plays at 0.25 s a leg and falls at 0.50 (see "a reference has a
+    #: tempo"), so this is not a free parameter.
+    PROLOGUE_LEG_S = 0.25
+    PROLOGUE_DWELL_S = 0.12
     ASSIST_ENV = "MICRODUCK_ASIMOV_GETUP_ASSIST"
     #: How far back toward STANDING each episode starts — the REVERSE
     #: CURRICULUM, and **MEASURED NOT TO WORK on this body**: see
@@ -320,6 +633,23 @@ class AsimovGetupEnv(AsimovWalkEnv):
                  arm_effort: float | None = None,
                  head_up: float | None = None,
                  start_rung: str | None = None,
+                 max_span: float | None = None,
+                 fall_depth: float | None = None,
+                 launch_span: float | None = None,
+                 span_cost: float | None = None,
+                 span_target: float | None = None,
+                 ground_cost: float | None = None,
+                 balance_cost: float | None = None,
+                 home_pay: float | None = None,
+                 limit_cost: float | None = None,
+                 push_bw: float | None = None,
+                 calm_cost: float | None = None,
+                 swing_pay: float | None = None,
+                 handoff_pay: float | None = None,
+                 rotate_pay: float | None = None,
+                 roll_pay: float | None = None,
+                 tuck_pay: float | None = None,
+                 prologue: str | None = None,
                  getup_assist: float | None = None, **kwargs):
         """The curriculum knobs arrive as KWARGS, not as `os.environ` reads.
 
@@ -361,6 +691,22 @@ class AsimovGetupEnv(AsimovWalkEnv):
         self._stand_z = float(W.STAND_Z)
         self._assist = float(getup_assist if getup_assist is not None
                              else os.environ.get(self.ASSIST_ENV, "0.0") or 0.0)
+        self._roll_pay = float(roll_pay if roll_pay is not None
+                               else os.environ.get(self.ROLL_ENV, "") or 0.0)
+        self._rotate_pay = float(rotate_pay if rotate_pay is not None
+                                 else os.environ.get(self.ROTATE_ENV, "")
+                                 or 0.0)
+        self._best_upright = None
+        self._best_supine = None
+        self._torso_bid = getattr(self, '_torso_bid', None)
+        self._tuck_pay = float(tuck_pay if tuck_pay is not None
+                               else os.environ.get(self.TUCK_ENV, "") or 0.0)
+        self._best_tuck = None
+        self._prologue = str(prologue if prologue is not None
+                             else os.environ.get(self.PROLOGUE_ENV, "")
+                             or "").strip().lower()
+        self._prologue_plan = self._build_prologue() if self._prologue else []
+        self._prologue_i = 0
         self._blend = float(getup_blend if getup_blend is not None
                             else os.environ.get(self.BLEND_ENV, "0.0") or 0.0)
         #: Standing head height, measured off the model's own STAND keyframe —
@@ -373,17 +719,208 @@ class AsimovGetupEnv(AsimovWalkEnv):
         self._w_head_up = float(head_up if head_up is not None
                                 else os.environ.get(self.HEAD_ENV, "")
                                 or self.W_HEAD_UP)
+        #: Foot-to-foot span, metres, past which the episode ENDS.
+        #:
+        #: Measured on teach-asimov_getup_clip-79ef4d, which rises 288/288:
+        #: it sprawls its feet a MEDIAN of 0.989 m apart and up to 1.042 m, on
+        #: a 1.2 m robot whose standing stance is 0.215 m. That is the splits,
+        #: and it is the route Jonathan ruled out at the start of this track —
+        #: "rather than doing the worm or some kind of break-dancing move,
+        #: both which are dangerous".
+        #:
+        #: A CUT and not a penalty, because the lesson on this robot is that
+        #: an unsampled state's value is never learned: a penalty leaves the
+        #: sprawl in the rollouts and merely prices it, while a cut removes it
+        #: from the distribution. 0.80 m by construction, not by taste — the
+        #: splayed feet-only rungs the ladder has to pass through sit at
+        #: 0.59-0.74 m, so this admits every pose in the cache and forbids the
+        #: 0.99 m scramble. Set 0 or leave unset to disable.
+        self._max_span = float(max_span if max_span is not None
+                               else os.environ.get(self.SPAN_ENV, "") or 0.0)
+        self._check_span_vs_starts = self._max_span > 0.0
+        #: Span allowed while the trunk is between `pike` and `fold` — the
+        #: BALLISTIC gap, the only stretch anything has ever crossed and the
+        #: only stretch it crosses by sprawling. 0 (default) = the flat cut
+        #: everywhere.
+        #:
+        #: Measured: every one of the teacher's 24 demonstrations reaches its
+        #: maximum foot span (median 0.929 m) INSIDE this window. Training the
+        #: handover under a flat 0.75 m cut therefore forbade the only known
+        #: solution and then scored 0/24 — a ban mistaken for an impossibility.
+        self._launch_span = float(launch_span if launch_span is not None
+                                  else os.environ.get(self.LAUNCH_SPAN_ENV, "")
+                                  or 0.0)
+        #: The CONTINUOUS span charge, per metre above `span_target`, and the
+        #: width it is measured from. 0 (the default) leaves the reward
+        #: exactly as every earlier run had it.
+        #:
+        #: Sized against the economy rather than chosen: the rise earns about
+        #: 13.5 a step (5422.8 over 400) and doing nothing earns 0.1, so a
+        #: charge of 6.0 on the 0.59 m by which the donor's 0.99 m rise
+        #: exceeds a 0.40 m stance costs 3.5 a step — enough that narrowing
+        #: pays, and far too little to make lying down the better deal. A
+        #: penalty that CAN eat its own task is the failure recorded in
+        #: "A ramped penalty can eat its task".
+        self._span_cost = float(span_cost if span_cost is not None
+                                else os.environ.get(self.SPAN_COST_ENV, "")
+                                or 0.0)
+        self._span_target = float(span_target if span_target is not None
+                                  else os.environ.get(self.SPAN_TARGET_ENV, "")
+                                  or 0.40)
+        #: The flight charge. Off by default (0.0), so every run before
+        #: 2026-10-09 reproduces exactly.
+        self._ground_cost = float(ground_cost if ground_cost is not None
+                                  else os.environ.get(self.GROUND_ENV, "")
+                                  or 0.0)
+        #: The balance charge. Off by default (0.0).
+        self._balance_cost = float(balance_cost if balance_cost is not None
+                                   else os.environ.get(self.BALANCE_ENV, "")
+                                   or 0.0)
+        #: Come home, and stop jamming. Both off by default (0.0).
+        self._home_pay = float(home_pay if home_pay is not None
+                               else os.environ.get(self.HOME_ENV, "") or 0.0)
+        self._limit_cost = float(limit_cost if limit_cost is not None
+                                 else os.environ.get(self.LIMIT_ENV, "")
+                                 or 0.0)
+        #: Shoves, in bodyweights. Off by default (0.0).
+        self._push_bw = float(push_bw if push_bw is not None
+                              else os.environ.get(self.PUSH_ENV, "") or 0.0)
+        #: Arrive quietly. Off by default (0.0).
+        self._calm_cost = float(calm_cost if calm_cost is not None
+                                else os.environ.get(self.CALM_ENV, "") or 0.0)
+        #: Swing the arms up. Off by default (0.0).
+        self._swing_pay = float(swing_pay if swing_pay is not None
+                                else os.environ.get(self.SWING_ENV, "") or 0.0)
+        #: Train for the handoff. Off by default (0.0).
+        self._handoff_pay = float(handoff_pay if handoff_pay is not None
+                                  else os.environ.get(self.HANDOFF_ENV, "")
+                                  or 0.0)
+        self._handoff_streak = 0
+        self._handoff_prev_xy = None
+        self._prev_sh = None
+        self._prev_swing_z = None
+        self._swing_lo = None
+        self._swing_hi = None
+        self._swing_best = 0.0
+        self._push_until = -1
+        self._push_next = -1
+        self._push_vec = np.zeros(3)
+        self._pushes = 0
+        self._span_cuts = 0
         self._start_rung = str(start_rung if start_rung is not None
                                else os.environ.get(self.START_RUNG_ENV, "")
                                or "").strip().lower()
         self._rungs = None
+        self._handover_q = None
+        self._handover_v = None
+        self._fall_q = None
+        self._fall_v = None
+        self._fall_groups = None
+        self._fall_depth = float(fall_depth if fall_depth is not None
+                                 else os.environ.get(self.FALL_DEPTH_ENV, "")
+                                 or 1.0)
         if self._start_rung and self._start_rung != "floor":
             from . import asimov_getup_ref as _R
 
             z = _R.holdable_rungs()
             sup, zz = z["support"], z["trunk_z"]
             if self._start_rung == "arm_top":
-                keep = (sup == "arm") & (zz >= np.quantile(zz[sup == "arm"], 0.75))
+                # An EXPLICIT height, not a quantile. As the top quartile this
+                # band moved the moment the rung cache changed: it was 24 rungs
+                # spanning 0.296-0.440 m when it took the floor rise rate from
+                # 0/36 to 16/36, and after the cache was re-validated down to
+                # 44 entries the same expression gave 10 rungs at 0.355-0.440 —
+                # a different stage under the same name, which is how a
+                # curriculum silently stops reproducing.
+                #
+                # RETUNED 2026-10-07, 0.29 -> 0.22, and the explicit height is
+                # why this was caught loudly instead of silently: when
+                # `_search_rungs` stopped hardcoding a 13.0 action clip and
+                # built the cache at the clip training actually uses, the arm
+                # plateau's top fell from 0.440 m to 0.280 m, `>= 0.29` matched
+                # NOTHING, and the env raised. (A quantile would have carried
+                # on, handing stage 2 the bottom of the plateau under the name
+                # "arm_top".) 0.22 restores the band to 20 rungs spanning
+                # 0.231-0.280 m — the size it had when it produced this
+                # track's only positive result.
+                keep = (sup == "arm") & (zz >= 0.16)
+            elif self._start_rung == "pike":
+                # the AUTHORED pike (0.215 m span), not an arm-plateau rung
+                # (0.70 m) — the hybrid keeps the narrow stance outside the
+                # launch window and those are different poses.
+                self._rungs = None
+                ps = _R.pike_states()
+                self._fall_q = np.asarray(ps["qpos"])
+                self._fall_v = np.asarray(ps["qvel"])
+                self._fall_groups = None
+                keep = None
+            elif self._start_rung == "seat":
+                # THE LONG SIT — the teacher's own signature and the one pose
+                # the authored route never had. The push-up ends face DOWN
+                # (uprightness -0.37 at `pike`) where hip flexion swings a leg
+                # 751-1095 mm INTO THE AIR, so the feet can never come under
+                # the mass; the teacher instead reaches +0.49 at 0.06-0.12 m
+                # and rises already upright. Settled, these sit at trunk
+                # 0.43 m, uprightness +0.93, on both feet at a 0.215 m span —
+                # above `rock_back` and more upright than `fold`, and nothing
+                # trained so far stands from them (s8: 0/24), which is exactly
+                # why they are a start to train ON rather than a rung.
+                self._rungs = None
+                q, v = _R.seat_states()
+                self._fall_q = np.asarray(q)
+                self._fall_v = np.asarray(v)
+                self._fall_groups = None
+                keep = None
+            elif self._start_rung == "falling":
+                # A REVERSE CURRICULUM IN PERTURBATION SPACE, not pose space.
+                # The policy stands 16/16 from `fold` and 0/16 from
+                # `rock_back` even trained on it; the move is decided by the
+                # contact mode and the contact mode by momentum. But the FALL
+                # is free — shove a settled fold and it drops through the whole
+                # gap in a second — so these states are reachable BY
+                # CONSTRUCTION and carry the velocity they really have. Three
+                # interpolated pose ladders failed because their rungs were
+                # averages of two poses and fell on their own; a state the
+                # robot demonstrably passes through cannot have that defect.
+                self._rungs = None
+                f = _R.fall_states()
+                fz = _R.BY_NAME["fold"].settled_z
+                pz = _R.BY_NAME["pike"].settled_z
+                cut = fz - self._fall_depth * (fz - pz)
+                sel = np.asarray(f["trunk_z"]) >= cut
+                if not sel.any():
+                    raise RuntimeError(
+                        f"no fall states at depth {self._fall_depth} "
+                        f"(cut {cut:.3f} m)")
+                self._fall_q = np.asarray(f["qpos"])[sel]
+                self._fall_v = np.asarray(f["qvel"])[sel]
+                # STRATIFY BY HEIGHT, because the fall is FAST through the gap
+                # and slow near the top: 89 of 134 cached states sit within
+                # 4 cm of `fold`. Sampled uniformly over states, the deep end
+                # is barely practised — measured, the first version of this
+                # curriculum held 20/48 overall and **0 of the 14 starts below
+                # 0.45 m**, i.e. it reproduced the fold-holding the policy
+                # already had and learned nothing at depth. Sampling a BAND
+                # first and then a state inside it spends equal time at every
+                # height.
+                fz_ = np.asarray(f["trunk_z"])[sel]
+                edges = np.linspace(float(fz_.min()), float(fz_.max()) + 1e-6, 7)
+                bands = [np.flatnonzero((fz_ >= lo) & (fz_ < hi))
+                         for lo, hi in zip(edges[:-1], edges[1:])]
+                self._fall_groups = [b for b in bands if len(b)]
+                keep = None
+            elif self._start_rung == "handover":
+                # THE SCRIPTED RAMP'S OUTPUT, not a rung. The arm plateau
+                # traverses open loop (phase 3i), so the bottom of the get-up
+                # is PLAYED and the policy only has to learn the one
+                # transition above it. These states carry their VELOCITY —
+                # `_rung_qvel` below — because a settled rung hands the policy
+                # a robot at rest and the gap above is ballistic.
+                self._rungs = None
+                h = _R.handover_states()
+                self._handover_q = np.asarray(h["qpos"])
+                self._handover_v = np.asarray(h["qvel"])
+                keep = None
             elif self._start_rung in ("arm", "feet"):
                 keep = sup == self._start_rung
             elif self._start_rung == "low":
@@ -392,7 +929,37 @@ class AsimovGetupEnv(AsimovWalkEnv):
                 # requiring trunk > 0.15 m had excluded it, so the first stage
                 # of the curriculum had nothing to aim at between the fallen
                 # pose (~0.11 m) and 0.21 m, and it stalled at 0.203 m.
-                keep = zz <= 0.26
+                # <= 0.30 and not 0.26, read off the validated distribution:
+                # the rungs sit at 0.146, 0.161, then nothing until 0.252, then
+                # a dense cluster. A 0.26 threshold caught 5 rungs and missed
+                # the cluster's bottom; 0.30 catches 19 and spans the 9 cm hole
+                # from 0.161 to 0.252 — which is the gap the policy is actually
+                # stuck in, since the old stage 1 reached 0.203 m, past both
+                # low rungs and below the next foothold.
+                keep = zz <= 0.30
+            elif self._start_rung in ("mix_top", "mix_arm", "mix_low"):
+                # A BAND, mixed with the floor. Measured, these two facts have
+                # to hold at once and only this shape does both:
+                #
+                #  * the stage that teaches the rise is the one that starts
+                #    HIGH. Across two chains, `arm_top` (0.30-0.44 m) took the
+                #    floor rise rate 0/36 -> **16/36** in a single stage, while
+                #    a `mix` stage and a `low` stage each left it at 0/36. A
+                #    near-goal start is the lever; starting the policy low
+                #    leaves the whole hard part still ahead of it.
+                #  * the floor's own states must stay in the normalizer's
+                #    distribution, because a warm start FREEZES it
+                #    (`venv.training = False`): the floor reaches |z| 13.1
+                #    under floor-trained stats while the rungs sit at 8.4 and
+                #    3.9, so a chain that only ever starts high and then
+                #    descends hands its last stage inputs that mean something
+                #    else.
+                #
+                # So every stage draws half its episodes from where the robot
+                # FELL and half from its band, and the band descends.
+                lo, hi = {"mix_top": (0.30, 9.9), "mix_arm": (0.14, 0.46),
+                          "mix_low": (0.14, 0.30)}[self._start_rung]
+                keep = (zz >= lo) & (zz <= hi)
             elif self._start_rung == "mix":
                 # EVERY rung and the floor too, so a final stage practises the
                 # whole task rather than only its last rung. A chain whose last
@@ -410,11 +977,17 @@ class AsimovGetupEnv(AsimovWalkEnv):
             else:
                     raise ValueError(
                     f"{self._start_rung!r} is not a rung — use floor, arm, "
-                    "arm_top, feet or mix")
-            if not keep.any():
-                raise RuntimeError(f"no {self._start_rung!r} rungs in the cache")
-            self._rungs = (z["joints"][keep], z["root_pitch"][keep],
-                           zz[keep])
+                    "arm_top, feet, low, mix, handover, falling or pike")
+            if keep is None:
+                # "handover" is not a rung selection — the scripted ramp's
+                # output is cached separately and carries its own velocity.
+                pass
+            else:
+                if not keep.any():
+                    raise RuntimeError(
+                        f"no {self._start_rung!r} rungs in the cache")
+                self._rungs = (z["joints"][keep], z["root_pitch"][keep],
+                               zz[keep])
         self._w_arm_push = float(arm_push if arm_push is not None
                                  else os.environ.get(self.ARM_PUSH_ENV, "")
                                  or self.W_ARM_PUSH)
@@ -449,8 +1022,61 @@ class AsimovGetupEnv(AsimovWalkEnv):
 
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed, options=options)
+        if getattr(self, "_prologue_plan", None):
+            # The push-up starts where the push-up starts. Rewind the script
+            # and put the robot face down; everything below it (rungs, fall
+            # states, a start_rung) would be a different episode entirely, so
+            # the prologue OWNS the start when it is on.
+            from . import asimov_getup_ref as _R
+            self._prologue_i = 0
+            w = _R.BY_NAME[self.PROLOGUE_ROUTE[0]]
+            self._place(np.asarray(w.joints, float), w.root_pitch)
+            self.data.qvel[:] = 0.0
+            self.data.xfrc_applied[:] = 0.0
+            self.data.xfrc_applied[self.trunk_body_id, 2] = self._assist_n
+            mujoco.mj_forward(self.model, self.data)
+            return self._get_obs(), info
+        if getattr(self, "_fall_q", None) is not None:
+            groups = getattr(self, "_fall_groups", None)
+            if groups:
+                g = groups[int(self._rng.integers(len(groups)))]
+                i = int(g[int(self._rng.integers(len(g)))])
+            else:
+                i = int(self._rng.integers(len(self._fall_q)))
+            self.data.qpos[:] = self._fall_q[i]
+            self.data.qvel[:] = self._fall_v[i]      # the velocity is the point
+            self.data.xfrc_applied[:] = 0.0
+            self.data.xfrc_applied[self.trunk_body_id, 2] = self._assist_n
+            mujoco.mj_forward(self.model, self.data)
+            self.twist_cmd[:] = 0.0
+            h0 = min(max(self.data.xpos[self.trunk_body_id][2]
+                         / self._stand_z, 0.0), 1.0)
+            self._best_rise = h0 * max(float(-self._projected_gravity()[2]), 0.0)
+            self._stood = False
+            self._held = 0
+            return self._get_obs(), {}
+
+        if getattr(self, "_handover_q", None) is not None:
+            # THE SCRIPTED RAMP HANDS OVER HERE. qvel is written too, and that
+            # is the whole difference from a rung: a settled rung starts the
+            # policy at rest, and `asimov_getup_floor` stage 2 does exactly
+            # that and rises 0/24 across a gap that is ballistic.
+            i = int(self._rng.integers(len(self._handover_q)))
+            self.data.qpos[:] = self._handover_q[i]
+            self.data.qvel[:] = self._handover_v[i]
+            self.data.xfrc_applied[:] = 0.0
+            self.data.xfrc_applied[self.trunk_body_id, 2] = self._assist_n
+            mujoco.mj_forward(self.model, self.data)
+            self.twist_cmd[:] = 0.0
+            h0 = min(max(self.data.xpos[self.trunk_body_id][2]
+                         / self._stand_z, 0.0), 1.0)
+            self._best_rise = h0 * max(float(-self._projected_gravity()[2]), 0.0)
+            self._stood = False
+            self._held = 0
+            return self._get_obs(), {}
+
         use_rung = self._rungs is not None
-        if use_rung and self._start_rung == "mix":
+        if use_rung and self._start_rung.startswith("mix"):
             # Half the episodes from where it FELL. The mix is deliberately
             # even rather than weighted by rung count: there are 95 arm rungs
             # and 5 feet ones, so drawing uniformly over the cache would spend
@@ -486,6 +1112,11 @@ class AsimovGetupEnv(AsimovWalkEnv):
             self._held_best = 0
             self._peak_rise = self._best_rise
             self._best_trunk_z = None
+            self._best_upright = None
+            self._best_supine = None
+            self._torso_bid = getattr(self, '_torso_bid', None)
+            self._best_tuck = None
+            self._reset_push()
             self._best_head = None
             return self._get_obs(), info
         pose = self._poses[int(self._rng.integers(len(self._poses)))]
@@ -511,9 +1142,82 @@ class AsimovGetupEnv(AsimovWalkEnv):
         # Cleared, or the first control step of an episode differences against
         # the LAST frame of the previous one and reads as a huge jump.
         self._best_trunk_z = None
+        self._best_upright = None
+        self._best_supine = None
+        self._torso_bid = getattr(self, '_torso_bid', None)
+        self._best_tuck = None
+        self._reset_push()
         self._best_head = None
         return self._get_obs(), info
 
+
+    def _build_prologue(self) -> list:
+        """The push-up as a list of ACTIONS, precomputed once per env.
+
+        Actions, not poses, because `step` has to substitute them for the
+        policy's output and the action is what the servos see. A smoothstep
+        ramp between consecutive waypoints at the measured tempo, with a short
+        dwell so each new contact set settles before the next leg.
+        """
+        from . import asimov_getup_ref as _R
+
+        if self._prologue not in ("pushup", "push_up", "1", "true"):
+            raise ValueError(
+                f"prologue={self._prologue!r} is not a route — "
+                f"use 'pushup' or leave it unset")
+        scale = float(np.atleast_1d(self.robot.action_scale)[0])
+        default = np.asarray(self.robot.default_pose, float)
+        clip = float(self._act_clip)
+        route = [_R.BY_NAME[n] for n in self.PROLOGUE_ROUTE]
+        plan = []
+        cur = np.asarray(route[0].joints, float)
+        for _ in range(int(self.PROLOGUE_DWELL_S * 50)):
+            plan.append(np.clip((cur - default) / scale,
+                                -clip, clip).astype(np.float32))
+        for w in route[1:]:
+            tgt = np.asarray(w.joints, float)
+            n = max(2, int(self.PROLOGUE_LEG_S * 50))
+            for k in range(n):
+                f = (k + 1) / n
+                f = f * f * (3.0 - 2.0 * f)
+                q = cur + (tgt - cur) * f
+                plan.append(np.clip((q - default) / scale,
+                                    -clip, clip).astype(np.float32))
+            cur = tgt
+            for _ in range(int(self.PROLOGUE_DWELL_S * 50)):
+                plan.append(np.clip((cur - default) / scale,
+                                    -clip, clip).astype(np.float32))
+        return plan
+
+    def in_prologue(self) -> bool:
+        """True while the scripted push-up is driving, not the policy."""
+        return bool(self._prologue_plan) and self._prologue_i < len(
+            self._prologue_plan)
+
+    def _refuse_illegal_joints(self, q, adr) -> None:
+        """A pose outside `jnt_range` is not a pose — refuse it here.
+
+        `qpos` is NOT clamped on assignment, so a placement past a stop is
+        accepted silently and the constraint solver then fights it for the
+        rest of the episode, which looks exactly like an unstable pose. On
+        2026-10-09 a search for a kneel ran ~26 000 samples with the knee at
+        -1.2 to -2.0 rad while that joint's range is **+0.00 to +1.50 and it
+        bends one way only**; every one of those poses was illegal, and the
+        toppling they showed was the solver ejecting them. `add-a-robot`
+        already says to check the joint limits BEFORE authoring a pose; this
+        makes skipping it impossible.
+        """
+        m = self.model
+        bad = []
+        for i, a in enumerate(np.atleast_1d(adr)):
+            j = int(np.argmax(m.jnt_qposadr == a))
+            lo, hi = float(m.jnt_range[j][0]), float(m.jnt_range[j][1])
+            if hi > lo and not (lo - 1e-6 <= float(q[i]) <= hi + 1e-6):
+                bad.append(f"{m.joint(j).name}={float(q[i]):+.3f} "
+                           f"outside [{lo:+.3f}, {hi:+.3f}]")
+        if bad:
+            raise ValueError("pose is outside the model's joint limits: "
+                             + "; ".join(bad))
 
     def _place(self, q, root_pitch, clearance=0.002):
         """Put the robot in `q` at `root_pitch`, dropped onto the floor."""
@@ -526,7 +1230,9 @@ class AsimovGetupEnv(AsimovWalkEnv):
         #  (the base env's) rather than :  now
         # lives on AsimovGetupEnv, which a rung start needs, and  is
         # defined further down on the reference subclass. Same 23 addresses.
-        d.qpos[getattr(self, "_q_adr", self.joint_qpos_adr)] = np.asarray(q)
+        adr = getattr(self, "_q_adr", self.joint_qpos_adr)
+        self._refuse_illegal_joints(np.asarray(q), adr)
+        d.qpos[adr] = np.asarray(q)
         mujoco.mj_forward(m, d)
         # MuJoCo's own collision detection, not a bound on the geometry — see
         # `asimov_getup_ref.settle_onto_floor` for the 50 mm of float and 25 mm
@@ -633,6 +1339,94 @@ class AsimovGetupEnv(AsimovWalkEnv):
         self._best_trunk_z = max(best, z)
         return gain * 50.0
 
+    def _tuck_gain(self) -> float:
+        """Monotone gain from bringing the FEET UNDER THE MASS.
+
+        The horizontal distance from the centre of mass to the midpoint of
+        the feet, best-so-far. Reducing it is the whole of "get your feet
+        under you", and it is the one move every other term charges for:
+        tucking lowers the trunk and costs uprightness on the way.
+        """
+        import mujoco as _mj
+
+        _mj.mj_comPos(self.model, self.data)
+        com = np.asarray(self.data.subtree_com[0], float)
+        ids = getattr(self, "_span_body_ids", None)
+        if ids is None:
+            ids = tuple(int(self.model.geom_bodyid[self.foot_geoms[s]])
+                        for s in ("left", "right"))
+            self._span_body_ids = ids
+        mid = (np.asarray(self.data.xpos[ids[0]], float)
+               + np.asarray(self.data.xpos[ids[1]], float)) / 2.0
+        gap = float(np.hypot(com[0] - mid[0], com[1] - mid[1]))
+        best = self._best_tuck
+        if best is None:
+            self._best_tuck = gap
+            return 0.0
+        gain = max(best - gap, 0.0)
+        self._best_tuck = min(best, gap)
+        return gain
+
+    def _upright_gain(self) -> float:
+        """Monotone gain in UPRIGHTNESS, the mirror of `_progress`.
+
+        Only motion that takes the trunk more upright than its own best this
+        episode. A per-step rate would be farmable by rocking, exactly as
+        plain up-speed was — bouncing scored 32.5 and random actions 35.4
+        against a real get-up's 57.2.
+        """
+        u = float(-self._projected_gravity()[2])
+        best = self._best_upright
+        if best is None:
+            self._best_upright = u
+            return 0.0
+        gain = max(u - best, 0.0)
+        self._best_upright = max(best, u)
+        return gain
+
+    def _supine_axis(self) -> float:
+        """`f_z`: the world-z component of the TORSO's forward axis.
+
+        -1 face down, +1 face up, ~0 on a side — Menlo's own
+        `label_fallen_states` takes the argmax of (f_z, -f_z, -l_z, l_z), so
+        this is the axis "supine" is decided on. Read off the torso, not the
+        trunk/pelvis body, for the same reason the classifier does.
+        """
+        import mujoco as _mj
+        if getattr(self, "_torso_bid", None) is None:
+            from . import asimov_getup as _G
+            bid = _mj.mj_name2id(
+                self.model, _mj.mjtObj.mjOBJ_BODY, _G.TORSO_BODY)
+            # `mj_name2id` returns -1 for a name this model does not have,
+            # and -1 is not None — so an unguarded cache would accept it and
+            # `xmat[-1]` would silently read the LAST body, paying `roll_pay`
+            # on an unrelated link with no error. The same shape as this
+            # repo's vendor-link-name trap.
+            if bid < 0:
+                raise RuntimeError(
+                    f"this model has no {_G.TORSO_BODY!r} body, so the supine "
+                    "axis cannot be read — `roll_pay` must stay 0 on it")
+            self._torso_bid = int(bid)
+        return float(self.data.xmat[self._torso_bid].reshape(3, 3)[2, 0])
+
+    def _roll_gain(self) -> float:
+        """Monotone gain in `f_z` — the mirror of `_upright_gain`.
+
+        Only motion that turns the chest further skyward than its own best
+        this episode. A per-step rate would be farmable by rocking, which is
+        how plain up-speed was farmed (bouncing scored 32.5 and random
+        actions 35.4 against a real get-up's 57.2), and `swing` was farmed at
+        1807 an episode before it was made monotone.
+        """
+        f = self._supine_axis()
+        best = self._best_supine
+        if best is None:
+            self._best_supine = f
+            return 0.0
+        gain = max(f - best, 0.0)
+        self._best_supine = max(best, f)
+        return gain
+
     def _compute_reward(self) -> tuple[float, dict[str, float]]:
         pelvis_z = float(self.data.xpos[self.trunk_body_id][2])
         upright = float(-self._projected_gravity()[2])       # +1 standing
@@ -670,7 +1464,27 @@ class AsimovGetupEnv(AsimovWalkEnv):
         terms = {
             "stand": self.W_STAND * stand,
             "rise": self.W_RISE * rise,
+            # The foot-span charge. It belongs on EVERY get-up reward, and
+            # adding it to the two subclasses and not this base is how the
+            # descend curriculum was first priced with a charge of exactly
+            # 0.0 while `span_cost=80` sat in its kwargs.
+            "span_penalty": -self._span_charge(),
+            "flight_penalty": -self._flight_charge(),
+            "balance_penalty": -self._balance_charge(),
+            "home": self._home_gain(),
+            "calm_penalty": -self._calm_charge(),
+            "swing": self._swing_gain(),
+            "limit_penalty": -self._limit_charge(),
             "progress": self.W_PROGRESS * gain,
+            # ROTATION, the axis the task actually turns on. Off by default
+            # (0.0), so every earlier run reproduces exactly.
+            "rotate": self._rotate_pay * self._upright_gain(),
+            # GET THE FEET UNDER THE MASS. Off by default (0.0).
+            "tuck": self._tuck_pay * self._tuck_gain(),
+            # ROLL ONTO THE BACK. Off by default (0.0). See `ROLL_ENV`.
+            "roll": self._roll_pay * self._roll_gain(),
+            "on_back": (self._roll_pay * self.ROLL_HOLD_W
+                        * float(self._supine_axis() >= self.ROLL_DONE)),
             "standing": self.W_STANDING * float(up),
             "joint_vel_penalty": -self.W_JOINT_VEL * joint_vel * float(up) * pen,
             "action_rate_penalty": -self.W_ACTION_RATE * rate * pen,
@@ -742,6 +1556,387 @@ class AsimovGetupEnv(AsimovWalkEnv):
         (70_000, 0.60), (100_000, 1.00),
     )
 
+    def _span_charge(self) -> float:
+        """What this step's stance costs, in reward, above `span_target`.
+
+        One-sided on purpose — AGENTS.md's rule for body terms — so a stance
+        NARROWER than the target is not paid for being narrow and the robot
+        has no reason to bring its feet together past a human stance.
+        """
+        if self._span_cost <= 0.0:
+            return 0.0
+        return self._span_cost * max(0.0, self._foot_span() - self._span_target)
+
+    def _flight_charge(self) -> float:
+        """What this step costs if the robot is in the AIR, in reward.
+
+        Zero floor contacts = flight. Asked of MuJoCo's own contact list
+        rather than of any height threshold, because the question is whether
+        the robot is SUPPORTED, and a 1.2 m body can have every geom above
+        50 mm while still resting on a heel.
+
+        Binary per step on purpose. A charge proportional to clearance would
+        pay for a LOW hop, and a low hop is the same move.
+        """
+        if self._ground_cost <= 0.0:
+            return 0.0
+        return 0.0 if self._on_floor_contacts() else self._ground_cost
+
+    def _home_gain(self) -> float:
+        """Per-step pay for being in the robot's OWN default pose, while up.
+
+        Gated on uprightness AND on the feet being the only thing down —
+        not on a full stand, so it still pulls through the last part of the
+        rise (the feet-only condition holds from ~0.8 s, well before the
+        trunk clears the bar), but a KNEEL cannot collect it. Kneeling in
+        the default pose is vertical, scores uprightness ~+1, and under an
+        uprightness-only gate would have paid full price for never standing
+        up — the "a proxy that failure also satisfies" trap, which this
+        repo has paid for five times.
+        """
+        if self._home_pay <= 0.0:
+            return 0.0
+        from . import asimov_getup_ref as _R
+        if float(-self._projected_gravity()[2]) <= _R.STAND_UPRIGHT:
+            return 0.0
+        if not self._on_feet_only():
+            return 0.0
+        adr = getattr(self, "_q_adr", self.joint_qpos_adr)
+        q = np.asarray(self.data.qpos[adr], float)
+        err = np.abs(q - np.asarray(self.robot.default_pose, float))
+        # NOTE (2026-10-10): scoring this PER JOINT was tried and reverted.
+        # Mean-of-exponentials makes a single 50 deg joint cost LESS than the
+        # same total error spread over 23 (9.57 vs 8.27 at weight 10), which
+        # is the opposite of the intent. And the premise was wrong anyway:
+        # forcing the arms to neutral on a standing policy takes it from
+        # 13/24 to **0/24**, so the raised arm is LOAD-BEARING, not sloppy.
+        # No pose reward can fix it while the robot arrives at 0.89 m/s.
+        # The old note on the mean hiding a joint:
+        # which is what this was and which let one joint hide completely.
+        # Measured on s11: mean error 13.2 deg while `right_shoulder_pitch`
+        # sat **49.4 deg** out (+63.8 against a neutral +14.3) and
+        # `right_shoulder_yaw` 37 deg. Averaging first, a 50 deg arm moves a
+        # 23-joint mean by 2 deg and costs almost nothing, so the policy was
+        # never paid to put the arm down. Jonathan saw it immediately next
+        # to the shipped walk policy's neutral stand: *it's not really
+        # standing straight with both of the arms down*.
+        #
+        # Scored this way a joint 50 deg out contributes exp(-4.3) = 0.014
+        # of its share whatever the others do, so the gradient points at the
+        # WORST joint instead of away from it.
+        return self._home_pay * float(np.exp(-err.mean() / self.HOME_TOL))
+
+    def _limit_charge(self) -> float:
+        """What this step costs for standing ON its joint stops, in reward.
+
+        Summed over every actuated hinge, in radians past its own range.
+        """
+        if self._limit_cost <= 0.0:
+            return 0.0
+        m = self.model
+        adr = np.atleast_1d(getattr(self, "_q_adr", self.joint_qpos_adr))
+        ids = getattr(self, "_limit_jnt", None)
+        if ids is None:
+            ids = [int(np.argmax(m.jnt_qposadr == a)) for a in adr]
+            self._limit_jnt = ids
+        over = 0.0
+        for a, j in zip(adr, ids):
+            lo, hi = float(m.jnt_range[j][0]), float(m.jnt_range[j][1])
+            if hi <= lo:
+                continue
+            v = float(self.data.qpos[a])
+            over += max(0.0, v - hi) + max(0.0, lo - v)
+        return self._limit_cost * over
+
+    def handoff_ready(self) -> bool:
+        """Is the robot in a state Menlo's walker can take over?
+
+        THE ONE DEFINITION. `behaviors.asimov_tasks._getup_handoff_due`
+        delegates here, so the condition the reward trains against and the
+        condition the lab deploys cannot drift — the failure this repo has
+        under "One definition of success, in the library".
+        """
+        from . import asimov_getup_ref as _R
+
+        xy = np.asarray(self.data.xpos[self.trunk_body_id][:2], float)
+        prev = self._handoff_prev_xy
+        self._handoff_prev_xy = xy.copy()
+        speed = 0.0 if prev is None else float(np.linalg.norm(xy - prev) * 50.0)
+        self._handoff_speed = speed
+        ok = _R.is_standing(self) and speed <= self.HANDOFF_SPEED
+        self._handoff_streak = (self._handoff_streak + 1) if ok else 0
+        return self._handoff_streak >= self.HANDOFF_DWELL
+
+    def _handoff_score(self) -> float:
+        """How CATCHABLE this handoff is, 0..1, from the measured basin."""
+        v = float(getattr(self, "_handoff_speed", 0.0))
+        lo, hi = self.HANDOFF_GOOD, self.HANDOFF_DROP
+        return float(np.clip((hi - v) / (hi - lo), 0.0, 1.0))
+
+    def _shoulder_pitch(self) -> np.ndarray:
+        """(left, right) shoulder pitch, radians, resolved once."""
+        idx = getattr(self, "_sh_adr", None)
+        if idx is None:
+            m = self.model
+            adr = np.atleast_1d(getattr(self, "_q_adr", self.joint_qpos_adr))
+            want = {}
+            for a in adr:
+                j = int(np.argmax(m.jnt_qposadr == a))
+                nm = m.joint(j).name
+                if nm == "left_shoulder_pitch_joint":
+                    want["l"] = int(a)
+                elif nm == "right_shoulder_pitch_joint":
+                    want["r"] = int(a)
+            idx = (want.get("l"), want.get("r"))
+            self._sh_adr = idx
+        if idx[0] is None or idx[1] is None:
+            return np.zeros(2)
+        return np.array([float(self.data.qpos[idx[0]]),
+                         float(self.data.qpos[idx[1]])])
+
+    def _swing_gain(self) -> float:
+        """Pay for swinging BOTH arms the same way, while still rising.
+
+        The shoulders are mirrored in the model, so the same world direction
+        is `-left + right`; the ANTI-symmetric part (one up, one down) is a
+        balance flail and is deliberately not paid.
+        """
+        if self._swing_pay <= 0.0:
+            return 0.0
+        cur = self._shoulder_pitch()
+        from . import asimov_getup_ref as _R
+        if _R.is_standing(self):
+            return 0.0                      # a STAND is never paid for waving
+        z = float(self.data.xpos[self.trunk_body_id][2])
+        if z >= _R.STAND_FRAC * _R.BY_NAME["stand"].settled_z:
+            return 0.0
+        # NO RATE BASELINE. An amplitude term does not need one, and keeping
+        # it cost two wasted calls at the start of every episode: the first
+        # returned early on `prev is None` before the min/max were seeded,
+        # so the sweep could not register until the third step.
+        # MONOTONE GAIN IN THE SWEEP, the same shape as `progress` and
+        # `rotate`, and the third design for this term.
+        #
+        #   * paid on the RATE alone it was farmed instantly — 1807 an
+        #     episode for lying on the floor waving;
+        #   * multiplied by upward trunk speed it stopped being farmable and
+        #     stopped being LEARNABLE, because a policy that cannot yet rise
+        #     has `up` about zero, so the term meant to CAUSE the rise only
+        #     paid once the rise existed (arm sweep moved 90.9 -> 96.6 deg,
+        #     i.e. nothing);
+        #   * paid per step against a per-episode budget, random thrashing
+        #     hit the cap in under two seconds, so there was no gradient
+        #     toward a BIGGER swing either.
+        #
+        # What the kip actually needs is AMPLITUDE: 200 deg of sweep lifts
+        # the trunk 16 mm and rotates it -0.13 -> -0.05 with the legs
+        # passive, while holding the arms overhead without sweeping does
+        # nothing at all. So pay the peak-to-peak sweep, best-so-far: a
+        # wider sweep earns, the same sweep repeated earns nothing, and the
+        # total over an episode is simply `swing_pay x final sweep`.
+        if self._ep_k > int(self.SWING_WINDOW_S * 50):
+            return 0.0
+        pos = float(-cur[0] + cur[1]) / 2.0
+        lo = self._swing_lo = (pos if self._swing_lo is None
+                               else min(self._swing_lo, pos))
+        hi = self._swing_hi = (pos if self._swing_hi is None
+                               else max(self._swing_hi, pos))
+        sweep = hi - lo
+        gain = max(0.0, sweep - self._swing_best)
+        self._swing_best = max(self._swing_best, sweep)
+        return self._swing_pay * gain
+
+    def _trunk_speed(self) -> float:
+        """Horizontal speed of the trunk, m/s, in the world frame.
+
+        `cvel` is in the body's own frame and its linear half is rows 3:6 —
+        the velocity-frame trap this repo has a memory about. Taken from
+        `xpos` across one control step instead, which is unambiguous.
+        """
+        tb = self.trunk_body_id
+        now = np.asarray(self.data.xpos[tb][:2], float)
+        prev = getattr(self, "_prev_trunk_xy", None)
+        self._prev_trunk_xy = now.copy()
+        if prev is None:
+            return 0.0
+        return float(np.linalg.norm(now - prev) * 50.0)
+
+    def _calm_charge(self) -> float:
+        """What this step costs for arriving (or standing) FAST, in reward."""
+        if self._calm_cost <= 0.0:
+            return 0.0
+        if not self._on_feet_only():
+            return 0.0
+        from . import asimov_getup_ref as _R
+        if float(-self._projected_gravity()[2]) <= _R.STAND_UPRIGHT:
+            return 0.0
+        # THE ARRIVAL, NOT THE HOLD. The first version charged speed for as
+        # long as the robot was up, which prices the CORRECTIONS that keep it
+        # there — and measured, that stage went `stays` 13/24 -> 6/24. The
+        # lunge is a property of how it gets to standing, so the charge ends
+        # once it has been up for `CALM_WINDOW_S`; after that it may move as
+        # much as it needs to.
+        k = int(getattr(self, "_ep_k", 0))
+        if self._stood_at is None:
+            self._stood_at = k
+        if k - self._stood_at > int(self.CALM_WINDOW_S * 50):
+            return 0.0
+        return self._calm_cost * max(0.0, self._trunk_speed() - self.CALM_FREE)
+
+    def _reset_push(self) -> None:
+        """Disarm the shove clock. PER EPISODE, beside the best-so-far
+        baselines — `rotate` paid 0.00 at a weight of 40 for exactly one
+        reason, which was a per-episode quantity initialised once in the
+        constructor."""
+        self._push_until = -1
+        self._push_next = -1
+        self._push_k = 0
+        self._ep_k = 0
+        self._stood_at = None
+        # The SWING baselines, per episode and for the same reason every
+        # best-so-far baseline is reset here: a rate carried across a reset
+        # is a rate between two different episodes. `rotate` paid 0.00 at a
+        # weight of 40 because one of these lived only in the constructor.
+        self._prev_sh = None
+        self._prev_swing_z = None
+        self._prev_trunk_xy = None
+        self._handoff_streak = 0
+        self._handoff_prev_xy = None
+        self._swing_lo = None
+        self._swing_hi = None
+        self._swing_best = 0.0
+        self._pushes = 0
+        self._push_vec = np.zeros(3)
+        if self._push_bw > 0.0:
+            self.data.xfrc_applied[self.trunk_body_id, 0:2] = 0.0
+
+    def _apply_push(self) -> None:
+        """Shove the trunk, once the robot is up. Called before every step.
+
+        Writes the HORIZONTAL row only and leaves `xfrc_applied[trunk, 2]`
+        alone, because that is the assist's channel and clobbering it would
+        silently switch the assist off mid-episode.
+        """
+        if self._push_bw <= 0.0:
+            return
+        from . import asimov_getup_ref as _R
+
+        tb = self.trunk_body_id
+        k = int(getattr(self, "_ep_steps", 0) or self._step_count())
+        if k <= self._push_until:
+            self.data.xfrc_applied[tb, 0:2] = self._push_vec[:2]
+            return
+        self.data.xfrc_applied[tb, 0:2] = 0.0
+        if not _R.is_standing(self):
+            return
+        if self._push_next < 0:                    # first stand: arm the clock
+            lo, hi = self.PUSH_EVERY_S
+            self._push_next = k + int(50 * float(self._rng.uniform(lo, hi)))
+            return
+        if k < self._push_next:
+            return
+        mass = float(self.model.body_subtreemass[tb])
+        mag = float(self._rng.uniform(0.5, 1.5)) * self._push_bw * mass * 9.81
+        yaw = float(self._rng.uniform(0.0, 2.0 * np.pi))
+        self._push_vec = np.array([mag * np.cos(yaw), mag * np.sin(yaw), 0.0])
+        self.data.xfrc_applied[tb, 0:2] = self._push_vec[:2]
+        self._push_until = k + int(50 * self.PUSH_HOLD_S)
+        lo, hi = self.PUSH_EVERY_S
+        self._push_next = (self._push_until
+                           + int(50 * float(self._rng.uniform(lo, hi))))
+        self._pushes += 1
+
+    def _step_count(self) -> int:
+        """Steps this episode, for bodies that do not keep `_ep_steps`."""
+        n = getattr(self, "_push_k", 0) + 1
+        self._push_k = n
+        return n
+
+    def _on_feet_only(self) -> bool:
+        """Is the robot touching the floor with its FEET and nothing else?
+
+        The cheap half of `standing_report`'s test, without the part naming
+        — this runs every step of every env and `part_of` walks the chain.
+        """
+        m, d = self.model, self.data
+        feet = {int(m.geom_bodyid[self.foot_geoms[s]])
+                for s in ("left", "right")}
+        seen = False
+        for c in range(int(d.ncon)):
+            g1, g2 = d.contact[c].geom1, d.contact[c].geom2
+            if m.geom_bodyid[g1] == 0 or m.geom_bodyid[g2] == 0:
+                b = int(m.geom_bodyid[g2] if m.geom_bodyid[g1] == 0
+                        else m.geom_bodyid[g1])
+                if b not in feet:
+                    return False
+                seen = True
+        return seen
+
+    def _balance_charge(self) -> float:
+        """What this step costs for standing off its feet, in reward.
+
+        Zero unless the robot is UP — so the rise is never charged — and
+        zero while the CoM is inside the polygon, so this is a one-sided
+        body term like `_span_charge`, not a target to be optimised toward.
+        """
+        if self._balance_cost <= 0.0:
+            return 0.0
+        from . import asimov_getup_ref as _R
+        if float(-self._projected_gravity()[2]) <= _R.STAND_UPRIGHT:
+            return 0.0
+        if not self._on_feet_only():
+            return 0.0
+        margin = _R.support_margin(self)
+        if margin is None or margin >= 0.0:
+            return 0.0
+        return self._balance_cost * min(-margin, self.BALANCE_CAP)
+
+    def _on_floor_contacts(self) -> int:
+        """How many contacts this step are with the floor (world body 0)."""
+        ids = getattr(self, "_floor_geom_ids", None)
+        if ids is None:
+            ids = frozenset(g for g in range(self.model.ngeom)
+                            if self.model.geom_bodyid[g] == 0)
+            self._floor_geom_ids = ids
+        return sum(1 for i in range(self.data.ncon)
+                   if self.data.contact[i].geom1 in ids
+                   or self.data.contact[i].geom2 in ids)
+
+    def _span_allowed(self) -> float:
+        """The span cut AT THIS HEIGHT — wide only inside the launch window.
+
+        Outside it the robot is either supported on its arms or standing on
+        its feet, and in both the narrow stance is what the authored route
+        uses (every waypoint sits at 0.215 m). Inside it the robot is crossing
+        136 mm of nothing, and a wide base is the only mechanism measured to
+        work. This bounds the sprawl to that moment instead of banning it.
+        """
+        if self._launch_span <= 0.0:
+            return self._max_span
+        from . import asimov_getup_ref as _R
+        z = float(self.data.xpos[self.trunk_body_id][2])
+        lo = _R.BY_NAME["pike"].settled_z - 0.02
+        hi = _R.BY_NAME["fold"].settled_z + 0.02
+        return self._launch_span if lo <= z <= hi else self._max_span
+
+    def _foot_span(self) -> float:
+        """Distance between the two feet, metres — lateral AND fore-aft.
+
+        Not the lateral width alone: the sprawl this exists to forbid opens
+        both, and a robot in a front-to-back splits is in the splits.
+        """
+        import numpy as _np
+        ids = getattr(self, "_span_body_ids", None)
+        if ids is None:
+            # resolved from the SPEC's own foot geoms, so a body that renames
+            # its ankle link cannot silently measure the wrong pair
+            ids = tuple(int(self.model.geom_bodyid[self.foot_geoms[side]])
+                        for side in ("left", "right"))
+            self._span_body_ids = ids
+        a = self.data.xpos[ids[0]]
+        b = self.data.xpos[ids[1]]
+        return float(_np.hypot(a[0] - b[0], a[1] - b[1]))
+
     def _penalty_scale(self) -> float:
         """How much of the shaping penalties apply yet, by per-env lifetime."""
         n = getattr(self, "_lifetime_steps", 0)
@@ -771,7 +1966,30 @@ class AsimovGetupEnv(AsimovWalkEnv):
         already sums the gate, and a sum cannot tell 40 scattered frames from
         one 0.8 s hold.
         """
+        if self.in_prologue():
+            # THE SERVOS DRIVE, not the policy. Substituting here rather than
+            # in `reset` is the whole point: this is stepped time, so the lab
+            # shows the push-up instead of jumping to its last frame.
+            action = self._prologue_plan[self._prologue_i]
+            self._prologue_i += 1
+        self._ep_k = getattr(self, "_ep_k", 0) + 1
+        self._apply_push()
         obs, reward, terminated, truncated, info = super().step(action)
+        info["prologue"] = self.in_prologue()
+        info["pushes"] = self._pushes
+        if self._max_span > 0.0 and not terminated and self._foot_span() > self._span_allowed():
+            terminated = True
+            self._span_cuts += 1
+        # THE EPISODE ENDS AT THE HANDOFF, when trained for it. The bonus
+        # replaces the income the rest of the episode would have paid, so
+        # arriving catchable is worth standing perfectly and arriving fast
+        # is worth a fraction of it.
+        if self._handoff_pay > 0.0 and not terminated and self.handoff_ready():
+            left = max(0, int(self.max_steps) - int(self._ep_k))
+            reward += self._handoff_pay * left * self._handoff_score()
+            info["handoff_score"] = self._handoff_score()
+            info["handoff_step"] = int(self._ep_k)
+            terminated = True
         if self._stood and not terminated:
             upright = float(-self._projected_gravity()[2])
             height = float(self.data.xpos[self.trunk_body_id][2]) / self._stand_z
@@ -1351,6 +2569,13 @@ class AsimovGetupRefEnv(AsimovGetupEnv):
             "contact": self.W_CONTACT * contact,
             "advance": self.W_ADVANCE * float(advanced),
             "up": self.W_UP * float(up),
+            "span_penalty": -self._span_charge(),
+            "flight_penalty": -self._flight_charge(),
+            "balance_penalty": -self._balance_charge(),
+            "home": self._home_gain(),
+            "calm_penalty": -self._calm_charge(),
+            "swing": self._swing_gain(),
+            "limit_penalty": -self._limit_charge(),
             "action_rate_penalty": -self.W_ACTION_RATE * rate,
         }
         self._track_err = err
@@ -1368,8 +2593,12 @@ class AsimovGetupRefEnv(AsimovGetupEnv):
         """
         obs, reward, terminated, truncated, info = super().step(action)
         self._ep_steps += 1
-        if (not terminated and not self._free
+        if (not terminated and not self._free and not self.in_prologue()
                 and getattr(self, "_track_err", 0.0) > self._track_tol):
+            # NOT WHILE THE SERVOS DRIVE. During the scripted push-up the
+            # policy's action is discarded, so ending the episode for drifting
+            # off the reference would charge it for a motion it did not make —
+            # and would kill most episodes in their first second.
             terminated = True
         if not terminated:
             floor = getattr(self, "_anchor_z", 0.0) - self.CUT_BACK_Z
@@ -1478,7 +2707,25 @@ class AsimovGetupClipEnv(AsimovGetupRefEnv):
     # ----------------------------------------------------------------- reset
 
     def reset(self, *, seed=None, options=None):
-        """Start where a SUCCESSFUL demonstration started, and track it."""
+        """Start where a SUCCESSFUL demonstration started, and track it.
+
+        THIS TASK CHOOSES ITS OWN START, so `start_rung` cannot apply — the
+        line below overwrites whatever the base class placed. It used to do
+        that in SILENCE: three chains were launched with
+        `start_rung="pike"`, recorded it in `run.json`, trained entirely from
+        clip frames at a median trunk height of **0.153 m**, and were then
+        evaluated in an env built the same way, so "rises 16/16 from the
+        settled pike" was measuring clip starts at every step. `getup` is the
+        task that honours the rung (pike -> 0.299 m, falling at depth 0 ->
+        0.523 m, both measured). The sixth knob on this body to train while
+        something else was recorded, and the first that a RECORDING test
+        could not catch — recorded is not applied.
+        """
+        if self._start_rung and self._start_rung != "floor":
+            raise ValueError(
+                f"getup_clip starts on a demonstration frame, so "
+                f"start_rung={self._start_rung!r} would be silently "
+                f"discarded — use --task getup, which honours it")
         obs, info = super().reset(seed=seed, options=options)
         self._clip_i = int(self._rng.integers(len(self._clips)))
         self._clip = self._clips[self._clip_i]
@@ -1512,7 +2759,16 @@ class AsimovGetupClipEnv(AsimovGetupRefEnv):
     #: product cannot be farmed by one axis. Same fault as the authored
     #: reference's (`AGENTS.md`, "same joints, different body"), recurring here
     #: because the harvested reward was written from the joint half alone.
-    ROOT_Z_STD = 0.10
+    #: Tightened 0.10 -> 0.05 on 2026-10-07. At 0.10 a 2 cm sag cost `track`
+    #: only 18 %, so the reward was nearly FLAT across the exact drift that
+    #: loses the episode: measured on teach-asimov_getup_clip-0e31e5, `track`
+    #: paid 6.75 -> 6.43 -> 6.49 -> 5.55 while the trunk fell 0.613 -> 0.597 m,
+    #: and `up` contributes nothing at all until the robot is already below the
+    #: standing threshold — a cliff, not a slope. 59 of 72 episodes stand and
+    #: then go down, and the servos are not the limit: during the sink the
+    #: commanded knee climbs 0.383 -> 0.645 rad with max torque 12.8 Nm against
+    #: 45 rated. The policy COMMANDS the sag, and nothing charged it.
+    ROOT_Z_STD = 0.05
     ROOT_U_STD = 0.25
 
     def _clip_target(self):
@@ -1530,7 +2786,15 @@ class AsimovGetupClipEnv(AsimovGetupRefEnv):
         one of the 23 tracked joints — cannot make the two incomparable.
         """
         ref = self._clip[self._clip_t()]
-        dz = abs(float(self.data.qpos[2]) - float(ref[2]))
+        # ONE-SIDED, and that is AGENTS.md's rule rather than a preference:
+        # "Make the BODY terms one-sided (max(0, target - actual)). Two-sided,
+        # the reward scored a pose past the target WORSE than one short of it
+        # — it punished overshooting toward the goal, which on a rise cannot be
+        # wrong." This was `abs()`, so a robot AHEAD of the demonstration was
+        # charged exactly as much as one sagging below it, and the measured
+        # failure is entirely on the low side: the policy stands at 0.613 m
+        # and then drifts DOWN to 0.452 while the reference holds 0.619.
+        dz = max(0.0, float(ref[2]) - float(self.data.qpos[2]))
         mat = np.zeros(9)
         mujoco.mju_quat2Mat(mat, np.ascontiguousarray(ref[3:7], dtype=float))
         ref_u = float(mat[8])
@@ -1562,6 +2826,13 @@ class AsimovGetupClipEnv(AsimovGetupRefEnv):
                      * float(np.exp(-dz / self.ROOT_Z_STD
                                     - du / self.ROOT_U_STD)),
             "up": self.W_UP * float(up),
+            "span_penalty": -self._span_charge(),
+            "flight_penalty": -self._flight_charge(),
+            "balance_penalty": -self._balance_charge(),
+            "home": self._home_gain(),
+            "calm_penalty": -self._calm_charge(),
+            "swing": self._swing_gain(),
+            "limit_penalty": -self._limit_charge(),
             "action_rate_penalty": -self.W_ACTION_RATE * rate
                                    * self._penalty_scale(),
         }

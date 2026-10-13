@@ -1294,6 +1294,7 @@ class AsimovBody(_SPEC_BASE):
         task = getattr(args, "task", None) or self.default_task
         if task == "getup_clip":
             from .asimov_env import AsimovGetupClipEnv as CE
+            from .asimov_env import AsimovGetupEnv as E
             from .asimov_env import AsimovGetupRefEnv as RE
             # The IMITATION task records which demonstration it tracked and how
             # much drift it was allowed. Without this the run recorded
@@ -1312,7 +1313,79 @@ class AsimovBody(_SPEC_BASE):
                 # the body's duck-inherited 4.0 and a policy trained at 4.0 and
                 # one trained at 13.0 are not the same controller: at 4.0,
                 # 92-98 % of the teacher's DAgger corrections are unexecutable.
-                "action_clip": CE.TEACHER_ACTION_CLIP,
+                # READ FROM THE ENVIRONMENT, not pinned: a constant here is
+                # PASSED TO THE CTOR, so it overrode the stage's own
+                # `ACTION_CLIP` and the knob was dead on this task. It happened
+                # to equal the teacher's value in every recipe that set it, so
+                # nothing was measured wrong — but the next value would have
+                # been silently ignored. See "One knob, three clip sites".
+                "action_clip": float(os.environ.get(E.CLIP_ENV, "")
+                                     or CE.TEACHER_ACTION_CLIP),
+                # WHICH RUNG the episodes start on, and the SPAN CUTS. All four
+                # were read straight from the environment by the ctor and
+                # trained with while `run.json` said nothing — the FIFTH time
+                # this exact bug has been found on this body. It is not
+                # cosmetic: `teach-asimov_getup_tidy-f4b58f` trained under a
+                # 0.45 m span cut that ended its episodes after 28 steps, and
+                # its `run.json` recorded neither the cut nor the window, so
+                # every later evaluation rebuilt a different task and scored it.
+                "start_rung": os.environ.get(E.START_RUNG_ENV, "") or "",
+                "max_span": float(os.environ.get(E.SPAN_ENV, "") or 0.0),
+                "launch_span": float(os.environ.get(E.LAUNCH_SPAN_ENV, "")
+                                     or 0.0),
+                "fall_depth": float(os.environ.get(E.FALL_DEPTH_ENV, "")
+                                    or 1.0),
+                # The CONTINUOUS span charge and the width it is measured
+                # from. On the run because a run that TERMINATES on a wide
+                # stance and one that is CHARGED for it are not two seeds of
+                # one experiment — the cut taught the policy to stop standing
+                # altogether (`…-rise-126f42-s2`: up 0.0 from 98 k steps,
+                # return 35.5 against a do-nothing floor of 39.8).
+                # THE ASSIST FORCE, as a fraction of body weight held up at
+                # the pelvis. It changes the DYNAMICS, so a run at 0.85 and
+                # one at 0.00 are different robots — and on this task it is
+                # the whole curriculum: 0.85 is the only setting measured to
+                # cross the pike->fold gap (fold reached 12/12 at a 0.355 m
+                # span) and 1.00 launches the robot to 1.8 m.
+                "getup_assist": float(os.environ.get(E.ASSIST_ENV, "0.0")
+                                      or 0.0),
+                # THE SCRIPTED PUSH-UP. A run whose episodes begin with
+                # 1.56 s of servo-driven prone->pike and one that starts at a
+                # placed pike are not the same experiment: the policy inherits
+                # a pike it ARRIVED at, with real velocity.
+                "prologue": os.environ.get(E.PROLOGUE_ENV, "") or "",
+                # GET THE FEET UNDER THE MASS — see `AsimovGetupEnv.TUCK_ENV`.
+                "tuck_pay": float(os.environ.get(E.TUCK_ENV, "") or 0.0),
+                # ROTATION pay. The get-up's blocker is rotation, not
+                # height, and `progress` pays only height — so a run with this
+                # on and one without optimise different things entirely.
+                "rotate_pay": float(os.environ.get(E.ROTATE_ENV, "") or 0.0),
+                # ROLL ONTO THE BACK — recorded on every branch, because a
+                # knob a run SETS and does not RECORD is the bug this file
+                # has now had five times.
+                "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
+                "span_cost": float(os.environ.get(E.SPAN_COST_ENV, "")
+                                   or 0.0),
+                "span_target": float(os.environ.get(E.SPAN_TARGET_ENV, "")
+                                     or 0.40),
+                # THE FLIGHT CHARGE. Recorded on every branch, because a
+                # knob a run SETS and does not RECORD is the bug this file
+                # has now had five times.
+                "ground_cost": float(os.environ.get(E.GROUND_ENV, "")
+                                     or 0.0),
+                "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
+                                      or 0.0),
+                "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+                "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
+                "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
+                "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
+                "swing_pay": float(os.environ.get(E.SWING_ENV, "") or 0.0),
+                "handoff_pay": float(os.environ.get(E.HANDOFF_ENV, "")
+                                     or 0.0),
+                # FREE mode: the intermediates are not imitated, only the rise
+                # is paid. A free run and a tracking one optimise different
+                # objectives and are not two seeds of one experiment.
+                "free": bool(int(os.environ.get(RE.FREE_ENV, "0") or 0)),
             }
         if task == "getup_ref":
             from .asimov_env import AsimovGetupEnv as E
@@ -1357,6 +1430,66 @@ class AsimovBody(_SPEC_BASE):
                 # starts on the floor and one that starts on the arm plateau are
                 # two different halves of the task, not two seeds of one.
                 "start_rung": os.environ.get(E.START_RUNG_ENV, "") or "",
+                # The SPRAWL cut. Unrecorded, the env still read it from the
+                # environment and trained with it while `run.json` said
+                # nothing — so every later evaluation rebuilt the env WITHOUT
+                # it and scored a different task. Measured: the staged chain's
+                # eval reached a 0.877 m foot span under a cut set to 0.70.
+                # This file's own docstring states the rule.
+                "max_span": float(os.environ.get(E.SPAN_ENV, "") or 0.0),
+                # How far down the fall `start_rung="falling"` may reset. THE
+                # curriculum axis for the one leg nothing learns from a static
+                # start — unrecorded, every later evaluation would rebuild a
+                # different task.
+                "fall_depth": float(os.environ.get(E.FALL_DEPTH_ENV, "")
+                                    or 1.0),
+                # The CONTINUOUS span charge and the width it is measured
+                # from. On the run because a run that TERMINATES on a wide
+                # stance and one that is CHARGED for it are not two seeds of
+                # one experiment — the cut taught the policy to stop standing
+                # altogether (`…-rise-126f42-s2`: up 0.0 from 98 k steps,
+                # return 35.5 against a do-nothing floor of 39.8).
+                # THE ASSIST FORCE, as a fraction of body weight held up at
+                # the pelvis. It changes the DYNAMICS, so a run at 0.85 and
+                # one at 0.00 are different robots — and on this task it is
+                # the whole curriculum: 0.85 is the only setting measured to
+                # cross the pike->fold gap (fold reached 12/12 at a 0.355 m
+                # span) and 1.00 launches the robot to 1.8 m.
+                "getup_assist": float(os.environ.get(E.ASSIST_ENV, "0.0")
+                                      or 0.0),
+                # THE SCRIPTED PUSH-UP. A run whose episodes begin with
+                # 1.56 s of servo-driven prone->pike and one that starts at a
+                # placed pike are not the same experiment: the policy inherits
+                # a pike it ARRIVED at, with real velocity.
+                "prologue": os.environ.get(E.PROLOGUE_ENV, "") or "",
+                # GET THE FEET UNDER THE MASS — see `AsimovGetupEnv.TUCK_ENV`.
+                "tuck_pay": float(os.environ.get(E.TUCK_ENV, "") or 0.0),
+                # ROTATION pay. The get-up's blocker is rotation, not
+                # height, and `progress` pays only height — so a run with this
+                # on and one without optimise different things entirely.
+                "rotate_pay": float(os.environ.get(E.ROTATE_ENV, "") or 0.0),
+                # ROLL ONTO THE BACK — recorded on every branch, because a
+                # knob a run SETS and does not RECORD is the bug this file
+                # has now had five times.
+                "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
+                "span_cost": float(os.environ.get(E.SPAN_COST_ENV, "")
+                                   or 0.0),
+                "span_target": float(os.environ.get(E.SPAN_TARGET_ENV, "")
+                                     or 0.40),
+                # THE FLIGHT CHARGE. Recorded on every branch, because a
+                # knob a run SETS and does not RECORD is the bug this file
+                # has now had five times.
+                "ground_cost": float(os.environ.get(E.GROUND_ENV, "")
+                                     or 0.0),
+                "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
+                                      or 0.0),
+                "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+                "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
+                "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
+                "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
+                "swing_pay": float(os.environ.get(E.SWING_ENV, "") or 0.0),
+                "handoff_pay": float(os.environ.get(E.HANDOFF_ENV, "")
+                                     or 0.0),
             }
         if task != "getup":
             return {}
@@ -1379,6 +1512,10 @@ class AsimovBody(_SPEC_BASE):
             # easiest one toppling in 0.34 s under ZERO action. Left reachable
             # so those four runs reproduce; a new run leaves it at 0.
             "getup_blend": float(os.environ.get(E.BLEND_ENV, "0.0") or 0.0),
+            # ROLL ONTO THE BACK — the axis `rotate` is blind to. Recorded on
+            # EVERY branch; this file has had the set-but-not-recorded bug
+            # five times, and a sixth the day this term was added.
+            "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
             # THE ACTION CLIP. Recorded because it is reachability on this
             # body, not tuning: the inherited 4.0 reaches 1.0 rad from the
             # standing pose and the working get-up needs 2.88. A run at 4.0 and
@@ -1399,12 +1536,45 @@ class AsimovBody(_SPEC_BASE):
             # starts on the floor and one that starts on the arm plateau are
             # two different halves of the task, not two seeds of one.
             "start_rung": os.environ.get(E.START_RUNG_ENV, "") or "",
+            # The SPRAWL cut and the FALL-DEPTH curriculum axis. Both were read
+            # from the environment and trained with while `run.json` said
+            # nothing, so every later evaluation rebuilt a different task —
+            # `teach-asimov_getup_catch-23657c` recorded start_rung="falling"
+            # but not WHICH DEPTH, which is the whole curriculum.
+            "max_span": float(os.environ.get(E.SPAN_ENV, "") or 0.0),
+            "fall_depth": float(os.environ.get(E.FALL_DEPTH_ENV, "") or 1.0),
+            "launch_span": float(os.environ.get(E.LAUNCH_SPAN_ENV, "") or 0.0),
+            # The CONTINUOUS span charge and the width it is measured
+            # from. On the run because a run that TERMINATES on a wide
+            # stance and one that is CHARGED for it are not two seeds of
+            # one experiment — the cut taught the policy to stop standing
+            # altogether (`…-rise-126f42-s2`: up 0.0 from 98 k steps,
+            # return 35.5 against a do-nothing floor of 39.8).
+            # THE SCRIPTED PUSH-UP — see `AsimovGetupEnv.PROLOGUE_ENV`.
+            "prologue": os.environ.get(E.PROLOGUE_ENV, "") or "",
+            # ROTATION pay — see `AsimovGetupEnv.ROTATE_ENV`.
+            # GET THE FEET UNDER THE MASS — see `AsimovGetupEnv.TUCK_ENV`.
+            "tuck_pay": float(os.environ.get(E.TUCK_ENV, "") or 0.0),
+            "rotate_pay": float(os.environ.get(E.ROTATE_ENV, "") or 0.0),
+            "span_cost": float(os.environ.get(E.SPAN_COST_ENV, "")
+                               or 0.0),
+            "span_target": float(os.environ.get(E.SPAN_TARGET_ENV, "")
+                                 or 0.40),
+            "ground_cost": float(os.environ.get(E.GROUND_ENV, "")
+                                 or 0.0),
+            "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
+                                  or 0.0),
+            "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+            "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
+            "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
+            "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
+            "swing_pay": float(os.environ.get(E.SWING_ENV, "") or 0.0),
+            "handoff_pay": float(os.environ.get(E.HANDOFF_ENV, "") or 0.0),
         }
         return out
 
     def env_class(self, task: str = "walk"):
-        from .asimov_env import (AsimovGetupEnv, AsimovGetupRefEnv,
-                                 AsimovWalkEnv)
+        from .asimov_env import AsimovGetupEnv, AsimovGetupRefEnv, AsimovWalkEnv
 
         if task in ("walk", ""):
             return AsimovWalkEnv

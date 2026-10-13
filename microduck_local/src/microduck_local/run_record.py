@@ -46,6 +46,87 @@ RECORD_NAME = "record.json"
 FIELDS = ("title", "description", "note", "group")
 
 
+#: Env kwargs a run RECORDS that any consumer replaying its policy must apply.
+#:
+#: One list, in one place, because the same bug has now been found twice in two
+#: different consumers and each was fixed alone:
+#:
+#:   * the lab previewed every Asimov get-up from the env's DEFAULT start (the
+#:     `pike`, where those policies score 0/12) instead of the `fold` they were
+#:     trained from (12/12, held 7.76 s) — so loading the stages showed nothing
+#:     working;
+#:   * `render-rollout`, the tool this repo's own doctrine points at ("render it
+#:     and look"), built every non-duck env with defaults and ignored the run
+#:     entirely. Its docstring already records ONE instance of this being caught
+#:     — a G1 kick that held 5/5 in training and 1/5 in a render, "so the render
+#:     disagreed with the evaluation and the render was wrong" — and the single
+#:     flag was fixed rather than the rule.
+#:
+#: Training-only knobs are deliberately NOT here: `domain_rand`, `obs_noise` and
+#: `random_yaw` make a replay irreproducible, and a look should show the clean
+#: motion. Everything else is part of the CONDITIONS the policy learned under,
+#: and replaying without them measures a different robot.
+REPLAY_KWARGS = (
+    "task", "clip_name", "max_episode_s",
+    # Asimov's get-up
+    "start_phase", "getup_label", "getup_blend", "getup_assist",
+    "track_tol", "ref_speed", "history", "force_lag", "free",
+    # ...and the five added on 2026-10-06, which were missing from this list
+    # for a day. `action_clip` and `start_rung` change the DYNAMICS and the
+    # reset distribution: a replay of a 13.0-clip run at the body's inherited
+    # 4.0 cannot command 2/3 of the motion, and a replay of a rung-started run
+    # from the floor is a different task. The three reward weights do not move
+    # the robot, but they decide what a score MEANS, so a verifier that reports
+    # a reward budget needs them too.
+    "action_clip", "start_rung", "arm_push", "arm_effort", "head_up",
+    # ...and the nine added on 2026-10-09, after `prologue` — a SCRIPTED
+    # push-up that drives the first 1.56 s of an episode — was recorded by
+    # the trainer and dropped by every replay, so the lab and `render-rollout`
+    # would have shown a prologue run doing something the trainer never did.
+    # `max_span` and `launch_span` TERMINATE and `fall_depth` picks the reset
+    # distribution; the five weights do not move the robot but decide what a
+    # score means. `test_a_recorded_knob_is_a_REPLAYED_knob` fails the build
+    # on the next one that is neither replayed nor deliberately excluded.
+    "prologue", "max_span", "launch_span", "fall_depth", "clip_file",
+    "span_cost", "span_target", "tuck_pay", "rotate_pay", "roll_pay", "ground_cost",
+    "balance_cost", "home_pay", "limit_cost", "push_bw", "calm_cost", "swing_pay", "handoff_pay",
+    # MOSS / MARS rungs and variants
+    "pick_rung", "approach_rung", "stow_rung", "prop", "arm_camera_mount",
+    "base_lock", "publish_size", "publish_attitude",
+)
+
+
+def replay_kwargs(run_dir: Path) -> dict[str, Any]:
+    """The recorded kwargs a replay of this run's policy must be built with.
+
+    Accepts a run directory or any path inside one, the way
+    `moss_env.obs_env_kwargs` does — callers usually hold `…/policy.onnx`.
+    Returns `{}` for a run that recorded nothing, which is the old behaviour
+    and the safe one.
+    """
+    import json as _json
+
+    p = Path(run_dir)
+    for cand in (p, p.parent, p.parent.parent):
+        meta = cand / "run.json"
+        if not meta.is_file():
+            continue
+        try:
+            rj = _json.loads(meta.read_text())
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(rj, dict):
+            return {}
+        ekw = rj.get("env_kwargs")
+        ekw = ekw if isinstance(ekw, dict) else {}
+        out = {k: ekw[k] for k in REPLAY_KWARGS if k in ekw}
+        task = rj.get("task")
+        if task:
+            out.setdefault("task", str(task))
+        return out
+    return {}
+
+
 def record_path(run_dir: Path) -> Path:
     return Path(run_dir) / RECORD_NAME
 
@@ -214,3 +295,42 @@ def default_record(run_name: str, run_json: dict[str, Any],
         # Deliberately absent until something measures it: `note`, `pick`,
         # `measured`. A trainer does not get to say its own run was good.
     }
+
+
+# The snapshot artefacts a trainer writes atomically. ONE list, shared by the
+# writers and the sweeper below — when two copies of a name list drift apart,
+# the sweep silently stops covering one and nothing fails.
+SNAPSHOT_TMPS = ("live.onnx.tmp", "model.tmp", "vecnormalize.pkl.tmp")
+
+
+def sweep_snapshot_tmps(run_dir: Path) -> list[str]:
+    """Remove a DEAD trainer's half-written snapshot temps; return what went.
+
+    `_snapshot` writes each artefact to a temp name and `os.replace`s it, so a
+    trainer killed between the two leaves the temp behind. `POST /teach/stop`
+    SIGTERMs the trainer, and **Python runs no cleanup on SIGTERM** — not
+    `finally`, not `except`, not `atexit` — so the writer cannot tidy up after
+    itself however it is written. Measured 2026-10-06: stopping one stage left
+    `runs/teach-asimov_getup-07942a-s4/model.tmp`, 5,018,382 bytes, with no
+    `model.zip` beside it, and every stopped job would leave one.
+
+    Only the three fixed names in `SNAPSHOT_TMPS`. A `*.tmp` glob would be a
+    race: `write_record` makes its temp with `tempfile.mkstemp`, so the name
+    carries a random infix and ANOTHER process may be writing one this
+    instant.
+
+    Call it only once the writer is gone — the caller owns that question.
+    """
+    gone: list[str] = []
+    for name in SNAPSHOT_TMPS:
+        p = run_dir / name
+        try:
+            if p.is_file():
+                p.unlink()
+                gone.append(name)
+        except OSError:
+            # A permission problem, or a writer that is not as dead as the
+            # caller thought. Leaving a stale temp costs disk; deleting one
+            # out from under a live save costs the checkpoint.
+            pass
+    return gone

@@ -74,7 +74,6 @@ def test_an_unknown_joint_is_a_KeyError_not_a_silent_no_op():
 def test_every_waypoint_is_inside_the_joint_limits():
     """An authored pose outside a limit is silently clamped, and the reference
     then asks for something the robot is not doing."""
-    import mujoco
     spec = W.walk_spec()
     model = spec.compile() if hasattr(spec, "compile") else spec
     lo = np.array([model.joint(n).range[0] for n in W.JOINT_NAMES])
@@ -407,6 +406,25 @@ def test_the_arm_penalty_is_gone_from_the_tracking_reward():
     _, terms = env._compute_reward()
     assert "arm_effort_penalty" not in terms, terms.keys()
     assert set(terms) == {"track", "contact", "advance", "up",
+                          # the foot-span charge, added 2026-10-08. ZERO here,
+                          # because `span_cost` defaults to 0 — it is a term
+                          # the curriculum turns on, not a change to this
+                          # reward. The arithmetic below is unaffected.
+                          "span_penalty",
+                          # the FLIGHT charge, added 2026-10-09, and zero
+                          # here for the same reason: `ground_cost` defaults
+                          # to 0. It exists because the first policy that
+                          # stood from the floor got there by hopping.
+                          "flight_penalty",
+                          # the BALANCE charge, added 2026-10-09 — zero here
+                          # (`balance_cost` defaults to 0), and gated on
+                          # being on its feet, so it never touches a rise.
+                          "balance_penalty",
+                          # COME HOME and STOP JAMMING, added 2026-10-09.
+                          # Both zero here (weights default to 0). The first
+                          # policy to stand did it with EIGHT joints outside
+                          # the model's limits, resting on the stops.
+                          "home", "calm_penalty", "swing", "limit_penalty",
                           "action_rate_penalty"}, terms.keys()
 
 
@@ -573,6 +591,24 @@ def test_free_mode_pays_the_product_and_no_known_exploit_beats_standing():
     env.reset(seed=0)
     _, terms = env._compute_reward()
     assert set(terms) == {"track", "contact", "advance", "up",
+                          # the foot-span charge, added 2026-10-08. ZERO here,
+                          # because `span_cost` defaults to 0 — it is a term
+                          # the curriculum turns on, not a change to this
+                          # reward. The arithmetic below is unaffected.
+                          "span_penalty",
+                          # the FLIGHT charge, added 2026-10-09 — zero here
+                          # (`ground_cost` defaults to 0), and it cannot be
+                          # an exploit route: it only ever SUBTRACTS.
+                          "flight_penalty",
+                          # the BALANCE charge, added 2026-10-09 — zero here
+                          # (`balance_cost` defaults to 0), and gated on
+                          # being on its feet, so it never touches a rise.
+                          "balance_penalty",
+                          # COME HOME and STOP JAMMING, added 2026-10-09.
+                          # Both zero here (weights default to 0). The first
+                          # policy to stand did it with EIGHT joints outside
+                          # the model's limits, resting on the stops.
+                          "home", "calm_penalty", "swing", "limit_penalty",
                           "action_rate_penalty"}, terms
 
     w = env.W_FREE_RISE
@@ -811,10 +847,12 @@ def test_the_harvested_clip_is_a_REACHABLE_reference():
     the tracker must therefore score FULL marks — and that is the control the
     authored reference never passed.
     """
-    import numpy as _np
     from pathlib import Path as _P
 
-    from microduck_local.robots import asimov, spec as S
+    import numpy as _np
+
+    from microduck_local.robots import asimov
+    from microduck_local.robots import spec as S
 
     clips = _P(asimov.CACHE_DIR) / "getup_clips.npz"
     if not clips.is_file():
@@ -900,7 +938,8 @@ def test_every_cached_rung_actually_HOLDS_when_replayed():
     assert set(np.unique(sup)) <= {"arm", "feet"}
 
     env = S.get("asimov1").env_class("getup_ref")(
-        domain_rand=False, obs_noise=False, seed=0, action_clip=13.0)
+        domain_rand=False, obs_noise=False, seed=0,
+        action_clip=float(S.get("asimov1").action_clip))
     m, d = env.model, env.data
     scale = float(np.atleast_1d(env.robot.action_scale)[0])
     fails = []
@@ -910,7 +949,8 @@ def test_every_cached_rung_actually_HOLDS_when_replayed():
         d.xfrc_applied[:] = 0.0
         mujoco.mj_forward(m, d)
         act = np.clip((d.qpos[env._q_adr] - np.asarray(env.robot.default_pose))
-                      / scale, -13.0, 13.0).astype(np.float32)
+                      / scale, -float(S.get("asimov1").action_clip),
+                float(S.get("asimov1").action_clip)).astype(np.float32)
         z0 = float(d.xpos[env.trunk_body_id][2])
         for _ in range(int(R.HOLDABLE_HOLD_S * 50)):
             d.xfrc_applied[:] = 0.0
@@ -928,3 +968,382 @@ def test_every_cached_rung_actually_HOLDS_when_replayed():
     # ...and a rung must be somewhere USEFUL: off the floor, below standing.
     assert trunk_z.min() > 0.12, f"lowest rung {trunk_z.min():.3f} m is the floor"
     assert trunk_z.max() < 0.639, f"highest rung {trunk_z.max():.3f} m is standing"
+
+
+def test_hip_roll_and_hip_yaw_MIRROR_so_a_splay_is_not_a_lean():
+    """`MIRRORED` was missing `hip_roll` and `hip_yaw`, and the cost was a
+    whole plateau.
+
+    The five stems originally listed mirror because the right-side axis is -Y
+    against the left's +Y. These two are the opposite case: both sides share
+    the SAME axis (+X for roll, -Z for yaw), so equal values rotate both legs
+    the same way in WORLD space. Left out of the tuple, `joints(hip_roll=v)`
+    therefore produced a LEAN where every other kwarg produces a symmetric
+    pose — and since `_search_rungs` builds every pose through this helper and
+    never passed these stems, both sweeps only ever searched a stance 0.215 m
+    wide, where the support set is a line. That is why the feet-only plateau
+    was reported to bottom out at 0.471 m.
+
+    The numbers below are measured, and they are what separates the two cases:
+    a lean keeps the width and moves the midline, a splay moves the width and
+    keeps the midline.
+    """
+    import numpy as np
+
+    from microduck_local.robots import asimov as _asimov
+    from microduck_local.robots import asimov_getup_ref as R
+    from microduck_local.robots import asimov_walk as W
+    from microduck_local.robots import spec as S
+
+    if not _asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    assert "hip_roll" in R.MIRRORED and "hip_yaw" in R.MIRRORED
+
+    idx = {n: i for i, n in enumerate(W.JOINT_NAMES)}
+    # the axes are the REASON, so assert them rather than the conclusion alone
+    env = S.get("asimov1").env_class("getup_ref")(
+        domain_rand=False, obs_noise=False, seed=0,
+        action_clip=float(S.get("asimov1").action_clip))
+    m, d = env.model, env.data
+    for stem, axis in (("hip_roll", 0), ("hip_yaw", 2)):
+        la = m.joint(f"left_{stem}_joint").axis
+        ra = m.joint(f"right_{stem}_joint").axis
+        assert np.allclose(la, ra), (
+            f"{stem} axes differ between sides {la} vs {ra} — if the model "
+            "changed, the reason this stem is in MIRRORED changed with it")
+        assert abs(la[axis]) > 0.99
+    for stem in ("hip_pitch", "knee", "ankle_pitch"):
+        la = m.joint(f"left_{stem}_joint").axis
+        ra = m.joint(f"right_{stem}_joint").axis
+        assert np.allclose(la, -np.asarray(ra)), f"{stem} should be anti-parallel"
+
+    # the helper negates the right side...
+    q = R.joints(hip_roll=0.7)
+    assert q[idx["left_hip_roll_joint"]] == pytest.approx(0.7)
+    assert q[idx["right_hip_roll_joint"]] == pytest.approx(-0.7)
+
+    # ...and passing a joint its own default is still a no-op, the property
+    # that makes a pose draft readable
+    assert np.allclose(R.joints(hip_roll=0.0, hip_yaw=0.0),
+                       np.array(W.DEFAULT_POSE))
+
+    LF = m.body("left_ankle_roll_link").id
+    RF = m.body("right_ankle_roll_link").id
+
+    def stance(roll_left, roll_right):
+        p = np.array(W.DEFAULT_POSE, dtype=float)
+        p[idx["left_hip_pitch_joint"]] = -1.20
+        p[idx["right_hip_pitch_joint"]] = +1.20
+        p[idx["left_knee_joint"]] = +1.35
+        p[idx["right_knee_joint"]] = -1.35
+        p[idx["left_hip_roll_joint"]] = roll_left
+        p[idx["right_hip_roll_joint"]] = roll_right
+        env._place(p, 0.25)
+        mujoco.mj_forward(m, d)
+        ly, ry = float(d.xpos[LF][1]), float(d.xpos[RF][1])
+        return abs(ly - ry), (ly + ry) / 2.0
+
+    w0, mid0 = stance(0.0, 0.0)
+    w_lean, mid_lean = stance(0.7, 0.7)      # what the helper used to produce
+    w_splay, mid_splay = stance(0.7, -0.7)   # what it produces now
+
+    assert w0 == pytest.approx(0.215, abs=0.01)
+    # a LEAN: width unchanged, midline walks sideways
+    assert w_lean == pytest.approx(w0, abs=0.01), (
+        f"equal rolls changed the stance width {w0:.3f} -> {w_lean:.3f}; the "
+        "lean/splay distinction this test rests on is gone")
+    assert abs(mid_lean) > 0.15, f"equal rolls did not shift the midline ({mid_lean:+.3f})"
+    # a SPLAY: width opens, midline stays put
+    assert w_splay > 0.60, f"mirrored roll only reached {w_splay:.3f} m of stance"
+    assert abs(mid_splay) < 0.01, f"mirrored roll shifted the midline {mid_splay:+.3f}"
+
+    # and `joints()` must take the splay branch, not the lean one
+    qs = R.joints(hip_pitch=-1.20, knee=1.35, hip_roll=0.7)
+    env._place(qs, 0.25)
+    mujoco.mj_forward(m, d)
+    got = abs(float(d.xpos[LF][1] - d.xpos[RF][1]))
+    assert got == pytest.approx(w_splay, abs=0.01), (
+        f"joints(hip_roll=0.7) produced a {got:.3f} m stance, not the "
+        f"{w_splay:.3f} m splay — hip_roll is not mirroring")
+
+
+def _feet_rungs_by_splay():
+    """Cached feet-only rungs, split on whether the hips are splayed."""
+    import numpy as np
+
+    from microduck_local.robots import asimov_getup_ref as R
+    from microduck_local.robots import asimov_walk as W
+    from microduck_local.robots import spec as S
+
+    z = R.holdable_rungs()
+    tz = z["trunk_z"]
+    sup = np.array([str(s) for s in z["support"]])
+    J = z["joints"]
+    env = S.get("asimov1").env_class("getup_ref")(
+        domain_rand=False, obs_noise=False, seed=0,
+        action_clip=float(S.get("asimov1").action_clip))
+    roll_i = {n: i for i, n in enumerate(W.JOINT_NAMES)}["left_hip_roll_joint"]
+    rolls = np.array([abs(float(np.asarray(J[i])[env._q_adr][roll_i]))
+                      for i in range(len(tz))])
+    feet = sup == "feet"
+    return tz, sup, feet, rolls
+
+
+def test_the_splay_is_what_reaches_below_the_old_feet_only_floor():
+    """The splay's contribution, measured against its own control.
+
+    CORRECTED 2026-10-07. The first version of this test asserted the two
+    plateaus OVERLAP. They do at an action clip of 13.0 — which is what
+    `_search_rungs` used to hardcode, and which nothing else in the repo uses.
+    At the robot's own clip the cache is 134 rungs, not 221, and the picture
+    is the opposite:
+
+        arm plateau  0.134 - 0.280 m (56)
+        feet plateau 0.416 - 0.606 m (78)
+        a 136 mm GAP between them
+
+    The splay still earns its place, and by more than before: feet-only rungs
+    with the hips square bottom out at 0.529 m, splayed ones reach 0.416 m —
+    **113 mm**, against 53 mm when this was measured at the wrong clip.
+
+    Both numbers come from the same sweep, which is the only comparison that
+    means anything: quoting the move from an older cache would conflate the
+    splay with a denser knee grid and an unpinned arm reach.
+    """
+
+    from microduck_local.robots import asimov as _asimov
+
+    if not _asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    tz, sup, feet, rolls = _feet_rungs_by_splay()
+    flat = feet & (rolls < 0.01)
+    wide = feet & (rolls >= 0.01)
+
+    assert flat.sum() >= 5, f"only {int(flat.sum())} unsplayed feet rungs — no control"
+    assert wide.sum() >= 20, f"only {int(wide.sum())} splayed feet rungs"
+
+    # the control: hips square cannot get down here
+    assert tz[flat].min() > 0.50, (
+        f"unsplayed feet-only reached {tz[flat].min():.3f} m — if a square "
+        "stance now goes this low, the splay is not what buys the depth")
+    # ...and the splay does, by a margin far outside any grid jitter
+    assert tz[wide].min() < 0.45, (
+        f"splayed feet-only only reached {tz[wide].min():.3f} m")
+    assert tz[flat].min() - tz[wide].min() > 0.08, (
+        f"the splay bought only {(tz[flat].min()-tz[wide].min())*1000:.0f} mm")
+
+    # AND the thing the first version got wrong: at the real clip the plateaus
+    # do NOT meet. This is the headline the curriculum has to respect.
+    arm_top = tz[sup == "arm"].max()
+    gap = tz[feet].min() - arm_top
+    assert gap > 0.05, (
+        f"the arm plateau now tops at {arm_top:.3f} and feet start at "
+        f"{tz[feet].min():.3f} — they meet or overlap, which they did only at "
+        "the 13.0 clip nothing uses. If this is real, re-derive phase 3h.")
+
+
+def test_MIRRORED_is_complete_rederived_from_the_model():
+    """`MIRRORED` must list EVERY left/right stem, and the model says which.
+
+    The tuple was wrong twice. `hip_roll`/`hip_yaw` missing cost a whole
+    plateau — `joints(hip_roll=v)` leaned the robot where it reads as a splay,
+    so both rung sweeps only ever searched a 0.215 m stance. The audit that
+    found it then found `shoulder_roll`, `shoulder_yaw`, `ankle_roll` and
+    `wrist_yaw` missing too.
+
+    So this does not hard-code the answer: it re-derives the convention from
+    the model by mirroring each left link's world ORIENTATION across the
+    sagittal plane and comparing it to its right counterpart, and asserts the
+    tuple agrees. Orientation, not position, because `ankle_roll` and
+    `wrist_yaw` are terminal joints whose child link rotates in place — a
+    position-based probe is blind to them and silently reports "no convention".
+
+    Reasoning from `joint.axis` is NOT a substitute and was tried first: five
+    stems have anti-parallel axes and six share an axis, and both groups turn
+    out to negate.
+    """
+    import numpy as np
+
+    from microduck_local.robots import asimov as _asimov
+    from microduck_local.robots import asimov_getup_ref as R
+    from microduck_local.robots import asimov_walk as W
+    from microduck_local.robots import spec as S
+
+    if not _asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    env = S.get("asimov1").env_class("getup_ref")(
+        domain_rand=False, obs_noise=False, seed=0)
+    m, d = env.model, env.data
+    idx = {n: i for i, n in enumerate(W.JOINT_NAMES)}
+    names = [m.body(i).name for i in range(m.nbody)]
+    pairs = [(m.body(n).id, m.body("right_" + n[5:]).id) for n in names
+             if n.startswith("left_") and "right_" + n[5:] in names]
+    assert len(pairs) >= 8, f"only {len(pairs)} mirrored body pairs to judge on"
+    MIR = np.diag([1.0, -1.0, 1.0])
+
+    def residual(vl, vr, stem):
+        q = np.array(W.DEFAULT_POSE, dtype=float)
+        q[idx[f"left_{stem}_joint"]] = vl
+        q[idx[f"right_{stem}_joint"]] = vr
+        d.qpos[:] = 0.0
+        d.qpos[3] = 1.0
+        d.qpos[env._q_adr] = q
+        mujoco.mj_forward(m, d)
+        return sum(float(np.abs(MIR @ d.xmat[L].reshape(3, 3) @ MIR
+                                - d.xmat[Rb].reshape(3, 3)).sum())
+                   for L, Rb in pairs)
+
+    stems = sorted({n[len("left_"):-len("_joint")] for n in W.JOINT_NAMES
+                    if n.startswith("left_")})
+    negating = []
+    for s in stems:
+        neg, same = residual(0.3, -0.3, s), residual(0.3, 0.3, s)
+        assert neg < same, (
+            f"{s}: mirroring gave residual {neg:.6f} against {same:.6f} for "
+            "equal values — this robot's convention is not what MIRRORED assumes")
+        assert neg < 1e-6, (
+            f"{s}: even the mirrored pose has residual {neg:.6f}; the model's "
+            "two sides are no longer mirror images and this test cannot judge")
+        negating.append(s)
+
+    assert set(negating) == set(R.MIRRORED), (
+        f"MIRRORED disagrees with the model — missing "
+        f"{sorted(set(negating) - set(R.MIRRORED))}, spurious "
+        f"{sorted(set(R.MIRRORED) - set(negating))}")
+
+    # the property the tuple exists for: a joint passed its own default is a
+    # no-op. `shoulder_roll` failed this before the audit (-0.050 vs +0.050).
+    for s in stems:
+        v = float(np.array(W.DEFAULT_POSE)[idx[f"left_{s}_joint"]])
+        assert np.allclose(R.joints(**{s: v}), np.array(W.DEFAULT_POSE)), (
+            f"joints({s}={v:+.3f}) is not a no-op — it does not round-trip "
+            "its own default")
+
+
+def test_no_curriculum_stage_starts_on_a_rung_its_own_clip_cannot_hold():
+    """The guard for the fault that cost `teach-asimov_getup_floor-cdd31c`.
+
+    `_search_rungs` hardcoded an action clip of 13.0 while every trainer runs
+    at `RobotSpec.action_clip`. So the cache certified 221 rungs, of which only
+    82 hold at the clip training uses — and the `asimov_getup_floor` chain then
+    started its episodes on poses the policy physically cannot hold. All 64 of
+    stage 2's rungs demanded more than its clip. The chain scored **0/36 from
+    the floor at every one of its five stages**, identical to commanding
+    nothing, and nothing in training reported a problem: each stage's own
+    numbers improved, because each was measured where it started.
+
+    A rung has to be an equilibrium IN THE ENV THAT TRAINS ON IT. This asserts
+    the two halves of that: the search derives its clip from the robot rather
+    than naming one, and no stage of a rung-based curriculum trains at a
+    different clip from the one the cache was built at.
+    """
+    import inspect
+    import re
+
+    from microduck_local import behaviors as B
+    from microduck_local.robots import asimov as _asimov
+    from microduck_local.robots import asimov_getup_ref as R
+    from microduck_local.robots import spec as S
+
+    if not _asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    src = inspect.getsource(R._search_rungs)
+    code = re.sub(r"^\s*#.*$", "", src, flags=re.M)      # comments may cite it
+    assert "action_clip" in src and "S.get" in src, (
+        "_search_rungs no longer derives its clip from the robot spec")
+    for bad in re.findall(r"action_clip\s*=\s*([0-9.]+)", code):
+        pytest.fail(f"_search_rungs hardcodes action_clip={bad}; it must read "
+                    "the spec, or the cache certifies rungs nothing trains on")
+
+    spec_clip = float(S.get("asimov1").action_clip)
+    for bid in ("asimov_getup_floor", "asimov_getup"):
+        beh = B.BEHAVIORS.get(bid)
+        if beh is None:
+            continue
+        for i, stage in enumerate(getattr(beh, "curriculum", ()) or (), 1):
+            envd = dict(getattr(stage, "env", None) or {})
+            rung = envd.get("MICRODUCK_ASIMOV_GETUP_START_RUNG", "")
+            if not rung or rung == "floor":
+                continue                      # starts where it fell, no rung
+            override = envd.get("MICRODUCK_ASIMOV_GETUP_ACTION_CLIP")
+            if override is None:
+                continue                      # inherits the spec clip: correct
+            assert float(override) == spec_clip, (
+                f"{bid} stage {i} ({stage.label!r}) starts on rung band "
+                f"{rung!r} but trains at clip {override}, while the rung cache "
+                f"was validated at {spec_clip}. Those rungs are not "
+                "equilibria in that env.")
+
+
+def test_the_scripted_ramp_lands_between_the_two_plateaus():
+    """The decomposition the handover task rests on.
+
+    The arm plateau traverses OPEN LOOP (phase 3i): position servos only, no
+    policy, 0.136 -> 0.280 m in seven legs at every tempo from 0.15 s to
+    0.90 s. So the bottom of the get-up is played, not learned, and what is
+    left to learn is the one transition above it.
+
+    This pins where that ramp leaves the robot, because the whole premise
+    fails quietly if it drifts: too low and the policy is being asked to
+    re-learn the arm plateau, too high and the task is not the handover at
+    all. It must land ABOVE the arm plateau's useful top and BELOW the
+    feet-only plateau, inside the span cut, on forearms and feet.
+    """
+    import numpy as np
+
+    from microduck_local.robots import asimov as _asimov
+    from microduck_local.robots import asimov_getup_ref as R
+
+    if not _asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    h = R.handover_states()
+    q, v, z = h["qpos"], h["qvel"], h["trunk_z"]
+    assert len(z) >= 8, f"only {len(z)} handover states — a rung is a SET"
+
+    rungs = R.holdable_rungs()
+    sup = np.array([str(x) for x in rungs["support"]])
+    feet_floor = float(rungs["trunk_z"][sup == "feet"].min())
+    arm_top = float(rungs["trunk_z"][sup == "arm"].max())
+
+    assert z.min() > 0.20, (
+        f"the ramp only reaches {z.min():.3f} m — it is not clearing the arm "
+        "plateau, so the handover task still contains the push-up")
+    assert z.max() < feet_floor, (
+        f"the ramp reaches {z.max():.3f} m, at or above the feet-only floor "
+        f"{feet_floor:.3f} — there would be no gap left to learn")
+    assert z.max() <= arm_top + 0.02, (
+        f"the ramp ends at {z.max():.3f} m, above the arm plateau's top "
+        f"{arm_top:.3f}; it is no longer arm-supported")
+
+    # and the states must be usable: inside the span cut the task trains under
+    from microduck_local.robots.asimov_env import AsimovGetupEnv
+
+    env = AsimovGetupEnv(domain_rand=False, obs_noise=False, getup_blend=0.0,
+                         getup_assist=0.0, start_rung="handover",
+                         max_span=R.EPISODE_SPAN_CUT_M)
+    spans = []
+    for i in range(len(z)):
+        env.data.qpos[:] = q[i]
+        env.data.qvel[:] = v[i]
+        mujoco.mj_forward(env.model, env.data)
+        spans.append(env._foot_span())
+    spans = np.array(spans)
+    # the EPISODE cut, not the rung filter: the ramp overshoots the rungs it
+    # passes through (0.705-0.724 against <=0.70), and setting the two equal
+    # voided a whole training run by ending every episode on its start pose
+    assert spans.max() <= R.EPISODE_SPAN_CUT_M + 1e-9, (
+        f"a handover state spans {spans.max():.3f} m against a cut at "
+        f"{R.EPISODE_SPAN_CUT_M} — the episode would end on its own start pose")
+    assert R.EPISODE_SPAN_CUT_M < 0.90, (
+        f"the episode cut is {R.EPISODE_SPAN_CUT_M} m, which admits the "
+        "teacher's 0.929 m sprawl — it forbids nothing")
+
+    # the gap it leaves is the thing worth learning, and it must be real
+    assert feet_floor - z.max() > 0.08, (
+        f"only {(feet_floor - z.max())*1000:.0f} mm between the handover and "
+        "the feet plateau — if this closed, the task is no longer a launch")
