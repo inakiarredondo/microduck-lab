@@ -53,12 +53,63 @@ export function scaleSceneToMetres<T extends { meshes: { v: number[] }[]; vertSc
   return sc;
 }
 
-/** Visual scene for a G1 person (same shape as GET /scene). null if unfetched. */
-export async function fetchG1Scene(): Promise<import("./lab").Scene | null> {
-  const r = await fetch(`${LAB_HTTP}/scene/g1`);
+/** Visual scene for ONE body (same shape as GET /scene). null if unavailable. */
+export async function fetchRobotScene(robot: string): Promise<import("./lab").Scene | null> {
+  const r = await fetch(`${LAB_HTTP}/scene/robot/${encodeURIComponent(robot)}`);
   if (!r.ok) return null;
   const sc = await r.json() as import("./lab").Scene & { vertScale?: number };
   return scaleSceneToMetres(sc);
+}
+
+/**
+ * One scene per DISTINCT walking-robot person kind in a scenario.
+ *
+ * A person's `kind` is a registry body id ("asimov1", "g1") or "capsule".
+ * This used to be a single `fetchG1Scene`, which is why the first non-G1
+ * robot to walk a room rendered as the grey capsule placeholder: its meshes
+ * were never asked for.
+ *
+ * A FAILED fetch is recorded as an explicit `null` rather than left out, and
+ * that distinction is the whole value of this return type: the caller's state
+ * starts empty and this is async, so "no entry for this kind" has to be able
+ * to mean *still coming* without also meaning *gave up*. SimStage draws the
+ * capsule for the null and nothing at all for the absent key — a placeholder
+ * that pops into a robot half a second later is worse than a brief gap, and a
+ * robot whose meshes genuinely 404 still has to be visible.
+ */
+export async function fetchPersonScenes(
+  persons: { kind?: string }[] | undefined,
+): Promise<Record<string, import("./lab").Scene | null>> {
+  const kinds = [...new Set((persons ?? []).map((p) => p.kind ?? "capsule"))]
+    .filter((k) => k !== "capsule");
+  const out: Record<string, import("./lab").Scene | null> = {};
+  await Promise.all(kinds.map(async (k) => {
+    out[k] = await fetchRobotScene(k).catch(() => null);
+  }));
+  return out;
+}
+
+/** What the stage draws for one person, from the three states a scene map has.
+ *
+ *  Named and exported because collapsing it to two is the bug it exists to
+ *  stop: `personScenes` starts empty and the fetch is async, so a truthiness
+ *  test ("have I got meshes for this kind?") answers the same NO for a robot
+ *  that is one round-trip away and for one whose meshes do not exist. The
+ *  capsule is right for the second and wrong for the first — it drew, then
+ *  popped into a robot, which is what a person watching a scenario open
+ *  actually saw. */
+export type PersonDraw = "meshes" | "capsule" | "pending";
+
+export function personDraw(
+  kind: string,
+  scenes: Record<string, import("./lab").Scene | null>,
+): PersonDraw {
+  if (kind === "capsule") return "capsule";       // a mocap walker, always
+  const sc = scenes[kind];
+  if (sc) return "meshes";
+  // The whole point of the type: `null` is a fetch that FAILED and must stay
+  // visible; `undefined` is one still in flight and must draw nothing.
+  return sc === null ? "capsule" : "pending";
 }
 
 export type TofPreset = "ideal" | "datasheet" | "hostile";
@@ -156,7 +207,15 @@ export function teamSwatch(team: string | null | undefined, fallback = "#555"): 
 }
 export interface ScenarioPerson {
   id: string; pos: [number, number]; yaw: number; path: [number, number][];
-  speed: number; radius: number; height: number; kind?: "capsule" | "g1";
+  speed: number; radius: number; height: number;
+  /**
+   * "capsule" (a mocap walker) or a BODY ID from the lab's registry — "g1",
+   * "asimov1", whatever is installed. Not a closed union: the set is the
+   * server's `robots/registry`, and a literal type here would have to be
+   * edited every time somebody adds a robot, while the only thing the viewer
+   * does with it is look up meshes by that id (`fetchPersonScenes`).
+   */
+  kind?: string;
 }
 export interface ScenarioPickable { id: string; kind: "brick" | "block" | "sock"; pos: [number, number]; yaw: number }
 export interface ScenarioBasket { pos: [number, number]; size: [number, number]; rim: number }
@@ -172,7 +231,11 @@ export interface ScenarioProp {
   mass: number; yaw: number;
   rgba: [number, number, number, number];
   cls: string; rolling: number;
+  /** What to draw OVER the collider — "" / absent draws the collider itself.
+   *  Closed set, `microduck_local/world/scenario.py PROP_LOOKS`. */
+  look?: string;
 }
+
 export const PICKABLE_SIZES: Record<string, [number, number, number]> = {
   brick: [0.032, 0.016, 0.0096],
   block: [0.04, 0.04, 0.04],

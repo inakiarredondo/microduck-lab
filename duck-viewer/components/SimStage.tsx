@@ -26,11 +26,14 @@ import * as THREE from "three";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
-import { goalDefenders, PICKABLE_COLORS, PICKABLE_SIZES, rugSize, TEAM_COLORWAYS,
+import { goalDefenders, personDraw, PICKABLE_COLORS, PICKABLE_SIZES, rugSize, TEAM_COLORWAYS,
   type Scenario, type SimClient, type TeamName, POSE_SMOOTH_HZ, simRate } from "@/lib/sim";
 import type { Scene } from "@/lib/lab";
+import { resetFps, tickFrame } from "@/lib/fps";
+import { buildBodyGeometries } from "./Duck";
 import { CREASE_ANGLE_DEG, g1PartKind, weldAndSmooth, weldTolerance, type G1PartKind } from "./G1Look";
 import { MARS_KINDS, marsPartKind, useMarsMaterials, type MarsPartKind } from "./MarsLook";
+import { ASIMOV_KINDS, asimovPartKind, useAsimovMaterials, type AsimovPartKind } from "./AsimovLook";
 
 // -- palette -----------------------------------------------------------------
 // Kept close to the page's UI accents (amber / teal) so the stage and the
@@ -749,6 +752,84 @@ function propGeometry(shape: string, size: [number, number, number]): THREE.Buff
   return g;
 }
 
+/** A duck FIGURINE: the real Microduck's CAD, posed once at its rest
+ *  keyframe and frozen — `scenario.Prop.look === "duck"`.
+ *
+ *  It reuses the lab page's own body geometries (`buildBodyGeometries`, the
+ *  same merged meshes every live duck is drawn from) and bakes each one at
+ *  the REST transform the lab ships in `Scene.home`. So a figurine is the
+ *  robot, not a duck drawn from primitives.
+ *
+ *  MERGED INTO ONE GEOMETRY, and that is a performance fix rather than
+ *  tidiness. A figurine is RIGID, so unlike a live duck it needs no group per
+ *  body — and drawn per body it was ~17 meshes each casting a shadow, times
+ *  one per figurine in the room, which is the trap `Duck.tsx` already
+ *  records ("70 meshes/duck, all casting shadows ... lost the WebGL context
+ *  with 8 ducks"). MEASURED on the four-figurine showcase room: the /sim page
+ *  fell to RTF 0.34 in the browser while the lab's own world loop was still
+ *  running 0.92 and the physics had a 30x ceiling — the cost was all draw
+ *  calls. One geometry, cached by height and SHARED by every figurine, is one
+ *  draw call each.
+ *
+ *  Seated and scaled by `Scene.bbox`: feet on the prop's base, body on its
+ *  axis, scaled to the prop's declared height — the same seating
+ *  `world/compose.py _duck_figurine` gives the MuJoCo model, so the browser
+ *  and a recorded video show the figurine in the same place. */
+const figurineGeometries = new Map<string, THREE.BufferGeometry | null>();
+function figurineGeometry(scene: Scene, height: number): THREE.BufferGeometry | null {
+  const key = `${scene.bodies.length}:${scene.geoms.length}:${height.toFixed(5)}`;
+  if (figurineGeometries.has(key)) return figurineGeometries.get(key) ?? null;
+  const { home, bbox } = scene;
+  let merged: THREE.BufferGeometry | null = null;
+  if (home && bbox && bbox.height) {
+    const k = height / bbox.height;
+    const parts: THREE.BufferGeometry[] = [];
+    buildBodyGeometries(scene).forEach((b, i) => {
+      const h = home[i];
+      if (!b.geometry || !h) return;
+      const g = b.geometry.clone();
+      g.applyMatrix4(new THREE.Matrix4().compose(
+        new THREE.Vector3(h.pos[0], h.pos[1], h.pos[2]),
+        new THREE.Quaternion(h.quat[1], h.quat[2], h.quat[3], h.quat[0]),
+        new THREE.Vector3(1, 1, 1)));
+      parts.push(g.index ? g.toNonIndexed() : g);
+    });
+    merged = parts.length ? mergeGeometries(parts, false) : null;
+    if (merged) {
+      // feet to the prop's base, body to its axis, then scale to the prop
+      merged.translate(-bbox.origin[0], -bbox.origin[1], -bbox.origin[2]);
+      merged.scale(k, k, k);
+      merged.translate(0, 0, -height / 2);   // the group sits at the CENTRE
+      merged.computeVertexNormals();
+    }
+  }
+  figurineGeometries.set(key, merged);
+  return merged;
+}
+
+/** Samples the BROWSER's draw rate into `lib/fps`, for the HUD.
+ *
+ *  Inside r3f's loop because that is the only place the real render rate
+ *  exists — `requestAnimationFrame` elsewhere on the page would measure the
+ *  browser's willingness to schedule, not this canvas's ability to draw. It
+ *  renders nothing and holds no state: the HUD reads the store at its own
+ *  4 Hz, so a frame counter never costs a React render. */
+export function FpsMeter() {
+  useEffect(() => resetFps, []);
+  useFrame(({ clock }) => tickFrame(clock.getElapsedTime() * 1000));
+  return null;
+}
+
+function DuckFigurine({ scene, height }: { scene: Scene; height: number }) {
+  const geo = useMemo(() => figurineGeometry(scene, height), [scene, height]);
+  if (!geo) return null;
+  return (
+    <mesh geometry={geo} castShadow>
+      <meshStandardMaterial vertexColors roughness={0.55} metalness={0.05} />
+    </mesh>
+  );
+}
+
 function toyGeometry(kind: string): THREE.BufferGeometry {
   const cached = toyGeometries.get(kind);
   if (cached) return cached;
@@ -817,7 +898,7 @@ export function RobotBody({
   scene: Scene;
   client: SimClient;
   from?: "objects" | "ducks";
-  look?: "g1" | "generic" | "mars";
+  look?: "g1" | "generic" | "mars" | "asimov1";
 }) {
   // /sim has no stage lights of its own, so it takes the full reflection —
   // the 0.35 the lab uses would leave the chassis flat here (the same split
@@ -835,17 +916,44 @@ export function RobotBody({
   // graphite body used to supply, and they do not wash out on pale wood. A
   // per-slot colorway field would let a scenario override it.
   const marsMaterials = useMarsMaterials(look === "mars", { envScale: 1 });
+  // Asimov's MJCF paints all 26 geoms one flat `visual_grey`, so "its own
+  // streamed rgba" is 26 identical greys and the robot arrives as a
+  // mannequin. components/AsimovLook.tsx is the table that separates his
+  // shells from his actuator housings and his soles; the colours in it are a
+  // look, and the file says so.
+  const asimovMaterials = useAsimovMaterials(look === "asimov1", { envScale: 1 });
+  // A look with a material TABLE shares one material per kind across the
+  // whole robot (the colorway, the clearcoats and the reflection have to be
+  // the same objects the lab stage uses, or the two pages diverge). The two
+  // hooks are mutually exclusive by construction — each is enabled on its own
+  // `look` — so at most one of these is ever non-null.
+  const sharedMaterials = marsMaterials ?? asimovMaterials;
+  const sharedKinds: readonly string[] =
+    marsMaterials ? MARS_KINDS : asimovMaterials ? ASIMOV_KINDS : [];
   const tree = useMemo(() => {
     // Vertices arrive in metres, or in millimetre ints with a `vertScale`
     // (the G1's dump is 21 MB that way instead of 78 MB of floats). Scaling
     // here is what keeps a body from arriving 1000x too big, off camera,
     // with nothing in the console.
     const vs = scene.vertScale ?? 1;
+    // A body that ships its OWN normals (`SceneMesh.n` — every `MjcfBody`)
+    // is drawn with them: no weld, no crease guess. Same reasoning and the
+    // same measurement as `Duck.buildBodyGeometries`, and all-or-nothing for
+    // the same reason. A room has to agree with the stage about what a robot
+    // looks like, so this branch cannot live only on the lab page.
+    const ns = scene.normalScale ?? 1;
+    const shipped =
+      scene.meshes.length > 0 && scene.meshes.every((m) => m.n?.length === m.v.length);
     const meshGeos = scene.meshes.map((m) => {
       const raw = new THREE.BufferGeometry();
       const v = vs === 1 ? m.v : m.v.map((x) => x * vs);
       raw.setAttribute("position", new THREE.Float32BufferAttribute(v, 3));
       raw.setIndex(m.f);
+      if (shipped) {
+        const n = ns === 1 ? m.n! : m.n!.map((x) => x * ns);
+        raw.setAttribute("normal", new THREE.Float32BufferAttribute(n, 3));
+        return raw;
+      }
       const g = weldAndSmooth(raw, weldTolerance(vs),
                               look === "mars" ? CREASE_ANGLE_DEG : undefined);
       raw.dispose();
@@ -864,12 +972,14 @@ export function RobotBody({
           geo.applyMatrix4(mat4);
           if (g.rgba) col.setRGB(g.rgba[0], g.rgba[1], g.rgba[2], THREE.SRGBColorSpace);
           else col.set("#888888");
-          const kind: G1PartKind | MarsPartKind | "own" =
+          const kind: G1PartKind | MarsPartKind | AsimovPartKind | "own" =
             look === "g1"
               ? g1PartKind(g.name, g.mat, col)
               : look === "mars"
                 ? marsPartKind(scene.bodies[g.body], g.name)
-                : "own";
+                : look === "asimov1"
+                  ? asimovPartKind(scene.bodies[g.body], g.name)
+                  : "own";
           return { geo, color: "#" + col.getHexString(), kind };
         }),
     );
@@ -909,17 +1019,16 @@ export function RobotBody({
             ref={(el) => { refs.current[i] = el; }}
           >
             {parts.map((p, k) =>
-              // MARS's materials come from the shared table (one material per
-              // kind for the whole robot), not from per-mesh JSX: the
-              // colorway, the clearcoats and the reflection have to be the
-              // same objects the lab stage uses or the two pages diverge.
-              marsMaterials ? (
+              // A look with a table (MARS, Asimov) indexes it by part kind;
+              // the per-mesh JSX below is for the G1's and for a body drawn
+              // in its own streamed colours.
+              sharedMaterials ? (
                 <mesh
                   key={k}
                   geometry={p.geo}
                   castShadow={false}
                   receiveShadow={false}
-                  material={marsMaterials[Math.max(0, MARS_KINDS.indexOf(p.kind as MarsPartKind))]}
+                  material={sharedMaterials[Math.max(0, sharedKinds.indexOf(p.kind))]}
                 />
               ) : (
                 <mesh key={k} geometry={p.geo} castShadow={false} receiveShadow={false}>
@@ -948,8 +1057,27 @@ export function RobotBody({
   );
 }
 
-export function Dynamics({ scenario, client, g1Scene }: {
-  scenario: Scenario | null; client: SimClient; g1Scene?: Scene | null;
+/** Which material table a robot person's BODY ID is drawn with.
+ *
+ *  A registry id, not a guess: each of these has a hand-built look in
+ *  `components/<Robot>Look.tsx`, and anything else takes "generic" — the
+ *  geoms' own streamed rgba, which is the right answer for a Menagerie model
+ *  whose MJCF paints its parts and the wrong one for a model that paints
+ *  everything a single grey. A new body that arrives flat belongs here, with
+ *  a look module beside the other three. */
+function personLook(kind: string): "g1" | "generic" | "mars" | "asimov1" {
+  if (kind === "g1" || kind === "mars" || kind === "asimov1") return kind;
+  return "generic";
+}
+
+export function Dynamics({ scenario, client, personScenes, duckScene }: {
+  scenario: Scenario | null; client: SimClient;
+  /** body id -> meshes, for persons that are robots (lib/sim.fetchPersonScenes).
+   *  `null` means the fetch FAILED and a key that is absent means it is still
+   *  in flight — the three states the person renderer below draws. */
+  personScenes?: Record<string, Scene | null>;
+  /** the duck's own scene dump — what a `look: "duck"` prop is drawn from */
+  duckScene?: Scene | null;
 }) {
   const refs = useRef(new Map<string, THREE.Group>());
   const blobs = useRef<THREE.InstancedMesh>(null);
@@ -1049,6 +1177,44 @@ export function Dynamics({ scenario, client, g1Scene }: {
   if (!scenario) return null;
   const freeBoxes = scenario.boxes.map((b, i) => ({ b, i })).filter(({ b }) => b.mass > 0);
   const persons = scenario.persons ?? [];
+  // A person is drawn in one of THREE states, and collapsing them into two is
+  // what made a robot scenario open with a four-foot blue capsule that popped
+  // into a robot a moment later. `personScenes` starts empty and
+  // `fetchPersonScenes` is async, so "no scene for this kind" was true of a
+  // kind that had FAILED and of one still in flight, and the capsule — which
+  // is the right fallback for the first — got drawn for the second.
+  //
+  //   key holds a Scene  -> its meshes          (arrived)
+  //   key holds null     -> the capsule         (fetch failed: a robot whose
+  //                                              meshes 404 must still be
+  //                                              visible)
+  //   key absent         -> NOTHING             (still in flight; it is about
+  //                                              to appear, and a brief gap
+  //                                              beats a placeholder that pops)
+  //
+  // The gap is the fetch, and it is NOT short — MEASURED, Asimov's dump is the
+  // biggest in the repo at 29.3 MB and the lab takes 0.3-1.2 s to answer for
+  // it (eight reads; time to first byte is 0.26-0.89 s of it and varies with
+  // what the lab's own 50 Hz loop is doing, while the 206 ms of transfer and
+  // the 69 ms of JSON.parse are the cheap, steady half). So the room really
+  // does stand empty where the robot goes, for something under a second.
+  //
+  // Starting the fetch earlier is NOT the lever, and the numbers say why: the
+  // initial load waits on `Promise.all([/scene, /scenarios, /world])`, which
+  // settles at 0.35 s, and `/world` alone — all this fetch actually needs —
+  // lands at 0.16 s. Chaining off it would save ~0.2 s of a ~1 s wait, and
+  // not even that, because the lab is one event loop and the person scene
+  // queues behind the 20 MB duck scene regardless. The cost is the lab
+  // serialising tens of megabytes of JSON per request; anything that matters
+  // has to come off there (or out of a cache), not out of the call order.
+  //
+  // (And don't take a repeat fetch as evidence: measuring this without
+  // `cache: "no-store"` reads 52 ms off the browser's HTTP cache, which is
+  // how the gap was first written down as "~70 ms, never visible".)
+  const scenesByKind = personScenes ?? {};
+  const kindOf = (q: { kind?: string }) => q.kind ?? "capsule";
+  const capsulePersons = persons.filter((q) => personDraw(kindOf(q), scenesByKind) === "capsule");
+  const meshPersons = persons.filter((q) => personDraw(kindOf(q), scenesByKind) === "meshes");
   const toys = scenario.pickables ?? [];
   // Props with mass stream a pose in `objects`; a mass-0 prop is scenery that
   // `compose` welded to the world body, so the group's initial position is
@@ -1072,16 +1238,23 @@ export function Dynamics({ scenario, client, g1Scene }: {
         // A prop that streams overwrites both of these every frame; a welded
         // one keeps them, which is the whole point.
         <group key={pr.id} ref={setRef(pr.id)} position={pr.pos} rotation={[0, 0, pr.yaw]}>
-          <mesh geometry={propGeometry(pr.shape, pr.size)}>
-            <meshStandardMaterial
-              color={new THREE.Color(pr.rgba[0], pr.rgba[1], pr.rgba[2])}
-              transparent={pr.rgba[3] < 1}
-              opacity={pr.rgba[3]}
-              roughness={0.5}
-              metalness={0}
-              envMapIntensity={0.8}
-            />
-          </mesh>
+          {pr.look === "duck" && duckScene ? (
+            // The collider is NOT drawn under this, matching the model, where
+            // `_collider_rgba` makes it invisible. It is still what collides
+            // and what every detector measures — a look is a picture only.
+            <DuckFigurine scene={duckScene} height={pr.size[2]} />
+          ) : (
+            <mesh geometry={propGeometry(pr.shape, pr.size)}>
+              <meshStandardMaterial
+                color={new THREE.Color(pr.rgba[0], pr.rgba[1], pr.rgba[2])}
+                transparent={pr.rgba[3] < 1}
+                opacity={pr.rgba[3]}
+                roughness={0.5}
+                metalness={0}
+                envMapIntensity={0.8}
+              />
+            </mesh>
+          )}
         </group>
       ))}
       {toys.map((t) => (
@@ -1091,7 +1264,10 @@ export function Dynamics({ scenario, client, g1Scene }: {
           </mesh>
         </group>
       ))}
-      {persons.filter((q) => q.kind !== "g1").map((q) => (
+      {/* A capsule for a mocap person, and for a ROBOT whose meshes FAILED to
+          load — a placeholder that is visible beats one that is not drawn. A
+          robot whose meshes are still coming is in neither list. */}
+      {capsulePersons.map((q) => (
         <group key={q.id} ref={setRef(q.id)}>
           {/* a capsule standing on the floor; the nose cone shows its heading */}
           <mesh rotation={[Math.PI / 2, 0, 0]}>
@@ -1104,8 +1280,15 @@ export function Dynamics({ scenario, client, g1Scene }: {
           </mesh>
         </group>
       ))}
-      {g1Scene && persons.filter((q) => q.kind === "g1").map((q) => (
-        <RobotBody key={q.id} id={q.id} scene={g1Scene} client={client} />
+      {meshPersons.map((q) => (
+        // The look is the BODY's, passed rather than defaulted: `RobotBody`
+        // defaults to "g1" because the G1 was the only robot that walked a
+        // room, and that default silently painted Asimov in the G1's table
+        // (every one of his parts fell through to its pale shell, which is
+        // what "flat featureless grey" was). A body with no look of its own
+        // gets "generic" — its own streamed rgba, right for a Menagerie model.
+        <RobotBody key={q.id} id={q.id} scene={scenesByKind[kindOf(q)]!}
+                   client={client} look={personLook(kindOf(q))} />
       ))}
       {scenario.balls.map((ball, i) => (
         <group key={`ball${i}`} ref={setRef(`ball${i}`)}>

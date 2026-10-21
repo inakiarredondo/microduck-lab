@@ -13,6 +13,14 @@ export const LAB_WS = `ws://${LAB_HOST}/ws`;
 export interface SceneMesh {
   v: number[]; // flat xyz, MuJoCo frame (Z-up)
   f: number[]; // flat triangle indices
+  /** The model's OWN vertex normals, one per `v` vertex, as ints on
+   *  `Scene.normalScale`. Present only when the body ships them (every
+   *  `MjcfBody` does); absent on the duck, the G1 and MARS, whose looks were
+   *  tuned against normals the viewer welds and averages for itself. Shipped
+   *  normals are used VERBATIM — no weld, no crease guess — because they are
+   *  what MuJoCo draws and the guess was off by more than 15 deg on 14 % of
+   *  the Go2's face corners and 55 % of the SO-ARM100's. */
+  n?: number[];
 }
 export interface SceneGeom {
   mesh: number;
@@ -36,6 +44,30 @@ export interface Scene {
    *  metres and omits it; the G1's streams MILLIMETRE ints (its mesh dump is
    *  ~21 MB that way instead of ~78 MB of floats) and sets 0.001. */
   vertScale?: number;
+  /** Multiply `SceneMesh.n` by this to get a unit vector. Set only when some
+   *  mesh ships normals. Independent of `vertScale`: scaling vertices into
+   *  metres (`sim.scaleSceneToMetres`) leaves normals alone. */
+  normalScale?: number;
+  /** Every body's world transform at the REST keyframe, body-indexed like
+   *  `bodies` — what draws this robot standing still with no frame stream.
+   *  The /sim page's duck figurine (`scenario.Prop.look`) is what needs it. */
+  home?: { pos: [number, number, number]; quat: [number, number, number, number] }[];
+  /** The posed robot's extent: `origin` is [centre x, centre y, FLOOR z] and
+   *  `height` its standing height, metres. A figurine is seated and scaled by
+   *  these, measured lab-side so the browser and `world/compose.py
+   *  _duck_figurine` put it in the same place. */
+  bbox?: { origin: [number, number, number]; height: number };
+  /** How big this robot IS, metres: standing height and widest horizontal
+   *  extent, measured from the whole body's geom AABBs at its own stand
+   *  keyframe (`lab/robots.measured_size`). NOT `bbox`, which is the VISUAL
+   *  meshes and 5 % shorter / 28 % narrower on the duck — one quantity, one
+   *  definition, so a camera frames every body the same way.
+   *
+   *  What wants it is the 🎥 record shot (`lib/camera.recordShot`), whose
+   *  metres were tuned on a 25 cm duck and put the lens inside a 1.3 m
+   *  Asimov. Absent on a lab that predates the field, and on a body whose
+   *  model would not compile; the shot then frames at the duck's size. */
+  size?: { height: number; width: number };
 }
 
 export interface LabGhost {
@@ -101,6 +133,12 @@ export interface DuckFrame {
    *  spotter_fn) — shown in-scene so an assisted stretch is never mistaken
    *  for the policy doing it unaided. */
   assist?: boolean;
+  /** The external SHOVE on this body's trunk, while one is being applied:
+   *  `{at: [x,y,z], vec: [fx,fy,0], n}` in newtons, read off MuJoCo's
+   *  `xfrc_applied` so the drawn arrow cannot drift from the force actually
+   *  integrated. Horizontal only — the vertical channel is the demo assist,
+   *  which `assist` above already reports. Drawn by `lib/push.pushArrow`. */
+  push?: { at: number[]; vec: number[]; n: number } | null;
   /** A showcase duck hot-swaps to a standing brain once the trick finishes
    *  (the robot's own pattern) — `handed` is true once control moved over,
    *  `handoff` names the brain taking it. */
@@ -232,6 +270,13 @@ export interface TrainingPayload {
    *  the body being trained. Optional: labs older than this field send none,
    *  and the caller falls back to "trainee". */
   trainee?: string | null;
+  /** Runs whose `policy.onnx` is being written right now, if any. A run does
+   *  not exist for the palette until that file lands (the lab lists a run
+   *  only `if (run / "policy.onnx").exists()`), and `status` reaches "done"
+   *  BEFORE the export does — so a panel that refetches on the done
+   *  transition alone still misses the run the user just watched train.
+   *  Absent on a lab that predates the field. */
+  exporting?: string[];
   behavior: BehaviorCard;
   progress: TrainingProgress;
   /** null/absent = single-run job; set while a curriculum chain trains. */
@@ -852,4 +897,94 @@ export function resolveStageSteps(
     if (Number.isInteger(i) && i >= 1 && i <= out.length && v > 0) out[i - 1] = v;
   }
   return out;
+}
+
+/** Bookkeeping for "one mesh set per robot on the stage, fetched once".
+ *
+ *  Lifted out of Viewer so it can be tested, because the gate and the store
+ *  were updated on DIFFERENT paths and that is a bug you cannot see: a fetch
+ *  resolving after its effect had been torn down (React Strict Mode's dev
+ *  double-mount, a hot reload) ran
+ *
+ *      loadedScenes.add(robot);                  // the permanent gate
+ *      if (!stopped) setScenes(...);             // ...but drop the scene
+ *
+ *  so the robot was marked LOADED while its scene went in the bin, and the
+ *  `loadedScenes.has(robot)` guard then skipped it on every later tick. That
+ *  robot had NO mesh set for the life of the page. The stage still drew its
+ *  floor and the HUD still listed the policies with live counters — the only
+ *  symptom was bodies that never appeared, which reads as "the lab is
+ *  broken", survives removing and re-spawning every duck, and goes away on a
+ *  reload only if the next race lands the other way. The sibling of this bug
+ *  is already in Viewer's comment: re-keying the effect threw away a 21 MB G1
+ *  fetch mid-flight and drew the G1 with the duck's meshes.
+ *
+ *  The rule the class exists to hold: ONLY the path that actually stores a
+ *  scene may close the gate. */
+export class SceneLoads {
+  private loaded = new Set<RobotId>();
+  private pending = new Set<RobotId>();
+  private failures = new Map<RobotId, number>();
+
+  /** A lab without that robot's assets answers 404 every time; stop after a
+   *  few rather than polling a 404 once a second forever. */
+  constructor(private readonly maxFailures = 5) {}
+
+  /** Should this tick start a fetch for `robot`? */
+  wants(robot: RobotId): boolean {
+    return (
+      !this.loaded.has(robot) &&
+      !this.pending.has(robot) &&
+      (this.failures.get(robot) ?? 0) < this.maxFailures
+    );
+  }
+
+  begin(robot: RobotId): void {
+    this.pending.add(robot);
+  }
+
+  /** The scene arrived AND was stored. The only thing that closes the gate. */
+  stored(robot: RobotId): void {
+    this.loaded.add(robot);
+    this.pending.delete(robot);
+    this.failures.delete(robot);
+  }
+
+  /** The scene arrived and was THROWN AWAY — this effect had been torn down.
+   *  It must not count as loaded, or nothing ever fetches it again. Clearing
+   *  `pending` is what lets the next mount's tick pick it back up. */
+  dropped(robot: RobotId): void {
+    this.pending.delete(robot);
+  }
+
+  failed(robot: RobotId): void {
+    this.failures.set(robot, (this.failures.get(robot) ?? 0) + 1);
+    this.pending.delete(robot);
+  }
+
+  /** For tests and diagnostics: robots whose scene is in hand. */
+  loadedRobots(): RobotId[] {
+    return [...this.loaded];
+  }
+
+  /** Which state is this robot in? A stage that draws its floor and its HUD
+   *  and NO BODIES gives no error, no failed request and nothing in the
+   *  console — on 2026-10-06 that cost an hour of guessing at the camera, the
+   *  vertex scales and the backend, all of which were fine. The four states
+   *  below are the whole decision tree up to the point where a mesh set is in
+   *  hand, so a caller can say which one it is instead of inferring.
+   *
+   *    "waiting"  — nothing has asked for it yet (no roster row carries it)
+   *    "fetching" — a request is in flight
+   *    "failed"   — N failures; a lab without that robot's assets 404s
+   *    "ready"    — the scene is stored, so anything still missing is
+   *                 downstream: the geometry build (which logs its own
+   *                 error), the material look, or the render itself */
+  describe(robot: RobotId): { state: "waiting" | "fetching" | "failed" | "ready"; failures: number } {
+    const failures = this.failures.get(robot) ?? 0;
+    if (this.loaded.has(robot)) return { state: "ready", failures };
+    if (this.pending.has(robot)) return { state: "fetching", failures };
+    if (failures > 0) return { state: "failed", failures };
+    return { state: "waiting", failures };
+  }
 }

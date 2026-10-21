@@ -9,12 +9,13 @@
 // colors without costing extra draw calls.
 
 import { useMemo, useRef } from "react";
-import { useFrame } from "@react-three/fiber";
+import { useFrame, useThree } from "@react-three/fiber";
 import { Html } from "@react-three/drei";
 import * as THREE from "three";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import type { DuckFrame, Scene, SceneGeom } from "@/lib/lab";
 import { assignDrag } from "@/lib/assign";
+import { pushArrowHeld, type PushArrow } from "@/lib/push";
 import { captureWantsCleanFrame } from "@/lib/record";
 import { getSelectedDuck } from "@/lib/select";
 import { propRadius, propShape } from "@/lib/prop";
@@ -25,7 +26,7 @@ import {
   type EpisodeCause,
 } from "@/lib/episode";
 import { getDuckLabels } from "@/lib/ui";
-import { CREASE_ANGLE_DEG, G1_KINDS, g1PartKind, useG1Materials, weldAndSmooth, weldTolerance } from "./G1Look";
+import { CREASE_ANGLE_DEG, G1_KINDS, g1PartKind, roomEnv, useG1Materials, weldAndSmooth, weldTolerance } from "./G1Look";
 import { MARS_KINDS, marsPartKind, useMarsMaterials } from "./MarsLook";
 import { duckMouths, MOUTH_TRAVEL_RAD } from "@/lib/mouth";
 import { SHELL_MATERIALS, TEAM_COLORWAYS, TRIM_MATERIALS, teamColor, type TeamName, POSE_SMOOTH_HZ, simRate } from "@/lib/sim";
@@ -139,11 +140,40 @@ export function buildBodyGeometries(
   // MARS is the boxy one: its shells are bevelled panels, and smoothing
   // across those bevels is what made its head arrive fluted. See
   // G1Look.weldAndSmooth for why this is opt-in rather than the default.
-  const crease = opts.look === "mars" ? CREASE_ANGLE_DEG : undefined;
+  //
+  // A GENERIC body gets it too, because nobody here has seen that robot and
+  // a bevel is what an unseen one is most likely to have. MEASURED, as the
+  // share of manifold edges sharper than CREASE_ANGLE_DEG: the SO-ARM100 is
+  // 20.7 % (a printed arm — as boxy as MARS) and the Go2 is 0.82 % (a smooth
+  // CAD quadruped, but those edges are exactly its panel seams). Smoothing
+  // is the lossy choice on both and creasing costs nothing on a round part,
+  // which is why the default runs the other way here than on the G1.
+  const crease =
+    opts.look === "mars" || opts.look === "generic" ? CREASE_ANGLE_DEG : undefined;
+  // The model's OWN normals, when it ships them (SceneMesh.n). A mesh that
+  // has them needs NO weld and NO crease guess: it is drawn with the normals
+  // MuJoCo draws with, hard edges and all. The weld below exists precisely
+  // because this array used to be dropped on the floor, and inventing it back
+  // is lossy twice over — it averages across an edge the author split, and it
+  // reads the lattice's rounding as surface. MEASURED against the authored
+  // normal, per face corner: the invented one is off by over 15° on 13.9 % of
+  // the Go2's corners and 55.0 % of the SO-ARM100's.
+  //
+  // ALL of them or none: a welded part comes back non-indexed when it creases
+  // and indexed when it does not, and `mergeGeometries` refuses a body whose
+  // parts disagree about either that or their attributes. One mesh the lab
+  // could not ship normals for would otherwise take out the whole body.
+  const ns = scene.normalScale ?? 1;
+  const shipped =
+    scene.meshes.length > 0 && scene.meshes.every((m) => m.n?.length === m.v.length);
   const meshGeos = scene.meshes.map((m) => {
     const g = new THREE.BufferGeometry();
     const v = vs === 1 ? m.v : m.v.map((x) => x * vs);
     g.setAttribute("position", new THREE.Float32BufferAttribute(v, 3));
+    if (shipped) {
+      const n = ns === 1 ? m.n! : m.n!.map((x) => x * ns);
+      g.setAttribute("normal", new THREE.Float32BufferAttribute(n, 3));
+    }
     g.setIndex(m.f);
     return g;
   });
@@ -154,7 +184,7 @@ export function buildBodyGeometries(
     const parts = scene.geoms
       .filter((g) => g.body === b)
       .map((g) => {
-        const geo = cad
+        const geo = cad && !shipped
           ? weldAndSmooth(meshGeos[g.mesh], tol, crease)
           : meshGeos[g.mesh].clone();
         quat.set(g.quat[1], g.quat[2], g.quat[3], g.quat[0]); // wxyz → xyzw
@@ -177,7 +207,7 @@ export function buildBodyGeometries(
     if (!cad) {
       const merged = mergeGeometries(parts.map((p) => p.geo), false);
       parts.forEach((p) => p.geo.dispose());
-      merged.computeVertexNormals();
+      if (!shipped) merged.computeVertexNormals();
       return { name, geometry: merged };
     }
     if (!kinds) {
@@ -238,9 +268,33 @@ export function Duck({
   const marsMaterials = useMarsMaterials(bodies.some((b) => b.look === "mars"));
   // A generic body is lit like the G1's shell but takes its colour from the
   // geometry, so one material serves every one of them.
+  //
+  // It is lit like the G1's shell because it now REFLECTS what the G1's
+  // shell does. This was a bare MeshStandardMaterial at metalness 0.2 with
+  // no environment, and metal with nothing to reflect is just darker: the
+  // Go2's near-white `metal` and `gray` shells (rgba .9 .95 .95 and .67 .69
+  // .77) arrived as flat putty, with none of the specular MuJoCo's own
+  // renderer gives them. The room map is already built once per renderer for
+  // the G1 and MARS (`G1Look.roomEnv`), so a third look costs no PMREM pass.
+  const gl = useThree((s) => s.gl);
   const genericMaterial = useMemo(
-    () => new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.2 }),
-    []
+    () =>
+      // The numbers are the G1 shell's own (`makeG1Material`'s default branch
+      // at `useG1Materials`' envScale 0.35 — 0.75 × 0.35 = 0.26), not a new
+      // set: that recipe is already tuned for THIS stage's three lights, and
+      // a first pass at 0.55 lit the Go2's near-white shells until its grey
+      // and its metal read the same. A body nobody has seen should borrow a
+      // measured look, not get an invented one.
+      new THREE.MeshPhysicalMaterial({
+        vertexColors: true,
+        envMap: roomEnv(gl),
+        envMapIntensity: 0.26,
+        roughness: 0.34,
+        metalness: 0.06,
+        clearcoat: 0.35,
+        clearcoatRoughness: 0.28,
+      }),
+    [gl]
   );
   const labelRef = useRef<THREE.Group>(null);
   const labelDivRef = useRef<HTMLDivElement>(null);
@@ -264,6 +318,14 @@ export function Duck({
   const ghostLineRef = useRef<THREE.LineSegments>(null);
   const targetRef = useRef<THREE.Mesh>(null);
   const targetPinRef = useRef<THREE.Mesh>(null);
+  // THE SHOVE ARROW: a group holding a shaft and a head, so one position and
+  // one rotation aim both and the shaft alone stretches with the force.
+  const pushRef = useRef<THREE.Group>(null);
+  const pushShaftRef = useRef<THREE.Mesh>(null);
+  const pushHeadRef = useRef<THREE.Mesh>(null);
+  // The last shove seen, so a 7-frame impulse stays legible. A ref, not
+  // state: this is read and written every frame inside the r3f loop.
+  const lastPush = useRef<{ arrow: PushArrow | null; at: number }>({ arrow: null, at: 0 });
   const tmpP = useMemo(() => new THREE.Vector3(), []);
   const tmpQ = useMemo(() => new THREE.Quaternion(), []);
   // The error segment's two endpoints. PER DUCK and stable across renders:
@@ -455,6 +517,41 @@ export function Duck({
       targetPinRef.current.visible = !!tgt;
       if (tgt) targetPinRef.current.position.set(tgt[0], tgt[1], 0.06);
     }
+    // THE SHOVE. Without it a viewer watching the recovery demo sees a robot
+    // that falls over for no reason; the arrow says what hit it and how hard.
+    // Snapped, not lerped: a 0.15 s impulse smoothed over would draw a force
+    // that is no longer being applied.
+    const { arrow, opacity } = pushArrowHeld(
+      duck.push, lastPush.current, performance.now());
+    for (const r of [pushRef, pushShaftRef, pushHeadRef] as const) {
+      if (r.current) r.current.visible = !!arrow;
+    }
+    for (const r of [pushShaftRef, pushHeadRef] as const) {
+      const mat = r.current?.material as THREE.Material | undefined;
+      if (mat) mat.opacity = opacity;
+    }
+    if (arrow && pushRef.current) {
+      // The arrow points INTO the robot, so it reads as something pushing
+      // rather than something the robot emits: the group sits back along the
+      // force and the head lands on the trunk.
+      const [dx, dy] = [-Math.sin(arrow.yaw), Math.cos(arrow.yaw)];
+      pushRef.current.position.set(
+        arrow.at[0] - dx * arrow.length,
+        arrow.at[1] - dy * arrow.length,
+        arrow.at[2],
+      );
+      pushRef.current.rotation.set(0, 0, arrow.yaw);
+      const head = 0.09;
+      if (pushShaftRef.current) {
+        // the unit cylinder is centred on its own origin, so half the length
+        // puts its base at the group and its tip under the head
+        pushShaftRef.current.scale.set(1, Math.max(0.01, arrow.length - head), 1);
+        pushShaftRef.current.position.set(0, (arrow.length - head) / 2, 0);
+      }
+      if (pushHeadRef.current) {
+        pushHeadRef.current.position.set(0, arrow.length - head / 2, 0);
+      }
+    }
     // ...and the error itself, as a segment from the belief to the truth.
     if (ghostLineRef.current) {
       const show = !!ghost && !!ball;
@@ -482,6 +579,9 @@ export function Duck({
       const spawn = duck.spawn && duck.spawn !== "standing" ? `↻ ${duck.spawn}` : "";
       const parts = [spawn];
       if (duck.assist) parts.push("🤝 spotting");
+      // The shove in NEWTONS, beside the arrow drawing it. The arrow's
+      // length is clamped, so it cannot be read as a magnitude on its own.
+      if (duck.push) parts.push(`💥 ${Math.round(duck.push.n)} N`);
       if (duck.handed && duck.handoff) parts.push(`→ ${duck.handoff}`);
       const txt = parts.filter(Boolean).join(" · ");
       if (spawnDivRef.current.textContent !== txt)
@@ -590,6 +690,25 @@ export function Duck({
         <cylinderGeometry args={[0.006, 0.006, 0.12, 8]} />
         <meshBasicMaterial color="#e8b24a" transparent opacity={0.7} depthWrite={false} />
       </mesh>
+      {/* THE SHOVE ARROW. Unit-height geometry scaled per frame rather than
+          rebuilt, and `meshBasicMaterial` with no shadow, in the spirit of
+          the rest of this file: the first viewer lost its WebGL context to
+          560 shadow-casting meshes. Red, because every other in-scene marker
+          here is amber (a target) or orange (a ball) and a force is not a
+          goal — and CYAN rather than the red this started as, because the
+          Asimov's own torso is orange-red (`ASIMOV_ACCENT` #c26a14) and a red
+          arrow on it was indistinguishable from the robot. A marker has to
+          contrast with the body wearing it. */}
+      <group ref={pushRef} visible={false}>
+        <mesh ref={pushShaftRef} visible={false}>
+          <cylinderGeometry args={[0.018, 0.018, 1, 10]} />
+          <meshBasicMaterial color="#19e5ff" transparent opacity={0.95} depthWrite={false} />
+        </mesh>
+        <mesh ref={pushHeadRef} visible={false}>
+          <coneGeometry args={[0.05, 0.09, 12]} />
+          <meshBasicMaterial color="#19e5ff" transparent opacity={1} depthWrite={false} />
+        </mesh>
+      </group>
       {/* THE ERROR SEGMENT. `frustumCulled={false}` because this is the one
           thing here that moves by rewriting its VERTICES instead of its
           transform: three computes a bounding sphere once, lazily, from

@@ -51,7 +51,13 @@ Maya/Blender-style: drag to orbit, scroll/two-finger-vertical to zoom,
 direction; browser back-swipe is suppressed over the scene, and panels keep
 native scrolling — one swipe is locked to one axis, `lib/swipe.ts`),
 **A/D** slide, **W/S·↑↓** dolly, **←/→** orbit, **E** up / **Q** down,
-**Shift+R** reset view — all held keys move smoothly (velocity × dt).
+**Shift+R** reset view — all held keys move smoothly (velocity × dt). The
+view home, and how far out the dolly may go, are **sized by the biggest body
+on the stage** (`lib/camera.homeView` / `stageMaxDist`, off `GET /scene`'s
+`size`): a duck stage opens exactly where it always did, and a 1.3 m Asimov
+no longer arrives with its head out of frame. On `/sim` the subject is the
+ROOM, so the same reset is sized by the floor — MOSS's 2.6 m yard and the
+Asimov's 8 m hall both fit.
 The one non-camera key is **R**, which **restarts the sim** (`{"reset": true}`
 to the lab): every duck's episode drops back to step zero at the same moment,
 which is what makes a side-by-side comparison legible. **Clicking a duck**
@@ -158,6 +164,15 @@ an authored pose pins the editor to its body. A one-robot lab shows no switch.
   the selected duck for you — the camera glides to a ¾ front shot (chosen from
   the duck's heading, then held with a slow cinematic drift; OrbitControls and
   camera keys pause for the take) and MediaRecorder captures the WebGL canvas.
+  **The shot is sized to the robot in the slot**: its metres were tuned on a
+  25 cm duck (0.78 m out, 0.34 m up) and every body got the same ones, which
+  put the lens inside a 1.3 m Asimov's hip. The lab now measures each body —
+  `GET /scene`'s `size`, the whole robot's geom AABBs at its own stand
+  keyframe — and `lib/camera.recordShot` scales distance and height by the
+  larger of its height and width (width matters: MOSS is 0.41 m tall and
+  0.57 m across, the Go2 0.39 by 0.75), so every body is framed the same
+  2.82 subject-lengths out at the same 23.6° lens. A lab too old to send
+  `size`, or a body whose model will not compile, frames at the duck's size.
   Footage is automatically clean: DOM labels/panels aren't part of the canvas,
   and the amber selection ring hides itself while filming. ■ stop uploads the
   take to the lab (`POST /captures`), whose bundled ffmpeg writes a
@@ -535,5 +550,43 @@ so rather than reading as a broken run.
   carries the right colours itself, so the table is empty today. Against a
   lab too old to stream colors the viewer falls back to one guessed color
   per body.
+- **A stage that draws its floor and its HUD and NO BODIES means a robot has
+  no mesh set — and that failure is silent.** The per-robot scene dumps are
+  fetched once each (`GET /scene?robot=`) and the bodies of any robot whose
+  dump is missing simply do not render. Everything an instrument would check
+  looks healthy: the floor grid draws, the HUD lists every policy with moving
+  counters and a green `● live` badge, the websocket frames carry correct
+  transforms, and nothing appears in the console. On 2026-10-06 that cost an
+  hour and produced three wrong diagnoses in a row — a stale restored trainee,
+  a dead render loop, a camera parked off-stage — each argued from one
+  sequence and each disproved by a repro (`?lab=host:port` points the page at
+  a scratch lab, which is how). **The cause of that particular blank stage is
+  still unknown**; a sim restart cleared it and it has not recurred.
+
+  Two things came out of it. The loader's bookkeeping is now one object
+  (`SceneLoads` in `lib/lab.ts`) rather than three loose refs, because the
+  "already fetched" gate and the stored scene were updated on different lines:
+
+  ```ts
+  loadedScenes.add(robot);                  // the permanent gate
+  if (!stopped) setScenes(...);             // ...but bin the scene
+  ```
+
+  A fetch resolving after a teardown would mark the robot loaded and throw its
+  meshes away, and nothing would refetch it. That inconsistency is real and is
+  now impossible — only the path that STORES a scene closes the gate — but it
+  is **latent**: neither Strict Mode's dev double-mount nor Fast Refresh could
+  be made to fire it (the effect runs before `clientRef` is set, so no fetch is
+  in flight at the first teardown), and planting the old semantics behind a
+  proxy that delayed the Asimov scene 30 s still rendered. So it is hardening,
+  not a fix for the bug above.
+
+  The second is the instrument, which is the part that will actually help:
+  Viewer warns once per robot when a roster row has carried it for 8 s with no
+  mesh set, naming which of the four states it is stuck in (`waiting`,
+  `fetching`, `failed`, `ready`) and what to look at. Verified by proxying the
+  lab and 404ing `/scene?robot=asimov1` — which reproduces the symptom exactly
+  and now says why.
+
 - The lab loop is single-threaded Python: 8 ducks × 50 Hz ≈ 5% of one core.
   Dozens of ducks are fine; hundreds would want the envs in a worker pool.

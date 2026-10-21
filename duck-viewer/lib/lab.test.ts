@@ -8,8 +8,11 @@
 // comparison. These pin the fallbacks, because most runs have no record and
 // must keep reading exactly as they always did.
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
-import { chainPick, DEFAULT_ROBOTS, policyTitle, robotsInFrame, type Policy } from "./lab";
+import { chainPick, DEFAULT_ROBOTS, policyTitle, robotsInFrame, SceneLoads, type Policy } from "./lab";
 
 function stage(label: string, extra: Partial<Policy> = {}): Policy {
   return {
@@ -93,5 +96,99 @@ describe("robotsInFrame", () => {
     expect(robotsInFrame([{ robot: "menagerie:unitree_go2" }])).toEqual([
       "menagerie:unitree_go2",
     ]);
+  });
+});
+
+describe("SceneLoads — the mesh-set gate", () => {
+  // The bug this class exists to make impossible, replayed as the sequence
+  // that produced it on 2026-10-06: two Asimovs on the stage, the lab live,
+  // the HUD listing both policies with moving counters, and not one body
+  // drawn. Removing and re-spawning the ducks did nothing, because the page
+  // had already decided it had asimov1's meshes.
+  it("a scene DROPPED after teardown stays fetchable", () => {
+    const l = new SceneLoads();
+    expect(l.wants("asimov1")).toBe(true);
+    l.begin("asimov1");
+    expect(l.wants("asimov1")).toBe(false);   // in flight
+
+    // Strict Mode unmounts; the fetch resolves into the dead closure.
+    l.dropped("asimov1");
+
+    expect(l.loadedRobots()).toEqual([]);     // NOT loaded — it was binned
+    expect(l.wants("asimov1")).toBe(true);    // ...so the next mount refetches
+  });
+
+  it("only a STORED scene closes the gate", () => {
+    const l = new SceneLoads();
+    l.begin("g1");
+    l.stored("g1");
+    expect(l.loadedRobots()).toEqual(["g1"]);
+    expect(l.wants("g1")).toBe(false);        // never fetched twice
+  });
+
+  it("gives up on a lab that does not have the robot, but not before 5 tries", () => {
+    const l = new SceneLoads();
+    for (let i = 0; i < 5; i++) {
+      expect(l.wants("go2")).toBe(true);
+      l.begin("go2");
+      l.failed("go2");
+    }
+    expect(l.wants("go2")).toBe(false);       // 404 forever — stop polling
+  });
+
+  it("a failing robot that finally answers is not held back by its failures", () => {
+    const l = new SceneLoads();
+    l.begin("mars"); l.failed("mars");        // lab restarting mid-session
+    expect(l.wants("mars")).toBe(true);
+    l.begin("mars"); l.stored("mars");
+    expect(l.loadedRobots()).toEqual(["mars"]);
+  });
+  // The class above can only hold the invariant if its ONE caller uses it the
+  // right way round, and the gap between the rule and the call site is
+  // precisely where this bug lived: the bookkeeping was three loose refs
+  // inline in the effect, and nothing could have tested it. Checked against
+  // the source, the way inset.test checks three's renderer.
+  it("Viewer's torn-down path calls dropped(), never stored()", () => {
+    const src = readFileSync(
+      fileURLToPath(new URL("../components/Viewer.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(src, "Viewer must use the shared gate").toContain("new SceneLoads()");
+    expect(src, "the loose refs must not come back").not.toMatch(/loadedScenes|pendingScenes|sceneFailures/);
+
+    // The `stopped` branch — everything between `if (stopped) {` and its
+    // close — must bin the scene and leave the robot fetchable.
+    const at = src.indexOf("if (stopped) {");
+    expect(at, "the fetch must still guard on teardown").toBeGreaterThan(-1);
+    const branch = src.slice(at, src.indexOf("}", src.indexOf("return;", at)));
+    expect(branch, "a dropped scene must stay fetchable").toContain("dropped(robot)");
+    expect(branch, "a dropped scene must NOT close the gate").not.toContain("stored(robot)");
+  });
+});
+
+describe("SceneLoads.describe — naming a silent failure", () => {
+  // The blank stage of 2026-10-06 produced no error, no failed request and a
+  // green "live" badge. Three wrong diagnoses came out of that (a stale
+  // trainee, a dead render loop, a camera parked off-stage), each argued from
+  // one sequence. These four states are what a caller should be able to say
+  // instead of guess.
+  it("walks waiting -> fetching -> ready", () => {
+    const l = new SceneLoads();
+    expect(l.describe("asimov1").state).toBe("waiting");
+    l.begin("asimov1");
+    expect(l.describe("asimov1").state).toBe("fetching");
+    l.stored("asimov1");
+    expect(l.describe("asimov1").state).toBe("ready");
+  });
+
+  it("reports failures with their count, and a dropped scene as NOT ready", () => {
+    const l = new SceneLoads();
+    l.begin("go2"); l.failed("go2");
+    expect(l.describe("go2")).toEqual({ state: "failed", failures: 1 });
+
+    const m = new SceneLoads();
+    m.begin("asimov1"); m.dropped("asimov1");
+    // The whole point: a binned scene must never look ready.
+    expect(m.describe("asimov1").state).not.toBe("ready");
   });
 });
