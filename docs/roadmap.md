@@ -20542,13 +20542,1709 @@ to be right and one wrong, and which is which is the useful part:
 
 Superseded by phase 3d, which trains against a reference instead of a reward.
 
-### Phase 4 — the hardware envelope  `[ ]`
+### Phase 4 — the hardware envelope  `[x] 2026-10-13 — and it invalidates every get-up above it`
 
 Peak torque per joint against rated, seconds at the clamp, joint-velocity
 peaks and ROM margin — sampled at the PHYSICS step, not the control step
-(`AGENTS.md`, "Measure the servos, not the score"). **Settles:** a get-up that
-never exceeds rated torque, against the walk baseline's three joints already
-at 100 %.
+(`AGENTS.md`, "Measure the servos, not the score"). **Settled, and the answer
+is no:** our get-up exceeds Menlo's published joint ratings on **82 % of rise
+frames, max 5.29x**, and under the real actuator envelope it does not get up at
+all.
+
+**What was wrong with our model, and it was not a small thing.** Our envs drive
+the MJCF's position servos, clamped at a per-group `forcerange` taken from
+Menlo's URDF `<limit effort=>` — and with **no speed dependence whatever**.
+That is a robot which is weak standing still and unlimited once it is moving,
+so the cheapest route through any reward is to fling everything, which is
+exactly what every policy here learned. The real motors have a speed-torque
+curve (mjlab's `dc_motor_clip`, which openhorizon-labs publish in
+`getup_policy_spec.json` and implement in `run_policy_mujoco.py`):
+
+    tau = clip(kp*(q_target - q) - kd*qd, lo, hi)
+    hi  = min(+effort, +peak * (1 - v/vlim)),  lo = max(-effort, -peak * (1 + v/vlim))
+    v   = clip(qd, -vlim*(1 + effort/peak), +vlim*(1 + effort/peak))
+
+`robots/asimov_motor` is that model, and it is a COPY of a published one rather
+than ours: `kp`, `kd`, `armature` and `friction` are already in
+`asimov_walk.GAIN_GROUPS` off Menlo's `env.yaml` and **agree with
+openhorizon's `pd_gains` on all 23 joints exactly**; `effort` and the rated
+speed `vlim` are read from Menlo's URDF at runtime (and their
+`velocity_limit` matches the URDF on all 23); `peak_torque` is the one quantity
+no Menlo file states, so it is theirs and `limits()` records whose it is.
+`actuator_force="dc"` selects it, per SUBSTEP, by rewriting
+`actuator_forcerange` from the live `qvel` — which is EXACTLY their `torque()`,
+because a MuJoCo position servo already computes `kp*(ctrl-q) - kd*qd` and
+already clamps it to that range. Verified 0 N\*m difference against their own
+function over 200 random states, and 0 violations in 18,377 joint-substeps.
+
+**An earlier "0/24 under limits" was measured with a wrong instrument and the
+conclusion survived anyway.** `AsimovGetupEnv._apply_vel_limit` was an opposing
+force proportional to overspeed: it removed torque above the rating without
+ever granting the 3x `peak_torque` below it, so it over-penalised in one
+direction and under-modelled in the other. It is deleted. Re-measured under the
+real envelope, paired by seed on the same 48 episodes
+(`scripts/probe_actuator_ab.py`, `teach-asimov_getup_turn-967072`):
+
+| pose | actuator `xml` (as trained) | actuator `dc` (published envelope) | paired exact McNemar |
+|---|---|---|---|
+| supine | rises **48/48** | rises **0/48** | discordant 48-0, p = 0.0000 |
+| prone | rises **47/48** | rises **0/48** | discordant 47-0, p = 0.0001 |
+
+**And the envelope is not the obstacle — our route is.** openhorizon-labs'
+get-up rises **24/24, median 1.00 s** under its own harness, and through
+`robots/asimov_openhorizon` in OUR lab env with `dc` enforced it rises
+**24/24, median 1.61 s, 24/24 still standing at the buzzer**, scored by this
+repo's own `is_standing` (trunk up, upright, nothing but feet down), from this
+repo's own pose cache. So a get-up fits through Menlo's published ratings; ours
+does not fit through them.
+
+**The whole of the observation gap is HISTORY.** Their policy takes 375 inputs
+and ours take 78, which reads like a contract mismatch and is not one: their
+five terms (`base_ang_vel`, `projected_gravity`, `joint_pos`, `joint_vel`,
+`actions`) are each already in Menlo's 78-float layout, at the same scale, in
+the same joint order, with `default_joint_pos` matching `DEFAULT_POSE` to
+**0.0000 rad** and `action.scale` 0.25 either way. 375 = 75 x 5 frames, and our
+78 carries three MORE floats than their 75 (the velocity command, which a
+get-up has no use for). `asimov_openhorizon.OpenHorizonPolicy` is therefore a
+`(obs78) -> action23` callable that stacks the ring their `Policy.step` keeps,
+and it reproduces their runner's actions to **< 1e-5** over a 150-step get-up.
+Eight planted regressions, each caught by the test that names it.
+
+One measured divergence between the two harnesses, stated rather than assumed
+negligible: `walk_env._refresh_derived` brings `sensordata`/`xmat` current after
+the substep loop and their runner does not, so a policy on our stage sees a
+gyro and gravity vector **one substep (5 ms) fresher** than the reference feeds
+it — up to 0.066 rad/s and 0.022 on gravity. The joint blocks are read from
+`qpos`/`qvel` and are identical to float precision.
+
+**What a naive retrain under `dc` would have done.** Priced the do-nothing
+policy first, which is the rule this repo paid most to learn. On the training
+start distribution under `dc`, the donor returns **-671.5** against a
+zero-action floor of **+254.7** — the floor wins by 926, because thrashing
+against the envelope costs `limit_penalty` and `flight_penalty` while lying
+still is free. A warm-start PPO run there trains the robot to stop trying, which
+is the `ep_rew 216 -> 2942` failure in a new costume. In the IMITATION env under
+`dc` the separation is the other way: the teacher scores **6603.7** against a
+floor of **48.6** (136x, and it rises 10/10 there), so that is where the
+gradient is.
+
+**Launched:** `teach-asimov_getup_clip-6da7b6`, 4 stages x 1.5 M, tracking 40
+demonstrations harvested by their policy **inside our own `dc` env from our own
+pose cache** (`harvest_getup_clips.py --our-env`, 40/40 kept, median 1.37 s) —
+so every reference frame is one our physics produced, rather than one from their
+model with its collision overlay. `run.json` records
+`actuator_force: "dc"`, and the lab's trainee previews at `actuator=dc` too.
+
+**THE RETRAIN UNDER THE REAL ENVELOPE IS A NULL, and the reason is the
+observation, not the training.** `teach-asimov_getup_clip-6da7b6`, 4 rungs x
+1.5 M tightening the drift cut 0.6 -> 0.25, tracking the 40 demonstrations
+harvested inside our own `dc` env: **0/48 rises** in the deployment env on both
+poses, paired against the old policy's 0/48 (discordant 0-0, p = 1.0000).
+Every rung is 0/24, so the ladder was not the problem. It is not a dead
+economy either — the final policy returns **166.6** against a zero-action floor
+of **55.0** — but `verify_run` names what happens: *a curriculum cut
+(track_err) fired before standing in 36 of 36 episodes*, peak trunk **0.180 m**.
+It learns the first instants of the demonstration and then drifts off it.
+
+**And the ablation says why, decisively** (`scripts/probe_history_ablation.py`).
+Freeze openhorizon's observation ring to the PRESENT — every one of the 5 slots
+filled with the current frame, which is exactly the input their own spec says
+step 1 receives — and leave the graph, weights and action mapping untouched:
+
+| pose | 5 frames, as published | 1 frame, history ablated |
+|---|---|---|
+| prone | rises **24/24**, median 1.61 s | rises **0/24** |
+| supine | rises **23/24**, median 1.14 s | rises **0/24** |
+
+So the five frames are **load-bearing**, not spare capacity, and the whole
+observation gap is the part that matters. That retires the roadmap's
+distillation plan as stated: a student on Menlo's 78 floats of CURRENT state
+cannot represent this controller, so no amount of cloning or PPO fine-tuning on
+one frame gets there. It also reframes the contribution. **A
+contract-preserving (78/23) get-up on this body needs memory the published
+observation does not carry** — which is a finding to send Menlo, not a training
+problem to grind at. The honest limit of the claim: this shows THEIR policy
+depends on history, and combined with our own 0/48 it is the best explanation
+available, but it does not prove no single-frame policy could rise. The next
+real experiment is therefore a 78 x N-frame student (`history` is already a
+recorded knob, and `AGENTS.md` has "Check the observation is sufficient" — run
+the history-vs-no-history control BEFORE reward work, which this is), scored
+against the 78 x 1 control.
+
+**THE 78 x N ARM WORKS: 40/48 rises and 28/48 HOLDS from supine, inside
+Menlo's published speed-torque envelope** (`asimov-getup-h5-dag`, 390 inputs =
+5 x 78, `actuator_force="dc"`). Paired against the one-frame arm on the same 48
+seeds, supine goes **0/48 -> 41/48 rises** (p = 0.0000) and the hold
+**0/48 -> 28/48** (p = 0.0000). Prone is the weak half at **10/48**. So the
+ablation's prediction held in both directions: one frame cannot do it, five
+can.
+
+The route that worked is behaviour cloning plus DAgger, not RL:
+
+| route | fidelity | rises (supine / prone) | holds |
+|---|---|---|---|
+| PPO tracking, `history=5`, 4 rungs | — | 0/48 / 0/48 | 0 |
+| clone, 250 eps, 65 k pairs | MSE **0.000238** rad² | **41/48** / 7/48 | 0/48 |
+| + DAgger x3 (60 eps/iter) | MSE 0.009 on a 36 k set | 40/48 / **10/48** | **28/48** |
+| + PPO fine-tune from the clone | — | 0/24 (made it worse) | 0 |
+
+DAgger is what bought the HOLD, which is the thing nine reward terms and
+eleven runs failed to buy on this body — its student-state collection goes
+7/60 then 13/60 ending standing, and the clone it starts from must be a GOOD
+one (seeded from a weak iteration-0 fit, the same chain went 0/30 at every
+iteration). The PPO fine-tune from the clone is a REGRESSION, not a null:
+peak trunk 0.314 -> 0.153 m, which is the warm-start hazard this repo already
+has two memories about.
+
+**RETRACTED: the "covariate shift" diagnosis, and the bug was mine.** An
+earlier version of this section reported every N-frame route at 0, and
+attributed it to covariate shift on the evidence that the clone failed on its
+own 40 training starts (0/24 at peak 0.313 m against the teacher's 24/24 at
+0.624 m). The real cause was an input bug I had just introduced. `_obs_live`
+— the flag that makes `_get_obs` rebuild the ring during reset instead of
+advancing it — is set by `AsimovGetupEnv.step`, and
+`scripts/distill_getup.py` hand-rolls `mj_step` for the teacher-driven
+iteration, so it never reaches that method. The flag stayed False for the
+whole episode, `_get_obs` rebuilt on every call, and **every collected
+observation held five identical frames**: a history-less input wearing a
+390-float shape, with no error anywhere. The clone fitted it to MSE
+**0.000359** and met a real history at evaluation, where its error on the SAME
+states is **0.273526** — a 760x gap that reads exactly like covariate shift.
+One line in the collection loop fixes it, and the same clone recipe then goes
+0/48 -> 41/48.
+
+Two lessons worth more than the result. **A flag that only the normal path
+sets is a trap for every abnormal one** — the fix is documented on the
+attribute itself now, because the next hand-rolled loop will hit it. And **the
+tell was available before the rollout**: training MSE 0.000359 against 0.273526
+on reachable states is a 760x discrepancy, and this repo's own rule is to
+"diff the training data's per-slot variance against the deployed env's" before
+blaming anything about learning. Four of the five history frames having zero
+variance would have said so immediately.
+
+**AND OUR OWN RULES STILL CANNOT FIND IT — 0/48 at 37 M steps with the
+observation fixed.** The fair question after all of the above is whether the
+working policy is only working because it is COPIED. It is: `h5-dag` is
+openhorizon's controller re-expressed in our observation, and our reward
+economy contributed nothing to it. So the economy was given its own clean
+shot: `teach-asimov_getup_turn-cb2d32`, the 14-stage `asimov_getup_turn`
+recipe with our own terms (`roll` 100, `tuck` 200, `span` 30, `ground` 6,
+`balance` 40, `home` 30, `limit` 50), **nothing imitated**, with exactly two
+things changed from every previous attempt — `history=5` and `actuator_force=
+"dc"`. 37,044,224 steps.
+
+Result: **0/48 rises on both poses**, peak trunk **0.170 m**, flat across
+every checkpoint from 34.5 M to 37 M. Paired against the clone: supine 40 vs
+0 (p = 0.0000), prone 10 vs 0 (p = 0.0020).
+
+**It is not a dead economy and it is not an insufficient observation — it is
+search.** Priced first, as the rule demands: in this exact configuration a
+policy that genuinely rises earns **10,512** against **725** for lying still,
+a 14.5x separation, so our terms do pay for the thing we want. The trained
+policy earns **~1,400** against a zero-action floor of **-33**, so it learned
+plenty — just none of it a rise. It found a floor-bound local optimum worth
+1,400 and never left it, while the optimum it was aimed at is worth 10,500.
+That is exploration, and 37 M steps of a 14-rung curriculum did not cross it.
+
+Which closes the loop on the ledger's oldest question. Every previous "this
+body cannot" was retired by openhorizon's policy; every "our rules cannot" was
+until now confounded by a ONE-FRAME observation that the ablation proves
+cannot represent the task. Both confounds are now gone, and the honest
+statement is narrower and harder: **on a Mac CPU, at 37 M steps, our reward
+economy does not find this skill, and imitation of a working teacher does.**
+The lever that remains is not another reward term — it is the one upstream
+uses, 4096 envs on an A6000, or staying with imitation.
+
+**WHERE THE CLONE'S MOTION DIFFERS FROM THE TEACHER'S, measured after
+Jonathan said it looked like different leg movements and less arm push.** He
+was right, and the error is concentrated exactly there. Same 16 supine starts,
+same env, same actuator:
+
+* **Not the strategy.** Joint peak-to-peak travel matches the teacher within
+  **1.02-1.11x on every group**, and both saturate the identical torque
+  ceilings (arm 30 N*m, leg 45 N*m). The feet are fine: ankle_roll RMS 0.078
+  rad, ankle_pitch 0.195.
+* **It IS the arm, then the hip and knee.** Trajectory RMS over the 1.2 s
+  push-off: `elbow` **0.464 rad**, `shoulder_roll` **0.459**, `hip_pitch`
+  0.433, `knee` 0.392. Worst single joint `right_elbow_joint` at **0.615 rad
+  RMS, 1.86 max**. At the opening action the ARM gap exceeds the LEG gap in
+  both clones (1.07 vs 0.82 for `h5-fix`; 1.36 vs 1.07 for `h5-dag`).
+* **It is wrong from the FIRST action**, not drifting into it: mean
+  **0.305 rad (17 deg)** of joint target at step 1, worst at
+  `right_elbow` / `left_knee` / `right_hip_pitch`. Divergence is 0.139 rad by
+  t=0.04 s and only reaches 0.39 by 0.9 s, so almost all of it is there
+  immediately.
+* **It is FIDELITY, not coverage.** On the 40 starts it was actually fitted
+  on the opening gap is 1.017 action units against 1.255 on the full pose
+  cache — **1.23x**, nothing. More demonstrations of the same kind will not
+  fix it.
+* **And DAgger traded motion fidelity for the hold.** It bought 0/48 -> 28/48
+  standing and made the opening **24 % less faithful** (0.984 -> 1.219). The
+  two things we want currently live in different policies.
+
+So the cleanups are, in order: **weight the fit by joint** (the loss averages
+23 joints equally, so the elbow — hardest and most consequential — is traded
+against ankles that are already right to 0.078 rad); **keep the clean
+demonstrations weighted in the DAgger aggregate**, which by iteration 3 is 36 k
+pairs dominated by hard student states; **more epochs**, since every fit was
+still improving at epoch 119; and only then more demonstrations, where prone
+(10/48) is the weak half. What will NOT help: more of the same starts.
+
+**ALL THREE OF THOSE CLEANUPS WERE MEASURED AND ALL THREE FAILED.** They were
+recommended off the diagnosis above and are now retracted, 48 paired episodes
+each:
+
+| change | MSE (rad²) | supine rises | supine holds | verdict |
+|---|---|---|---|---|
+| `h5-fix` baseline, 120 epochs | 0.000238 | **41/48** | 0/48 | — |
+| **fix 3** 300 epochs | 0.000162 | 41/48 | 1/48 | **NULL** (p = 1.000) |
+| **fix 1** + arm weight x3 | 0.000164 | **12/48** | 0/48 | **REGRESSION** p = 0.0000 |
+| `h5-dag` DAgger x3 | 0.009 | 40/48 | **28/48** | — |
+| **fix 2** + clean weight x4 | 0.012 | 41/48 | **15/48** | **REGRESSION** p = 0.0146 |
+
+* **More epochs is a null.** 31 % better MSE, one episode either way.
+* **Weighting the arm x3 cost 29 of 41 rises** while moving the opening arm
+  gap only **-2 %** and the leg gap **+4 %** the wrong way. The mechanism is
+  real and far too weak to be worth its price.
+* **Weighting the clean demonstrations x4 cost 13 of 28 holds**, and in
+  hindsight it is backwards: the student states are not "diluting" the
+  aggregate, they ARE what DAgger is for, and the hold is precisely the
+  failure that lives in them. Protecting the teacher's rows undermined the
+  only mechanism that had ever bought the hold.
+
+**And the reason the whole diagnosis mis-led: action MSE does not predict
+whether this clone gets up.** `h5e` and `h5w` sit at **0.000162** and
+**0.000164** — the same number — and score **41/48** and **12/48**. Every one
+of the three fixes was reasoned from the error's size or its distribution
+across joints, and the error's size is not the thing. Whatever decides this
+is not visible in the aggregate imitation loss, which is the measurement
+`distill.fit` reports and the one this track has been steering by.
+
+The artefacts to keep are unchanged: `h5e` (41/48 rises) and `h5-dag` (40/48
+rises, 28/48 holds). Untested and still open: arm weights between 1 and 3, and
+a per-PHASE weighting of the push-off rather than a per-joint one.
+
+**THE FOURTH CLEANUP IS THE ONE THAT WORKS: weight the PUSH-OFF, not the
+arm.** Reweighting WHEN rather than WHICH, at 144 paired episodes against the
+`h5-fix` baseline:
+
+| | baseline | `h5p` (push-off x3) | paired exact McNemar |
+|---|---|---|---|
+| supine rises | 130/144 | **137/144** | discordant 1-8, **p = 0.0391** |
+| supine holds | 5/144 | **15/144** | discordant 4-14, **p = 0.0309** |
+
+Both halves improve, and the hold — which nine reward terms never bought —
+triples. Its action MSE is **0.000268**, WORSE than the baseline's 0.000238,
+which is the point: it trades accuracy on the frames that do not matter for
+accuracy on the ones that do, and the aggregate loss cannot see the
+difference.
+
+**The band is measured, not chosen.** On the teacher's own rises the trunk
+climbs at **0.77-0.90 m/s** between z = 0.19 and 0.50 m and at **0.125 m/s**
+below it — a 7x step — and the fastest-climbing quartile of frames sits at
+0.23-0.51 m. More to the point, **the push-off is only 7 % of the collected
+frames** (4,754 of 65,000): the moment that decides the get-up is outnumbered
+13:1 by the setup that precedes it, and an unweighted mean spends almost all
+of its gradient there.
+
+Why this works where the per-joint weight failed. The arm weight asked for a
+different APPORTIONMENT of error across joints at every instant, and bought
+-2 % on the arm for +4 % on the legs. The phase weight asks for the same
+apportionment at a different TIME, and the 93 % of frames it de-emphasises
+are ones where the robot is barely moving (0.125 m/s) and almost any action
+is survivable.
+
+At 48 episodes this read **0-4 discordant, p = 0.125** — "NO INSTRUMENT, not
+no effect", which is what `score_getup_dc` prints for exactly this case.
+Raising to 144 resolved it. A 4-episode margin on 48 is not a result; the
+tooling said so and was right.
+
+**AND THE TWO MECHANISMS COMPOSE — but only in one order.** Clone with the
+push-off weighted, then DAgger with the weight OFF (`asimov-getup-h5pd2`),
+96 paired episodes against the previous best:
+
+| | `h5-dag` | `h5pd2` | paired |
+|---|---|---|---|
+| supine rises | 83/96 | 88/96 | null, p = 0.125 |
+| supine holds | 61/96 | **74/96** | **p = 0.0351** |
+| prone rises | 16/96 | **81/96** | **p = 0.0000** |
+| prone holds | 8/96 | **54/96** | **p = 0.0000** |
+
+Prone — the half that had been stuck at 10/48 and was the standing open item
+— goes **16/96 to 81/96**. That is the largest single gain in this track.
+
+**Leaving the phase weight ON during DAgger is a regression** (`h5pd`: holds
+20/96 against 61/96, p = 0.0000), and the mechanism is exact: standing is
+trunk z ~0.54, **above the band's 0.50 ceiling**, so a weight that triples
+the push-off is relatively de-emphasising by 3x the very frames DAgger
+collects to fix the hold. The weight has to come off once the thing being
+corrected moved to the other end of the motion.
+
+So the recipe, with every arm measured: **push-off weighting during the
+clone, DAgger without it afterwards.** Per-joint arm weighting is a
+regression, more epochs is a null, clean-row weighting is a regression.
+
+**AND THE NARROWING FINE-TUNE FAILED: the sprawl is structural, not a
+preference.** The proposal was imitation-to-bootstrap then our-own-reward-to-
+specialise — start from the working clone (which supplies the anchor our
+from-scratch runs never had) and charge it for the splits.
+`teach-asimov_getup_turn-8fd9f7`, 4 M steps from `h5pd2`, `span_cost` 300 at
+`span_target` 0.40:
+
+| | peak span | rises | holds |
+|---|---|---|---|
+| donor `h5pd2` | 0.942 m | 22/24 | 22/24 |
+| @ 500 k | 0.924 m | 23/24 | 23/24 |
+| @ 4 M (final) | **0.901 m** | 18/24 | **0/24** |
+
+The charge was priced first and was worth **51.5 % of the episode's income**
+at that setting (9,351 -> 4,540 on the frozen policy, against a 729 floor), so
+it was not too weak to be felt. Four million steps of that pressure bought
+**41 mm — 4 %** — on a quantity that needs to fall 58 %, and the hold
+collapsed on the way. The best checkpoint is at 500 k and is barely distinct
+from the donor.
+
+So the span is not a style the policy chooses, it is how this body gets up:
+the teacher sprawls 0.955 m, every clone of it inherits 0.94 m, and direct
+financial pressure barely moves it. That CONFIRMS and extends the ledger's
+older `the-sprawl-is-the-launch` finding — now under the real actuator
+envelope, and from a policy that works rather than one that failed.
+
+**What this costs the contribution plan.** A narrow/safe get-up was the one
+NEW ARTEFACT on offer; it is not reachable this way. What remains genuinely
+ours is method and measurement, not a motion: the history ablation on THEIR
+policy (24/24 -> 0/24 with the ring frozen), push-off phase weighting
+(+7 rises, +10 holds at 144 paired episodes, and prone 16/96 -> 81/96 when
+chained in the right order), and the faithful speed-torque envelope with the
+48/48 -> 0/48 it implies for anything trained without it. Untested and
+therefore still open: a span charge RAMPED across a curriculum rather than
+applied flat, and harvesting narrow demonstrations instead of penalising wide
+ones — the sprawl cannot be removed from a teacher that has it.
+
+**HARVESTING NARROW DEMONSTRATIONS: no source has one, and the attempt
+LOCALISED the sprawl.** Two candidate sources, both measured under the real
+envelope:
+
+* **The authored route is narrow and does not complete.** Played open loop
+  under `dc`, it holds **0.215 m** of foot span — **4.4x narrower** than the
+  teacher — and then collapses after `pike`: trunk z 0.287 -> `rock_back`
+  0.198 -> `fold` 0.237 -> `stand` **0.008**, which is flat on the floor. The
+  real actuator envelope does NOT rescue it (xml and dc agree to 3 mm), and
+  neither does clip 4 (`fold` 0.207 against the 0.517 it needs). The ledger's
+  "fold holds at clip 4 cold" was an `xml` measurement and does not carry.
+* **The teacher completes and is not narrow — except from one waypoint.**
+  Placed at each rung and run to a stand, 16 episodes each:
+
+  | started at | peak span | rises | holds |
+  |---|---|---|---|
+  | prone (the floor) | 0.941 m | 16/16 | 16/16 |
+  | quadruped | 0.944 m | 16/16 | 16/16 |
+  | pike | 0.940 m | 16/16 | 16/16 |
+  | **fold** | **0.671 m** | 16/16 | 16/16 |
+
+**So the sprawl is generated in the `pike` -> `stand` segment**, not on the
+floor and not in the push-up: the teacher placed at `quadruped` or at `pike`
+still chooses to sprawl, and only from `fold` — past the point where it has
+room to — does it stand at 0.671 m. That is the first time this repo has
+localised the splits to a segment rather than to the motion as a whole, and it
+says where a narrow get-up would have to be solved.
+
+It also closes the harvest: the narrow source does not complete, the
+completing source is not narrow before `fold`, and the teacher's own episodes
+have no spread to filter (median 0.941, p10 0.933). **A narrow demonstration
+would have to be CREATED for the `pike` -> `stand` segment, which is the one
+transition six optimisers and ~50 M steps have already failed on.**
+
+**"STAND FROM PIKE WITHOUT SPRAWLING" HAS NO ANCHOR, so it was priced and
+NOT trained.** The localisation above suggested the narrow problem had shrunk
+to one segment. Priced before launching, as the rule requires — servo
+prologue to pike (`prone -> plant_forearms -> draw_knees_in -> quadruped ->
+pike`, 0.215 m throughout), `dc`, `history=5`, 12 episodes:
+
+| arm | return (span_cost 300) | rises | span after pike |
+|---|---|---|---|
+| `h5pd2`, the working clone | **-1,701** | 0/12 | 0.839 m |
+| zero action | **-8** | 0/12 | 0.214 m |
+
+**Nothing stands from pike.** The clone cannot (it never saw a pike ARRIVED at
+with real velocity, and sprawls to 0.839 m then fails), the authored route
+collapses past it, and doing nothing beats the only candidate by 1,693 under
+the narrow objective. "If nothing succeeds from those states, the curriculum
+has no anchor and no reward will give it one" — so this was not launched.
+
+**And a correction to the localisation.** The earlier reading said "the
+teacher placed at pike still chooses to sprawl". It does not: placed at pike
+(trunk z 0.525) it FALLS OUT of it first — trunk 0.525 -> 0.496 -> **0.038**
+by 0.55 s — and then runs its ordinary floor get-up, sprawling to 0.933 m at
+1.55 s. Pike is out of its distribution; it was never standing from pike at
+all. The 0.94 m figure for "from pike" is the floor get-up that follows a
+collapse, not a choice about pike.
+
+What survives, and it is the sharper statement: **every authored rung is
+0.215 m wide, and `fold` onward is both narrow and upright** (fold +0.83,
+crouch +0.96, stand +1.00), while the teacher from `fold` stands 16/16 at
+0.671 m. So the narrow route exists as a set of CONFIGURATIONS and the single
+missing piece is a demonstration of the **`pike` -> `fold` rotation** — the
+one transition six optimisers and ~50 M steps have already failed on, and the
+one thing that would turn the narrow get-up from impossible into a clone.
+
+**THE TRAJECTORY SEARCH ON `pike` -> `fold` FAILS UNDER THE REAL ENVELOPE
+TOO, which kills the one hypothesis that justified retrying it.**
+`scripts/search_pike_fold.py`: CEM over a residual on the straight-line joint
+path, from a pike the robot ARRIVED at (servo prologue, trunk 0.317, upright
+**-0.53** — note the arrived pike is far more collapsed than the authored
+waypoint's 0.525/+0.36), scored on the pose that SURVIVES a 1.5 s hold.
+
+**1,920 sampled trajectories (30 iterations x 64), and not one ends on its
+feet alone.** Every candidate finishes with 3 non-foot parts on the floor;
+the best reaches upright -0.35 at trunk 0.201 against fold's +0.83 at 0.511.
+
+The retry was justified by one specific argument: every previous pike->fold
+attempt ran under the flat +/-45 N*m actuator, a robot that is weak at rest,
+while this is a braced near-stall rotation where the published envelope grants
+up to 3x. **That argument is now refuted** — the search has the 3x and still
+cannot do it. This agrees with the ledger's older verdict from the other
+direction ("rock_back->fold fails four ways and is NOT torque; 5x arms changes
+nothing"), and the two together make a reasonable case that `pike -> fold` is
+not a torque problem at all.
+
+**And the first objective was gameable, which is worth recording in full.** It
+paid `100*uprightness + 60*trunk` and charged 25 per non-foot contact, and the
+optimiser discovered that **lying on its left side** scores well: span 0.023 m
+(feet together, so no width penalty) and uprightness +0.16 (better than pike's
+-0.52). It rolled over and collected while trunk height collapsed 0.316 ->
+0.158. The support had to become a GATE rather than a tariff. Same shape as
+the hopping get-up that passed a height test: a pose test cannot price the
+route, and a soft penalty on the wrong contact is not a pose test.
+
+**AND THEN THE OPENING: narrow stands DO happen — from `fold`, at 0.21-0.24 m.**
+Every attempt above asked for a trajectory INTO a pose. The dual question is
+how big the TARGET is, and nobody had asked it. Perturbing a properly SETTLED
+`fold` (joint sd 0.20, pitch sd 0.10) and running to a stand, 48 samples:
+
+| policy | stands | **narrow (<= 0.40 m)** | median span |
+|---|---|---|---|
+| `h5pd2` | 9/48 | **8/48** | 0.240 m |
+| openhorizon teacher | 8/48 | **7/48** | 0.241 m |
+
+**0.21-0.24 m is UNDER the 0.40 m gate and ~4x narrower than the 0.94 m
+get-up either of them performs from the floor.** So a narrow stand is not
+impossible on this body and never was — it is RARE, about 19 %, and nothing
+had ever sampled the state it works from. Note this required dropping the
+pose to contact by bisection: `_place` leaves it floating ~22 cm clear, where
+every contact reading is vacuous, which is what three earlier versions of the
+probe measured.
+
+**And the right starting policy is NOT the clone — it is ZERO ACTION.** Priced
+on the new start distribution with the narrow objective, 48 episodes:
+
+| arm | return | stands | narrow | median span |
+|---|---|---|---|---|
+| `h5pd2` | 1,416 | 3/48 | **0/48** | 0.390 m |
+| **zero action** | **2,709** | **6/48** | **4/48** | **0.314 m** |
+
+Doing nothing BEATS the best policy in the repo here, and the reason is
+structural: zero action commands `DEFAULT_POSE`, which IS the standing pose,
+and from `fold` the robot is already crouched and upright — so "command
+stand" simply works, narrowly, some of the time. The clone does worse because
+it insists on executing its sprawling get-up. **That is the anchor every
+previous narrow attempt lacked** (successes present in the rollouts at the
+starting policy), and it says train from SCRATCH rather than warm-starting
+from the sprawl.
+
+`scripts/harvest_fold_poses.py` writes 240 such starts into the cache as the
+label `fold` (appended; the 477 existing poses across six labels are
+preserved), and `teach-asimov_getup_turn-deb154` is training on them at
+`history=5` under `dc`.
+
+**FIRST NARROW STAND, AND IT IS OURS** (`teach-asimov_getup_turn-deb154-s9`).
+Trained from SCRATCH by this repo's own reward economy on the `fold` start
+distribution above — no imitation, no distillation — at `history=5` under
+`dc`. 48 episodes with obs noise and the action delay:
+
+| policy | holds | **narrow (<= 0.40 m)** | median peak span |
+|---|---|---|---|
+| zero action | 7/48 | 5/48 | 0.276 m |
+| `h5pd2` (distilled from openhorizon) | 47/48 | **0/48** | 0.932 m |
+| **ours, trained on `fold`** | **43/48** | **13/48** | **0.413 m** |
+
+Comparable reliability at **2.3x narrower**. At 96 episodes it is 84/96 holds
+and **25/96 narrow**. This is the first get-up artefact in this track that is
+not a copy of somebody else's policy.
+
+**Raising the span charge does NOT narrow it further.** A continuation at
+`span_cost` 150 / target 0.35 (`…-11dcd7`) is a NULL against it on the same 96
+seeds: narrow 25 vs 16 (p = 0.211), holds 84 vs 87 (p = 0.250), median span
+0.415 -> 0.413. That is the SECOND time a span charge has failed to move this
+quantity — the first bought 41 mm in 4 M steps — and together they say the
+reward is not the lever.
+
+**The lever is the START DISTRIBUTION**, which is this repo's own doctrine
+("if rollouts never contain the skill you are paying for, fix the physics
+curriculum, not the reward"). The basin data says it directly: at joint sd
+0.10 every stand that happened was narrow (6/6), at 0.20 it was 8/9, at 0.35
+only 5/9. The width of the start sets the width of the stand. A `fold_tight`
+label (sd 0.10 / 0.05) is now in the cache and training on it.
+
+**AND THE DETERMINANT IS THE START SPAN, not anything the policy does.**
+Grouping 57 stands of the narrow policy by outcome:
+
+| | start span | peak span | foot travel |
+|---|---|---|---|
+| **narrow** (18) | **0.207 m** | 0.393 m | 0.927 m |
+| **wide** (39) | **0.343 m** | 0.418 m | 0.534 m |
+
+The policy barely widens from wherever it begins — 0.207 -> 0.393 and 0.343 ->
+0.418 — so **the stance it is handed decides the stance it stands in**. The
+narrow episodes also move their feet MORE (0.927 m against 0.534 m), i.e. they
+reposition under the body while the wide ones stay spread.
+
+That explains both span-charge nulls at once: a charge on the span arrives
+after the stance is already set, so it is paying for something the policy
+cannot much change. The lever is upstream, in which starts the episode draws —
+`--max-start-span` now filters the harvest on exactly that quantity (240 kept
+of 542 tries at <= 0.25 m, label `fold_narrow`).
+
+**AND TIGHTENING THE START SET DELIVERS IT: 68/96 under the gate**
+(`teach-asimov_getup_turn-251bcc`). Trained on `fold_tight` (joint sd 0.10 /
+pitch sd 0.05) and scored on the WIDER `fold` set, so this is generalisation
+and not an easier exam — 96 episodes with obs noise and the action delay:
+
+| | holds | **narrow (<= 0.40 m)** | median peak span |
+|---|---|---|---|
+| `h5pd2`, distilled from openhorizon | 47/48 | **0/48** | 0.932 m |
+| ours, first narrow policy | 84/96 | 25/96 | 0.415 m |
+| **ours, tight start set** | **86/96** | **68/96** | **0.394 m** |
+
+Paired against its own donor on the same seeds: **narrow 25 -> 68, discordant
+3-46, p = 0.0000**; holds 84 -> 86, p = 0.500. It got dramatically narrower
+and gave up nothing.
+
+So the whole narrow problem turned on **which states the episode starts in**,
+and not on any reward term: two span charges in a row were nulls, and the
+reason is now measured — the policy barely widens from where it begins, so a
+charge on the span is paying for something it cannot much change. Fix the
+start distribution, as this repo's own doctrine has said since the duck's
+get-up ladder, and the skill appears.
+
+**THE BACKWARD LADDER STOPS AT `pike`, and that is now six approaches deep.**
+The narrow stand from `fold` is solid and extends no further back:
+
+| rung | trunk z | upright | narrow policy |
+|---|---|---|---|
+| `fold` | 0.541 | +0.84 | **72/96 narrow**, 84/96 holds |
+| `pike` | 0.520 | +0.46 | **0/96** after 8 M steps with `rotate` 150 |
+| `rock_back` | 0.382 | +0.11 | **0/96** after 2.68 M steps |
+
+**`rock_back` was the wrong rung and the authored route misled me into it.**
+Measured in state space it is a DIP — the robot rocks DOWN to 0.382 before
+coming back up to `fold` — so the recipe's ordering is not the difficulty
+ordering, and `pike` is the genuinely adjacent state. 2.68 M steps on the
+wrong rung bought 0/96.
+
+`pike` is the better-posed version of the same wall: there the robot HOLDS
+0.521 under zero action instead of collapsing, so it is a rotation problem
+(+0.46 -> +0.84) rather than a recovery one, and beyond +0.84 the policy
+already stands. It still does not rotate, after 8 M steps with the axis paid
+directly.
+
+**Everything tried on `pike` -> `fold`, all measured dead:** two span charges
+(41 mm in 4 M steps; then p = 0.211), a 1,920-sample CEM trajectory search
+under the real envelope (0 ending on their feet), harvesting narrow
+demonstrations (no source has one), a servo bridge (arrives trunk 0.23 against
+fold's 0.511 at every tempo — commanding fold's ANGLES does not produce fold's
+POSE), and now two ladder rungs. The ledger's older mechanism survives all of
+it: no back pitch joint, 112 deg needed against 59 available, CoM 560 mm ahead
+of the feet — and the teacher's answer is to sprawl, which is the thing being
+refused.
+
+**What the last run DID buy** is the narrowest stand yet: median peak span
+**0.394 -> 0.326 m** on `fold` while holding 84/96 and 72/96 narrow (both
+counts nulls against the donor; the span is the gain). More PPO on this rung
+is not warranted without a new idea — the honest next lever is a narrow
+demonstration of the rotation itself, from a human or a contact-aware planner,
+not another reward term.
+
+**AND THE 0.40 m BAR WAS NEVER DERIVED — the real reference is 0.215 m.**
+The acceptance gate asks for `span_m <= 0.40` and the file never said why;
+every other gate there is traceable. Measured 2026-10-15, **Menlo's own
+`STAND` keyframe — the pose they ship as standing — spans 0.215 m**, which is
+what "does not sprawl" means on this body:
+
+| | foot span | x natural stance |
+|---|---|---|
+| Menlo's `STAND` keyframe | **0.215 m** | 1.0x |
+| the authored get-up route | 0.215 m | 1.0x |
+| **the narrow stand trained here** | **0.326 m** | **1.5x** |
+| the gate, as written | 0.40 m | 1.9x |
+| our distilled get-up | 0.932 m | 4.3x |
+| openhorizon's teacher | 0.955 m | 4.4x |
+
+The threshold is LEFT at 0.40 in `getup_acceptance.py` on purpose — every
+published verdict above was read against it and moving it would silently
+rewrite them — but the derivation is now recorded beside it. The useful
+statement is not "we are under the gate", it is **2.9x narrower than the
+policy we distilled, against a robot whose own stance is 0.215 m**.
+
+**AND THE REASON EVERY LADDER FAILED: `fold` IS THE ONLY AUTHORED RUNG THAT
+IS A STATE.** Perturbed (joint sd 0.10 / pitch sd 0.05), settled, and required
+to be still up ON BOTH FEET one second later:
+
+| rung | survives 1 s |
+|---|---|
+| `quadruped` | **0 of 480** |
+| `pike` | **0 of 480** |
+| `rock_back` | **0 of 480** |
+| **`fold`** | **60 of 80 (75 %)** |
+
+Everything except `fold` is a TRANSIENT the robot falls out of inside a
+second. So there was never a `pike -> fold` transition to learn as a rung —
+pike is not a configuration, it is a moment. Seven approaches to it failed
+because the start distribution was **falls in progress**, which is this repo's
+oldest rule ("a start nothing recovers from produces no successes and
+therefore no gradient") arriving from a direction nobody had checked.
+
+**And it was invisible because of a peak.** The harvest settled candidates for
+10 physics steps — **0.05 s** — and the collapse takes **0.5 s**, so every
+pike pose passed the filter. The reading that said pike was safe,
+"zero action HOLDS pike at 0.521", was a PEAK over the episode: the first
+frame, before the fall. Read frame by frame the policy starts at trunk 0.524
+on ONE foot, is at 0.076 by t = 0.50 s and flat at 0.016 from t = 1.00 s
+onward, and never moves again. Seven aggregate measurements hid what one
+contact sheet showed immediately — "peak height is not a rise" applies to a
+HOLD just as hard.
+
+`harvest_fold_poses.py` now takes `--settle-s` (1 s by default) and requires
+both feet and a trunk height at the END of it, and reports zero survivors as a
+result rather than a traceback.
+
+**What this means architecturally.** A narrow get-up cannot be built as a
+ladder of static rungs, because on this robot there is only one: `fold`. The
+floor-to-fold half has to be a DYNAMIC route carrying momentum through
+unholdable configurations — which is exactly what openhorizon's teacher does,
+and the sprawl is how it buys the time. That is no longer a failure to explain
+but a design constraint to state: **narrow and static are available from
+`fold` upward; below it the motion must be dynamic.**
+
+**AND THE MECHANISM, FINALLY: the CoM is a LEG LENGTH ahead of the feet.**
+Signed distance from the centre of mass to the mean foot position, with
+controls:
+
+| pose | CoM ahead of feet | |
+|---|---|---|
+| `STAND` keyframe | **+0.047 m** | the control: mass over the feet, as it must be |
+| **`fold`** | **-0.004 m** | **exactly over the feet** |
+| `prone` | -0.134 m | behind, lying down |
+| `pike` | +0.367 m | |
+| the authored route, prone -> fold | **+0.495 to +0.603 m** | |
+| **leg length, hip to ankle** | **0.540 m** | |
+
+**`fold` is the only authored rung whose CoM is over its feet** — which is
+exactly why it is the only one that survives a settle, and why a narrow stand
+works from it at all. Everywhere else on the floor-to-fold route the mass sits
+**0.50-0.60 m** ahead of the feet, against a leg of **0.540 m**.
+
+Span is the distance BETWEEN the feet, so in principle a narrow robot could
+step BOTH feet forward and keep its stance — which is what the narrow
+episodes do from `fold` (0.927 m of foot travel against the wide ones'
+0.534 m). From the floor route it cannot: the step required is a **whole leg
+length**, and a loaded leg cannot reach that far forward. Widening is the only
+remaining way to move the support polygon under the mass, and widening is the
+sprawl. **The teacher is not being careless — it is doing the only thing the
+geometry leaves.**
+
+So the narrow get-up is not blocked by reward design, by the actuator
+envelope, by exploration, by tempo or by search: **it is blocked by geometry,
+and the number is CoM-to-foot ~= leg length.** Eight approaches now agree, and
+this is the one that says why. It is also the most contributable thing in this
+track — a design note about Menlo's robot, not a training report.
+
+**AND THE GEOMETRIC CLAIM WAS THEN TESTED AGAINST THE ROBOT, not just the
+route.** The argument above was derived from the AUTHORED waypoints, which is
+one route's bound and not the body's — the error this track has already made
+once ("a teacher's bound is not the robot's"). The CoM is a function of
+CONFIGURATION, so a search over 4,000 configurations, seeded from every pose
+this robot is known to adopt, asked directly: is there a NARROW (<= 0.30 m),
+feet-only, stable pose anywhere below `fold`?
+
+| trunk z | survives 1 s | **survives 3 s** |
+|---|---|---|
+| 0.25 - 0.35 | 13 | **0** |
+| 0.35 - 0.45 | 18 | **0** |
+| 0.45 - 0.55 | 37 | **2** |
+| 0.55 - 0.70 | 144 | 63 |
+
+At one second there appeared to be a whole ladder of narrow rungs below
+`fold`, with CoM gaps of +0.33 to +0.43 — and **every one of them is a slow
+fall.** At three seconds nothing below 0.45 m survives. That is the SAME trap
+as the 0.05 s pike filter, one order of magnitude up, and it was caught only
+because the pike lesson was an hour old.
+
+So the conclusion now rests on a search of the robot's configuration space
+rather than on one authored route: **there is no narrow static rung below
+`fold`.** A narrow get-up cannot be laddered; the floor-to-fold half must be
+dynamic; and dynamically the CoM sits a leg length ahead of the feet, so
+widening is the only way to put the support under the mass. Eight approaches,
+a trajectory search, a tempo sweep and a configuration search all agree, and
+the mechanism explains each of them.
+
+**The settle time is the instrument.** 0.05 s called pike a configuration;
+1 s called a dozen slow falls rungs; 3 s is where `fold` and the stand stay
+and everything else goes. Any future rung claim here needs the number stated
+beside it.
+
+**AND THE LAST SEARCH REINVENTED THE SPRAWL, which is the positive form of
+the argument.** Everything above is quasi-static. A KIP is not: it rotates the
+trunk with angular momentum rather than static balance, it is narrow by
+nature, and humans rise from their backs that way. Nothing here had searched
+for one. `scripts/search_narrow_kip.py` starts at the end of the narrow servo
+route (trunk 0.20, upright -0.34, **span 0.215**, free to reach), gives CEM a
+2 s horizon with 8 knots and amplitude enough to express a swing, requires
+nothing of the intermediate poses — mid-motion instability is the POINT — and
+scores only what survives a 2 s hold.
+
+**1,600 trajectories, none ends on two feet.** The best reaches upright -0.66
+at trunk 0.401, on one foot and three other parts.
+
+And the telling part is not the failure, it is the direction of the search:
+**given a 0.215 m start, freedom to move and a penalty on span, the optimiser
+drove the span to 0.608 m.** It went looking for a rise and found width,
+exactly as the geometry says it must — the CoM is a leg length ahead of the
+feet, forward is out of reach, and sideways is all that is left. An
+independent method, penalised for sprawling, rediscovered the sprawl.
+
+That is nine approaches: two span charges, a pike->fold CEM search, narrow-demo
+harvesting, a servo bridge, two ladder rungs, an arm-push rung, a tempo sweep,
+a configuration-space search and a kip search. One mechanism explains every
+one, and the last one demonstrates it constructively rather than by absence.
+
+**SEVERAL SMALL STEPS, not one big one — also dead.** The geometric bound is
+about a SINGLE step: the CoM is a leg length ahead of the feet, so support
+cannot be put under mass in one move. It says nothing about several, and
+Menlo ship a controller that takes small steps. So the narrow servo route was
+played and the robot handed to their WALKER
+(`scripts/probe_walk_out_of_fold.py`): **0/12 stands, peak span 0.759 m,
+1.723 m of foot travel, final trunk 0.194.** The feet move enormously and
+never arrive anywhere useful — the walker is trained from standing and has no
+policy at trunk 0.19, so it thrashes and widens.
+
+That is ten approaches. The two that carried genuinely new ideas — the kip
+(momentum instead of balance) and the walker (many steps instead of one) —
+both ended wider than they began: 0.215 -> 0.608 m and 0.215 -> 0.759 m.
+**Every method given freedom to move widens.** The mechanism is not an
+inference from failures any more; it is the thing three independent searches
+keep producing.
+
+**Recommendation: stop this line.** What would change the answer is a
+contact-implicit planner that co-optimises footstep placement with trunk
+rotation — a tool this repo does not have and that is not a variation on
+anything above — or different hardware. Everything else on the list has been
+measured, and the measurements agree.
+
+**THE CRAWL-IN IS THE FIRST THING TO MOVE THE NUMBER, and it is where a
+continuation should start.** The contact-implicit idea, made practical: every
+search above optimised a joint trajectory under whatever contact physics
+produced, and none could decide to BREAK contact and re-place a foot — which
+is exactly what the geometry calls for. With the ARMS taking the weight, each
+foot can be unloaded and brought in a little at a time. That is how a person
+rises from their front without doing the splits, and at the end of the narrow
+servo route this robot is already in that posture (forearms down, span
+0.215 m). `scripts/search_crawl_in.py` structures the contact SCHEDULE
+(alternating single-leg swings, arms supporting) and lets CEM tune only what
+each swing does.
+
+Two results, and they are not yet the same motion:
+
+* **Structured, it stays NARROW.** The CEM crawl ends at **span 0.216 m** —
+  the robot's own natural stance — with **both feet down** and the trunk at
+  0.331, where every unstructured search widened (kip 0.215 -> 0.608, walker
+  0.215 -> 0.759). **Imposing the contact schedule defeats the
+  freedom-widens pattern**, which is the first counter-example to it.
+* **It moves the CoM.** A hand-rolled version of the same direction closes
+  the CoM-to-foot gap **+0.539 -> +0.355 m**, a third of the way. **Nothing
+  else in ten approaches moved that number at all.** It pays for it in span
+  (0.771 m), so the narrow crawl and the gap-closing crawl have not yet been
+  made the same motion.
+
+Neither rises: uprightness stays near **-0.58** throughout, and more steps do
+not help (8 swings reach trunk 0.331 against 4 swings' 0.326). So with the
+feet brought in, the remaining bound looks like the TRUNK ROTATION rather than
+foot placement — the ledger's 112 deg needed against 59 deg available, and no
+back pitch joint. That is a sharper claim than "the feet cannot get under the
+mass" and it is the one a continuation should test, by driving the crawl until
+the gap reaches ~0 and seeing whether the rise is still refused.
+
+### RESOLVED, and the premise was wrong: the crawl never started at `fold`
+
+Ran the continuation above (2026-10-15). Driven DIRECTLY at the CoM gap under
+a support gate, the crawl closes **+0.540 -> +0.490 m** over 16 CEM iterations
+and flatlines, span holding at 0.214 m; adding a contralateral HAND walk (the
+other end of the gap, `--hands`) reaches **+0.471 m** but costs 57 mm of span.
+Two mechanisms, both refusing to close 540 mm.
+
+The reason is that there was never 540 mm to close. Three measurements, in the
+order they should have been taken:
+
+1. **The gap is not the arms.** `scripts/probe_com_decompose.py`: at the
+   crawl's start the arms are 20.8 % of the mass and 0.731 m ahead of the feet,
+   but replacing them kinematically with the STAND keyframe's arm joints moves
+   the gap **-0.004 m**. Trunk+head alone contribute +0.278 of the +0.539.
+   With the body horizontal, everything is ahead of the feet no matter where
+   the feet are, so minimising the CoM gap asks for a trunk ROTATION and reads
+   a stepping failure where there is none. Both crawls duly raised the trunk by
+   pitching further face-down (upright -0.28 -> -0.59).
+
+2. **A feet-under-the-hips pose exists, and lower than expected.**
+   `scripts/probe_tuck_reach.py` sweeps pelvis height, settling the root with
+   MuJoCo's own contact distances and allowing only the feet to touch. With the
+   arms pinned the tuck appears at pelvis **0.399 m** (gap 0.016) and is absent
+   at 0.351 (gap 0.424); with the arm joints FREE — they were colliding and
+   blocking poses — it appears at **0.303 m** (gap 0.011). The crawl reaches
+   0.326-0.333. So configuration space was never the bound either.
+
+3. **The route does not arrive at `fold`.** The one that matters. `fold`
+   PLACED is pelvis **0.511 m**, upright **+0.83**, span 0.215 m, pelvis gap
+   **-0.071 m**, CoM gap **+0.013 m** — the feet already under the mass — and
+   it HOLDS on feet alone (0.511 -> 0.516 m over 1.5 s of commanded hold,
+   upright +0.85). The servo ramp through the waypoints arrives at pelvis
+   **0.206 m**, upright **-0.29**, CoM gap **+0.539 m**, still on its
+   forearms, and goes DOWN over the last two rungs:
+
+   | route arrives at | pelvis | upright | pelvis gap | on the floor |
+   |---|---|---|---|---|
+   | plant_forearms | 0.008 | +0.01 | +0.591 | head, feet, forearms |
+   | draw_knees_in | 0.118 | -0.20 | +0.496 | shins, forearms |
+   | quadruped | 0.185 | -0.26 | +0.434 | shins, forearms |
+   | pike | 0.289 | -0.50 | +0.515 | forearms |
+   | rock_back | 0.228 | -0.25 | +0.482 | feet, forearms |
+   | **fold** | **0.206** | **-0.29** | **+0.486** | feet, forearms |
+   | *`fold` placed* | *0.511* | *+0.83* | *-0.071* | *feet only* |
+
+**So every crawl search in this session started 305 mm below its own target
+pose, and the 540 mm gap it was trying to close is not a property of `fold` —
+it is a property of the collapsed heap the route leaves the robot in.** The
+feet do not need walking in. `rock_back -> fold` is the whole remaining
+difficulty of the narrow get-up, which `the-narrow-route-and-its-one-leg`
+already said and which this re-derived the expensive way.
+
+The habit this cost: **measure the TARGET pose before optimising toward it.**
+One `_place` of `fold` and one print of its gap — two lines, both already
+written in `probe_com_decompose.py` for the route — would have killed the
+crawl, the hand walk and the reachability sweep before any of them ran. And
+the giveaway was visible the whole time: the route's own trace falls
+0.289 -> 0.228 -> 0.206 over its last three waypoints, which is a failing ramp
+printed in the header of every search I ran.
+
+**And the gap is one transition wide.** `9702ba` scored on the deployment env,
+48 episodes per start, same seeds:
+
+| start pose | holds | narrow | median span |
+|---|---|---|---|
+| `fold` | **43/48** | 37/48 | 0.331 m |
+| `narrow_rock_back` | **0/48** | 0/48 | 0.319 m |
+| `narrow_pike` | **0/48** | 0/48 | 0.348 m |
+
+A cliff, not a slope. Two things follow. The narrow track's whole remaining
+deficit is `rock_back -> fold`, with a target pose that is verified stable and
+verified to be a basin the existing policy stands from 43/48 — which is an
+anchor, and so a well-posed curriculum in the sense
+`train-the-tasks-states-not-the-toolings` demands. And `9702ba` was TRAINED on
+`fold_tight,narrow_pike`, so pike was half of its start draw and it scores
+0/48 there: it specialised on the easy half of its own 50/50, exactly as
+`train-on-the-harder-condition` describes. Its title already recorded the pike
+rung as a null; this is the number.
+
+### The gap is DYNAMIC: there is no rung, and the basin is 0.2 m/s
+
+Four measurements the same day (2026-10-15), each with the number that settles
+it, and together they say what the pike->fold move actually is.
+
+1. **No static rung exists between pike and fold.**
+   `scripts/search_tuck_rung.py` searches poses with the 1.5 s commanded HOLD
+   inside the objective (not checked afterwards) and gated on narrow, both
+   feet, nothing else down, and `support_margin`. The best candidate starts at
+   pelvis **0.316 m** and collapses to **0.106 m**, at span **0.185 m** —
+   NARROWER than `fold`'s 0.215. So narrowness is not the obstacle, height is,
+   and the move cannot be laddered with intermediate poses. The hold path is
+   validated on cases that must pass: `stand` keeps 0.614 -> 0.608 m upright
+   +1.00 and `fold` 0.511 -> 0.516 m upright +0.85, both on feet alone.
+
+2. **The catch basin at `fold` is ~0 m/s — RETRACTED AND RE-MEASURED
+   2026-10-19.** The table below was taken with a BROKEN INSTRUMENT and the
+   "0.2 m/s" it produced is void. `scripts/probe_catch_basin.py` forced
+   `env_class("getup")` and named the pose with `getup_label` for every run
+   whatever its recorded `task`, so a `getup_ref` policy was scored in an env
+   it never trained in. Under the same name `fold` the two envs place
+   DIFFERENT POSES: trunk 0.5197 m at a **0.215 m** foot span in the ref env
+   against 0.5465 m at **0.461 m** in the plain one — 0.73 rad of maximum
+   qpos difference, 210 of 390 observation slots apart, and already outside
+   the 0.40 m narrow gate before the policy acts. The tell was a
+   contradiction: `teach-asimov_getup_ref-c2bae8-s1` scores 48/48 from a
+   placed `fold` under its own flags and **6/24** in this probe. The probe now
+   builds the run's own task and waypoint and prints the placed trunk height
+   and span in its header, so the pose it measured is on the face of every
+   future table.
+
+   Re-measured on `c2bae8-s1`, which is the best `fold` catcher this repo has:
+
+   | arrival lift | pitch rate | holds | narrow | med span |
+   |---|---|---|---|---|
+   | 0.00 m/s | 0.00 | **24/24** | 24/24 | 0.269 |
+   | 0.20 | 0.94 | 6/24 | 6/24 | 0.291 |
+   | 0.40 | 1.88 | **0/24** | 0/24 | 0.295 |
+   | 0.60 | 2.82 | 0/24 | 0/24 | 0.312 |
+   | 1.00 | 4.70 | 0/24 | 0/24 | 0.361 |
+
+   So the basin is TIGHTER than published, on a STRONGER catcher: a cliff at
+   0.2 m/s rather than the gradual 21 -> 18 -> 13 -> 7 decay, which was the
+   sprawled plain-env pose being more tolerant of vertical speed. The old
+   numbers describe a different robot.
+
+   Still not a wall on energy — the 211 mm climb needs ~2.0 m/s at launch and
+   a push that just reaches the top arrives near zero, so the spec is
+   PRECISION, not power. But the precision demanded is "arrive at rest", and
+   a gate written from the old figure is 3x too loose. The direct attack is
+   to TRAIN the basin rather than aim at it: `ARRIVAL_ENV`
+   (`MICRODUCK_ASIMOV_GETUP_ARRIVAL`) injects a per-episode arrival twist
+   drawn from [0, arrival] on top of the placed waypoint, which is the one
+   thing this env could never do — `reset` places from `_start_cache` and
+   then sets `qvel[:] = 0.0`, so every episode of this task in the repo's
+   history began at rest. On `c2bae8-s1` the knob gives a trainable gradient
+   rather than a wall: 16/16 at `arrival=0`, 7/16 at 0.40, 3/16 at 1.00.
+
+3. **The reference recipe is not the narrow get-up at any budget.** Launched
+   `asimov_getup_ref` for the first time on the real robot (history 5 + dc;
+   the only prior chain, `3e895f`, used history 1 + XML limits and 12,000,000
+   steps). `849494-s8` at the recipe's own 2.7M default: **7/24** from `fold`
+   at median span 0.426 m, **0/24** from `prone`. `3e895f-s8` at 12M: 15/24
+   from fold but only **2/24 narrow** at 0.415 m, and **0/24** from prone. The
+   extra 9M steps buy holds but neither narrowness nor the floor. The chain
+   also regressed on its own anchor mid-flight — s1 7/24 from fold, s2 3/24
+   and 0/24 from `narrow_rock_back` — so that stage cost the anchor and bought
+   nothing. **Pulse a long chain against the previous chain AT THE SAME STAGE**,
+   which is what caught this four stages in rather than at the end.
+
+4. **`asimov_getup_gap` already crosses the gap — as a HEIGHT, not a pose.**
+   Scored under its own flags with the prologue kept (`scripts/score_gap_chain.py`;
+   `score_narrow_stand` drops `start_phase` and overwrites `getup_label`, which
+   deletes the servo push-up and scores a pose the policy never trains from):
+   at assist **0.85** the peak trunk reaches **0.672 m** — above a stand's
+   0.64 — at a narrow 0.355 m span, and **0/24 STANDING**. That matches
+   `asimov_env`'s own note that assist 0.85 reaches fold's height at
+   uprightness **-0.86**: it arrives face down. Fading loses it completely
+   (peak z 0.672 -> 0.309 at assist 0.10 -> 0.316 at 0.00, all 0/24), because
+   nothing in that economy pays for ATTITUDE or ARRIVAL SPEED.
+
+**So the move is one dynamic transition that must arrive at `fold`'s pose —
+upright, feet under, under 0.2 m/s — and every recipe so far has paid for
+height instead.** `handoff_pay` is the existing hook for exactly that and has
+never been tried on this task at assist 0.85; the measured NULL on it was for
+the STAND handoff, where the rise arrives at 0.89 m/s and no per-step charge
+can remove arriving momentum. Launched `teach-asimov_getup_gap-b76ed2`, the
+8.4M assist ladder, on the real robot (history 5 + dc) for the first time — the
+control that says whether the crossing survives Menlo's envelope at all, and
+which measures the arrival attitude and speed that an arrival term would have
+to target.
+
+### The gap recipe's anchor is a HANDSTAND, and the assist cannot be fixed
+
+Stopped that chain at stage 3. The anchor is not a crossing.
+
+**The "crossing" is 97 % airborne and inverted.** `scripts/probe_arrival_state.py`
+searches each episode for the frame CLOSEST to `fold`'s pose and reports the
+four clauses separately. Over 32 episodes of `ca350e-s1` (assist 0.85) the
+closest approach is pelvis **0.672 m**, uprightness **-0.998**, pelvis gap
++0.091 m, span **0.215 m**, lift **0.03 m/s** — narrow, slow, already inside
+the 0.2 m/s catch basin, and upside down. The spread is nil (uprightness -0.997
+to -0.998 across all 32). At the apex MuJoCo reports **NOTHING** on the floor,
+and **2328 of 2400 frames (97 %)** have no foot down.
+
+Nothing charged for it. The ref env HAS the term — `flight_penalty`, which
+calls `_flight_charge` on `self._ground_cost` — but the gap recipe never set
+`MICRODUCK_ASIMOV_GETUP_GROUND`, so it was **0.0 for all 8,400,000 steps**. The
+one term that would have caught this was present, summed, and switched off.
+(The intermediate `track` is also gated `if foot_down`, so an airborne frame
+escapes it rather than paying it.)
+
+**And the anchor needs no policy at all.** `scripts/probe_assist_floor.py`
+prices the assist against ZERO ACTION:
+
+| assist | peak z | upright at peak | airborne |
+|---|---|---|---|
+| 0.00 | 0.317 | -0.53 | 0.5 % |
+| 0.20 | 0.312 | -0.36 | 0.2 % |
+| 0.55 | 0.357 | -0.48 | 3.8 % |
+| 0.70 | 0.446 | -0.78 | 8.5 % |
+| **0.85** | **0.643** | **-1.00** | 19.5 % |
+| 1.00 | 8.514 | -0.48 | 96.2 % |
+
+The whole ladder was calibrated on PEAK HEIGHT ("at 0.85 the crossing
+appears"), and height is exactly what a vertical pelvis force buys by tipping
+the trunk over the planted forearms: uprightness at the peak gets monotonically
+WORSE as the assist rises. **Price the do-nothing policy applies to the ASSIST,
+not only to the reward** — one zero-action rollout at 0.85 would have shown the
+handstand before 8.4 M steps were spent fading it.
+
+**A rotation assist is the right kind of help and still not enough.**
+`scripts/probe_torque_assist.py` applies a pitch torque at the trunk
+(`xfrc_applied[trunk, 4]`) with the lift at zero, under zero action, both signs
+because the sign is a fact about the frame:
+
+| N.m | peak z | upright at peak | best upright | z there | airborne |
+|---|---|---|---|---|---|
+| 0 | 0.317 | -0.53 | +0.28 | 0.072 | 0.5 % |
+| -40 | 0.296 | -0.31 | +0.55 | 0.085 | 0.2 % |
+| -80 | 0.262 | -0.20 | +0.73 | 0.056 | 0.5 % |
+| **-100** | 0.281 | **+0.28** | **+0.84** | 0.111 | **0.0 %** |
+| +100 | 0.586 | -0.99 | — | — | 4.2 % |
+
+At -100 N.m the trunk reaches `fold`'s own attitude (+0.84 against +0.83) with
+nothing airborne and a 0.215 m span, where the lift's best attitude at ANY
+level is -0.36. But it arrives upright at pelvis **0.111 m**: it sits up
+without rising. Combined (lift 0.55 + torque) the two launch the robot — peak
+1.7 to 4930 m at 58-69 % airborne for |T| >= 80, and 0.329 m at -0.36 for -40.
+
+**So the assist cannot manufacture a supported upright crossing: the lift
+raises and inverts, the torque rotates and stays low, and together they
+launch.** That closes the assist ladder as a route, and it closes it on a
+mechanism rather than on a budget. Both halves of the help the move needs are
+available separately and neither is the help it needs.
+
+### An attitude scaffold fixes the inversion — and the crossing still will not transfer
+
+So `getup_attitude` was added (`AsimovGetupEnv`, default **0.0** so no prior run
+moves): a clamped PD on uprightness toward `fold`'s +0.83, applied as
+`xfrc_applied[trunk, 4]` per control step, `ATTITUDE_MAX` 60 N.m,
+`ATTITUDE_DAMP` 8.0. A PD rather than the constant torque above, because a
+constant one has no opinion about where it stops.
+
+**Priced against ZERO ACTION it delivers the anchor the recipe never had.** One
+supported instant, 8 episodes, the four clauses read off the SAME frame:
+
+| lift | gain | pelvis z | upright | span | arrival | airborne |
+|---|---|---|---|---|---|---|
+| 0.60 | 160 | **0.549** | **+0.92** | 0.215 | 0.48 m/s | 9.0 % |
+| 0.70 | 160 | 0.509 | +0.73 | 0.215 | 0.51 | 10.5 % |
+| 0.80 | 120 | 0.483 | +0.73 | 0.215 | **0.00** | 16.0 % |
+
+`fold` is 0.511 m at +0.83, span 0.215 — and the 0.80/120 row arrives
+STATIONARY, inside the 0.2 m/s catch basin. The lift alone never got above
+-0.36 at any level.
+
+**Trained, it fixes the attitude and nothing else.** `teach-asimov_getup_gap-c0b03b`,
+8,429,568 steps, 7 stages, history 5 + dc, attitude 120 AND the flight charge
+finally ON at 6.0. Stage 1's closest approach to `fold` is uprightness
+**+0.831** at pelvis 0.573 m, span 0.215 m — against `ca350e`'s **-0.998** —
+so the handstand is gone and the distance to `fold` fell **14.38 -> 3.64**. But
+standing is **0/24 at every stage**, and peak trunk by assist is 0.577 (0.70),
+0.415 (0.55), 0.307 (0.40), 0.295 (0.25), 0.284 (0.10), **0.288** (0.00): the
+same collapse as the chain it replaced. At stage 1 the upright pose has
+**NOTHING** on the floor in 8/8 episodes — an upright flight in place of an
+inverted one — and as the lift fades the policy stops rising, because the height
+was always the lift's.
+
+**The unified reason every route today failed.** The band between pelvis
+**0.30 m** and **0.511 m** contains no pose that is both supported on the feet
+and holdable: a feet-under-hips pose does not exist below 0.30 even with the
+span unconstrained (`probe_tuck_reach.py`), and the best one at 0.316 collapses
+to 0.106 in 1.5 s (`search_tuck_rung.py`). So any route from the floor must
+cross that band DYNAMICALLY, and no scaffold that can be faded exists inside
+it — which is why fading one teaches nothing: at every reduced assist the
+policy's best available behaviour is not to attempt the move, so there is no
+intermediate success to amplify, and "a curriculum can only amplify a success
+that occurs" bites exactly here.
+
+It also explains the one thing that DOES get up from the floor. The sprawling
+clone crosses the same band at a 0.944 m span. On this evidence the sprawl is
+not a stylistic defect of the demonstration — it is how you cross a band whose
+narrow configurations are all unsupported or unstable.
+
+### The arrival spec, measured: fold's JOINTS within ~0.1 rad, under 0.2 m/s
+
+Stopped fading and used the scaffold as a STATE GENERATOR only — it never
+appears at training time (`scripts/probe_scaffold_handoff.py`). Zero action
+under lift 0.80 + attitude 120 reaches **78 of 78 FEET-ONLY** candidate states
+at pelvis **0.479-0.483 m**, uprightness **+0.73**, span **0.215 m**: narrow,
+upright, supported on the feet alone, 30 mm from `fold`'s height.
+
+`9702ba` stands **0/78** from them. Zero action stands 0/78. And the harness is
+sound — the CONTROL, `fold` placed through the identical replay path, stands
+**8/8**, which is the check that makes the 0/78 mean anything.
+
+**The difference is the JOINTS, not the trunk.** The closest feet-only crossing
+state sits **0.290 rad mean / 1.214 rad max** from `fold` in joint space —
+further than the ref recipe's own not-tracking cut fires (0.6-0.9 rad) — while
+the cache poses the catcher handles 43/48 sit about **0.1 rad** away:
+
+| joint | crossing | `fold` | err |
+|---|---|---|---|
+| hip pitch | 0.186 | **1.400** | 1.214 |
+| elbow | 0.401 | **1.400** | 0.999 |
+| knee | 0.443 | **1.000** | 0.557 |
+| shoulder pitch | 0.276 | **0.800** | 0.524 |
+
+`fold` is a deep CROUCH — hips about 80 deg, knees about 57 deg. The attitude
+scaffold holds the TRUNK upright and leaves the robot nearly straight-legged,
+so it arrives upright but not crouched. **The catcher's basin is a joint-space
+neighbourhood of `fold`, not a trunk-pose one**, and every arrival objective
+written against trunk height and uprightness — which is all of them, including
+the one this session added — is aiming at the wrong three numbers.
+
+So the spec for the crossing is now fully measured, and it is the first
+complete one this track has had:
+
+* arrive within about **0.1 rad** of `fold`'s JOINT configuration (23 joints),
+* with pelvis lift under **0.2 m/s** — the figure `FOLD_LIFT` still uses,
+  and now known to be 3x too loose: that basin was measured with the
+  broken probe (see item 2 above), and re-measured on the best catcher
+  this repo has it is 24/24 at 0.00 m/s but already **6/24 at 0.20**,
+* at a span at or under **0.215 m**, feet only on the floor.
+
+Hit that and `9702ba` finishes the get-up at 43/48. The gap recipe cannot hit
+it, because its stage 2 deliberately DROPS the imitation term and pays
+`pelvis height x uprightness` instead — for the good reason that the authored
+route through `pike` is unreachable, but with the consequence that **nothing in
+the economy aims at `fold`'s configuration at all**. A joint-space arrival
+bonus against the `fold` waypoint specifically (not the phase's waypoint) is
+the one term the recipe is missing, and it is the next thing to train.
+
+### The term was added, and the blocker is the ARMS: it never gets its hands off
+
+`fold_pay` was added to `AsimovGetupEnv` (default **0.0**): a per-step pay for
+dwelling in a catchable state, with the three gates taken from the measurements
+— joints within `FOLD_TOL` 0.10 rad of the `fold` waypoint, pelvis lift at or
+under `FOLD_LIFT` 0.20 m/s, feet only on the floor and span at or under
+`FOLD_SPAN` 0.30. Hard gates rather than a weighted sum, because a state close
+in joint space but airborne is not catchable at all and a soft sum pays for two
+out of three — which is how this track got a 97 %-airborne anchor.
+
+It is demonstrably live and sharply discriminating: at `fold` it pays **80.2**
+over 10 steps, at `prone` **0.00**, and at `quadruped` **0.00 despite being
+feet-only**, because that pose's joints are far from fold. That last row is the
+proof it reads CONFIGURATION and not contact.
+
+**Trained with it (`teach-asimov_getup_gap-49f54f`, one knob changed from
+c0b03b), it earns 0.00 per episode at every stage.** Standing is 0/24 again.
+The reason is in the same measurement: across 6 episodes at each of stages 1, 4
+and 5, **no FEET-ONLY frame occurs at all** — the policy is supported on its
+FOREARMS from the prologue to the end, so `fold_pay`'s first gate never opens.
+A live hook on a set the policy never enters.
+
+**The lesson is one this repo already has, applied one level deeper.** "Check a
+knob's reachable set first" was satisfied for the HOOK — it fires at `fold` and
+not elsewhere — and never asked the other question: does the POLICY'S
+TRAJECTORY ever enter the gated set? It does not, and that is invisible in
+every per-step check of the term in isolation. Price a new gated term against a
+ROLLOUT of the actual policy, not against a placed pose.
+
+**So the blocker is now named precisely: the robot never unloads its arms.**
+`_arm_load` already measures it — the normal component of every arm-geom/floor
+contact over `mg`, read with `mj_contactForce` rather than counted as a
+boolean, "because a forearm resting on the floor and a forearm PUSHING are the
+same contact and only the second one gets you up" — and `arm_effort` charges
+for it. The gap recipe runs that charge at **0.02**, the class default, i.e.
+almost off.
+
+Raising it flat is the trap `a-ramped-penalty-can-eat-its-task` describes: this
+robot has NO HANDS, its wrists carry no collision geometry, so the forearms are
+the only way up and a charge on arm load removes the push-up along with the
+lingering. The term the next experiment needs is a **GATED** arm-load charge —
+free during the push-up, paid once the trunk is high enough that the hands
+should have come off — so that unloading becomes the cheap route and
+`fold_pay`'s gate can finally open. That is one knob, and the number that
+settles it is whether any feet-only frame occurs at all.
+
+### The hands came off — and the height is still the assist's
+
+First, the gate at 0.35 m was measured UNREACHABLE before launching: over 1014
+frames of the policy it would warm-start from, the trunk never exceeds **0.317
+m** (median 0.217). A height-gated charge would have fired on **0.0 %** of
+frames and been a second `fold_pay`. The same rollout says the arms carry load
+on **98.2 %** of frames at a median **0.694** of body weight, so the gate was
+moved to NOT RISING — the complement of `arm_push` — which bites on **50.9 %**
+of frames and leaves the 47 % of rising frames free. Pre-checking the reachable
+set of the POLICY, not of the hook, is what caught this.
+
+`teach-asimov_getup_gap-3ec8cc`, one knob changed (`ARM_UNLOAD=2.0`), sized
+from the reward budget at ~60 x weight per episode against `track`'s 207.
+
+**It is the first thing on this track that moved.** At stage 2:
+
+| | before (`49f54f`) | after (`3ec8cc-s2`) |
+|---|---|---|
+| FEET-ONLY frames | **0 (0.0 %)** | **216/612 (35.3 %)** |
+| arm load | 98.2 %, median 0.694 | 14.7 %, median **0.000** |
+| `fold_arrival` earned | 0.00/ep | **+82.91/ep** |
+| best feet-only pose | — | pelvis **0.518** m, span **0.215** m |
+| peak trunk | 0.288 | **0.577** |
+
+The robot takes its hands off the floor and stands on its feet alone for a
+third of the episode, at `fold`'s exact span and above `fold`'s height.
+
+**And it still does not stand: 0/24 at every stage.** Peak trunk by assist is
+0.577 (0.70), 0.415 (0.55), 0.307 (0.40), 0.295 (0.25), 0.289 (0.10),
+**0.286** (0.00) — the same collapse as all three chains before it. The gate
+opened only at the HIGH-assist rungs; the height was the lift's throughout. At
+the open gate the one failing clause was uprightness **+0.56** against the
+**0.85** `is_standing` requires, and the attitude hold is clamped at 60 N.m — a
+clamp calibrated while the ARMS were still carrying the trunk, which is the
+untested lever. Median span 0.215 m at stages 5-6 is the narrowest any chain
+has produced.
+
+**Five chains, ~45 M steps, one shape**, and the unholdable band is why: with
+no supported holdable pose between pelvis 0.30 and 0.511 m, at each reduced
+assist the policy's best available option is to stay low, so there is never an
+intermediate success for the next rung to amplify. Each chain removed a
+different *obstacle* — inversion, flight, an unreachable arrival gate, loaded
+arms — and none of them supplied the dynamic effort the band actually demands.
+
+### The attitude clamp: tested, and dead — plus an instrument that lied by 6/6
+
+The clamp WAS binding, so raising it was a real intervention and not a guess:
+on `3ec8cc-s2`, **18 %** of feet-only frames sat at the 60 N.m clamp, falling
+to 1 % at 100 and **0 %** at 150. No retraining needed — `ATTITUDE_MAX` is a
+class attribute, so the same policy was rolled out under each value
+(`scripts/probe_attitude_clamp.py`).
+
+It reported `is_standing` firing in **6/6** episodes at clamp 150. That was an
+ANY-FRAME counter, and it is wrong. Characterised frame by frame
+(`scripts/probe_standing_frames.py`):
+
+| ep | standing frames | longest run | feet down | airborne |
+|---|---|---|---|---|
+| 0 | 4/102 | **0.04 s** | **1-1** | 41.2 % |
+| 4 | 9/106 | 0.12 s | 1-1 | 33.0 % |
+| 7 | 9/106 | 0.18 s | 1-1 | 32.1 % |
+
+Every standing frame is on **ONE foot**, the longest hold is **0.18 s**, and
+32-44 % of each episode is AIRBORNE. Episodes holding it >= 0.5 s: **0/8**. On
+two feet throughout: **0/8**. A one-footed vertical flicker on the way past is
+the `a-stand-is-not-a-getup` failure mode — the same shape as the 23/24 once
+reached by hopping — and raising the clamp bought FLIGHT rather than
+uprightness, exactly as the lift assist bought height by inverting.
+
+Two things to keep. **`only_feet` is `floor <= feet`, which ONE foot
+satisfies** — so a one-legged flicker passes `standing_report`, and any scorer
+that counts frames rather than the pose that SURVIVES will report it as a
+stand. And `score_gap_chain`, which reads `is_standing` on the surviving pose,
+said **0/24** throughout: the library's instrument was right and the ad-hoc
+counter was the liar. Source default left at 60 N.m.
+
+### The band is unholdable on FOUR contacts too
+
+The unholdable band was measured with FEET ONLY allowed down, which left one
+fact unexploited: the robot has forearms, and the whole authored route sits
+inside that band on them, holding. If a pose could hold HIGH in the band on
+four contacts, the hands would only have to come off over the remainder — 60 mm
+instead of 200 — which is a far smaller dynamic gap.
+
+Measured with the 1.5 s hold inside the objective and forearm contact made free
+(`search_tuck_rung.py --hands`), at three target heights:
+
+| target | reached | after 1.5 s | span | upright |
+|---|---|---|---|---|
+| 0.36 | 0.329 | **0.109** | 0.143 | +0.02 |
+| 0.42 | 0.412 | **0.103** | 0.128 | +0.07 |
+| 0.48 | 0.486 | **0.186** | 0.180 | -0.19 |
+
+All three collapse. **So the band is unholdable on four contacts as well**, and
+forearm support does not shorten the dynamic crossing. That closes the last
+structural idea: there is no rung in the band, with the hands or without them,
+and the only quasi-static poses are below 0.32 (where the route already sits)
+and at `fold` 0.511.
+
+One methodological note, because it nearly produced a false positive: the first
+pass of this search printed "A NEW RUNG" for a pose at pelvis **0.283** against
+a 0.42 target — a candidate the height penalty had REJECTED before the hold ran.
+The verdict checked survival, contacts and span but never that the height was
+the one ASKED FOR, and a pose that holds BELOW the band is not news. The
+verdict now requires the target height and an upright trunk.
+
+### Retargeting the demonstration: the sprawl is EMERGENT, not commanded
+
+The last untried idea. The missing piece is a NARROW demonstration of the
+crossing; a trajectory search never found one, span penalties in training are
+measured dead and so is filtering demos — but all three either select among
+what exists or charge for width after the fact. RETARGETING is neither: take a
+demonstration that WORKS and modify the channel that makes it wide. The sprawl
+is hip ABDUCTION, so scale that.
+
+**Open loop it is void, and the control says so.** Replaying
+`getup_clips_dc.npz`'s recorded actions from their own start states gives
+**0/12 rises at scale 1.00** (the unmodified demonstration), peak trunk 0.407 m
+against a 0.523 m bar. A demonstration from a feedback controller is not an
+open-loop trajectory — any divergence compounds — so nothing about retargeting
+could be read off it.
+
+**Closed loop, with the policy in the loop and its hip-roll OUTPUT scaled**
+(`scripts/probe_retarget_closed.py`, `asimov-getup-h5-dag` from `prone`):
+
+| scale | rises | held 1 s | peak span |
+|---|---|---|---|
+| **1.00** (control) | 3/10 | **3/10** | 0.555 |
+| 0.80 | 2/10 | 0/10 | 0.554 |
+| 0.60 | 0/10 | 0/10 | 0.554 |
+| 0.20 | 0/10 | 0/10 | 0.554 |
+| **0.00** | 0/10 | 0/10 | **0.553** |
+
+The control rises, so the rest counts. Scaling abduction down loses the rise
+progressively — gone by 0.60 — **and does not narrow the span at all**: 0.553 m
+with the hip-roll command at ZERO, against 0.555 m unmodified. **The sprawl is
+EMERGENT from the dynamics, not commanded**, which is also why a span penalty
+was dead: the policy has no direct lever on span either, so there was nothing
+for the charge to buy. Retargeting by abduction is closed on both axes.
+
+(The median peak-trunk column reads 0.128 m at scale 1.00 and that is not a
+contradiction with 3/10 standing — the median over 10 episodes where 7 never
+rose reports the FAILURES' peak. Read a median against the success rate beside
+it.)
+
+### The joints do not determine the pose — the ROOT does, and `fold_pay` had it wrong
+
+Every previous search of this transition scored trunk HEIGHT or UPRIGHTNESS, so
+one scored on the JOINT-SPACE objective was genuinely new
+(`scripts/search_pike_to_fold_joints.py`, CEM over knot offsets FROM `fold`,
+starting at the route's own arrival at `pike`, under `dc`).
+
+It gets **0.040 rad** of mean joint error from `fold` — well inside the 0.10
+rad band the catcher's own start poses sit at — **at pelvis 0.235 m, propped on
+its forearms**. And the route's arrival at `pike` is already only **0.127 rad**
+away.
+
+**So `fold`'s joint configuration exists at pelvis 0.235 m as well as at its own
+0.511 m**: the joints do not determine the pose, the root does. That corrects
+the conclusion above, which read the 0/78 result as "the basin is a joint-space
+neighbourhood". It is not — it is a neighbourhood in joints AND root, and the
+two states measured today each satisfy one axis and fail the other:
+
+| state | joints vs fold | root | caught |
+|---|---|---|---|
+| scaffolded crossing | **0.290 rad** away | pelvis 0.518 m, upright +0.73 | 0/78 |
+| this search's best | **0.040 rad** away | pelvis 0.235 m, on forearms | — |
+
+That is `two-maxima-are-not-a-pose` with the two maxima being JOINTS and ROOT
+rather than height and uprightness.
+
+**And it is a real defect in `fold_pay`**, which gated on joints, lift,
+feet-only and span and never on trunk height or uprightness — so it would have
+paid nearly full value for a crouch at half the height with the feet down.
+Fixed: `FOLD_Z` 0.46 m and `FOLD_UPRIGHT` 0.70 are now hard clauses beside the
+others. Re-verified discriminating — `fold` pays **80.17** over 10 steps
+(pelvis 0.514, upright +0.91) while `pike` pays **0.00** despite clearing the
+height gate at 0.498 m, rejected on uprightness +0.09, and `quadruped` and
+`prone` pay 0.00. 217 Asimov tests pass.
+
+**And the corrected gate is UNREACHABLE by the policy that would warm-start
+it** — pre-checked before launching, the third time that check has paid for
+itself today. On `3ec8cc-s2`, 816 frames over 8 episodes, clause by clause:
+
+| clause | frames passing |
+|---|---|
+| span <= 0.30 | **97.1 %** |
+| joints <= 0.30 rad | **79.4 %** |
+| feet-only | 35.3 % |
+| height >= 0.46 | 33.3 % |
+| lift <= 0.20 | 30.4 % |
+| **uprightness >= 0.70** | **2.9 %** |
+| **all six** | **0.0 %** |
+
+So **five of the six arrival clauses are comfortably reachable and uprightness
+is the single binding constraint**, and the 2.9 % of frames that pass it never
+coincide with the others. A relaunch against the corrected term would be a
+third unreachable gate, so it was not spent.
+
+That is the sharpest statement of the remaining obstacle this track has: not
+"the crossing fails", but *the robot can arrive narrow, at height, slow, on its
+feet, in nearly fold's configuration — and not UPRIGHT*. Every lever tried
+against uprightness has failed on a measured mechanism: the lift assist buys
+height by tipping the trunk over (upright -1.00 at 0.85), a constant pitch
+torque reaches +0.84 only at pelvis 0.111 m, the two together launch the robot,
+and raising the attitude clamp converts the extra authority into flight
+(32-44 % airborne) rather than into uprightness.
+
+### A NARROWER `fold` exists, and the catcher takes it 12/12
+
+Uprightness is not a kinematic bound — `fold` is +0.83 on the feet alone and
+holds — so the 2.9 % is a trajectory problem. The four-contact search run
+earlier targeted HEIGHT and happened to return poses at uprightness -0.19 to
++0.07, which answered a different question, so a search was run on UPRIGHTNESS
+directly (`scripts/search_upright_on_four.py`).
+
+**Unseeded it is a void instrument and the control proves it:** it returns 0.0
+while `fold`'s own configuration, pushed through that same scoring pipeline,
+scores **105.0**. The prior was the midpoint of the joint ranges, nowhere near
+fold's crouch, and 14 CEM iterations over 24 dims never arrive. A search that
+cannot recover a known-good solution cannot report impossibility — it had also
+read the contact pre-gate BEFORE the first step, where `fold` itself reports
+"on floor: NOTHING" because the settle leaves it a hair clear. Both fixed
+(`--from-fold`, and the gate judged after one step).
+
+Seeded, it finds a pose that holds 1.5 s on the feet alone at **span 0.149 m**
+and uprightness **+0.99** — narrower and more upright than `fold` itself. And
+`9702ba` stands from it **12/12, narrow 12/12**, with `fold` as a passing
+control at 12/12.
+
+**What it is NOT: a lower rung.** The search measured its pelvis at 0.465 m,
+but re-placing the same joints settles at **0.513 m** — fold's own height — so
+that 46 mm lived in the search's ROOT placement, not in the configuration. The
+durable finding is a narrower `fold`: **span 0.151 m against 0.215**, same
+height, caught 12/12. It does not shorten the crossing, and the unholdable band
+stands as measured.
+
+### THE ANSWER: the vendor's own policy spends its width INSIDE the band
+
+Two things make this the conclusion rather than another negative. First, `fold`
+PLACED already satisfies `is_standing` — pelvis 0.553 m against a 0.523 m bar,
+uprightness +0.85, feet only — so "stand from `fold`" is a HOLD, not a rise,
+and the 43/48 measures not falling. The whole get-up is the crossing. Second,
+"zero action" on this body is **not** a do-nothing floor: `ctrl` IS the default
+pose (max difference 0.00e+00 rad) and the default pose is the STANDING pose,
+so from `fold` zero action reaches pelvis 0.609 m, uprightness +1.00 and
+`standing True` in 25 steps. Every "price the do-nothing policy" number taken
+on this body is a *stand-up controller's* score, which is why zero action
+"beats the sprawling clone" from `fold`.
+
+And then the measurement that explains the whole day. OpenHorizon's own policy
+rises 7/8 in this MuJoCo under the real envelope; its span BINNED BY HEIGHT:
+
+| pelvis band | frames | median span | p90 |
+|---|---|---|---|
+| 0.00-0.20 | 982 | 0.505 | 0.825 |
+| 0.20-0.30 | 192 | 0.881 | 0.934 |
+| **0.30-0.38** | 123 | **0.934** | 0.961 |
+| **0.38-0.46** | 158 | **0.850** | 0.934 |
+| **0.46-0.52** | 37 | **0.719** | 0.756 |
+| 0.52-0.65 (up) | 2508 | **0.239** | 0.244 |
+
+Inside the band (0.30-0.52 m): median **0.840 m**, p90 0.952, max 0.966. Above
+it, standing: **0.239 m**.
+
+**The only controller that gets this robot off the floor spends its entire
+width inside the band, and is narrow everywhere else.** That is the behavioural
+counterpart of the configuration-space result — no pose in 0.30-0.511 m holds,
+on the feet or on four contacts — and the two agree from opposite directions.
+The sprawl is not a defect of the demonstration or a stylistic habit: it is how
+this body crosses a region that contains no narrow stable configuration.
+
+So a narrow get-up asks for something the vendor's own working policy does not
+do, in exactly the region measured to forbid it, which is why ~45 M steps
+across five chains produced 0/24 at every stage. It also corrects the note
+elsewhere that "the policy crosses the same band at 0.300 m" — measured, it
+crosses at 0.840 m median.
+
+What remains is a choice about the deliverable, not a missing experiment: the
+0.40 m gate has no derivation, `fold` is 0.215 m, and the only motion that
+crosses measures 0.84-0.95 m there.
+
+**And there is no narrow TAIL to harvest.** Per-episode, over 24 episodes, the
+max span while inside the band: 23 crossings succeeded and their widths run
+**0.934 to 0.981 m** — p10 0.941, median 0.949, **47 mm of spread**, and
+**0/23 under the 0.40 m gate**. The crossing width is not a stochastic quantity
+with a lucky narrow tail that distillation could pick out; it is near
+deterministic, 23/23 inside a 47 mm band. That was the last route to a narrow
+demonstration and it is closed.
+
+### The conclusion, from four independent directions
+
+1. **Configuration space:** no pose between pelvis 0.30 and 0.511 m holds a
+   1.5 s commanded hold — not on the feet (best 0.316 -> 0.106 m) and not on
+   four contacts (0.329 -> 0.109, 0.412 -> 0.103, 0.486 -> 0.186).
+2. **The vendor's working policy:** spends its whole width inside that band
+   (median 0.840 m, 0.934 at the bottom) and is narrow everywhere else
+   (0.239 m standing).
+3. **No narrow tail:** 23/23 successful crossings within 47 mm of 0.95 m.
+4. **Five chains, ~45 M steps**, each removing a different confirmed obstacle —
+   inversion, flight, an unreachable arrival gate, loaded arms, a binding
+   attitude clamp — all 0/24.
+
+### Re-scored on WIDTH instead of the undraw gate
+
+The 0.40 m gate has no derivation, so the ranking was redone on the number
+itself — span while CROSSING (pelvis 0.30-0.52 m) versus the stance it ends in
+(`scripts/rescore_width.py`, from `prone`, 8 eps, each run's own kwargs, `dc`):
+
+| policy | rises | crossing | final stance |
+|---|---|---|---|
+| asimov-getup-h5-fix | 1/8 | **0.771** | 0.290 |
+| asimov-getup-h5-dag | 2/8 | 0.809 | 0.252 |
+| **asimov-getup-h5pd2** | **7/8** | **0.835** | 0.235 |
+| asimov-getup-h5cw | 2/8 | 0.846 | 0.260 |
+| openhorizon (vendor) | 3/8 | 0.853 | 0.238 |
+| asimov-getup-h5p | 1/8 | 0.857 | 0.237 |
+| asimov-getup-h5pd | 2/8 | 0.890 | 0.440 |
+| asimov-getup-h5-dag-it1 | 1/8 | 0.937 | 0.230 |
+
+5 of 13 never rose. **Every riser ENDS narrow (0.23-0.29 m, essentially
+`fold`'s 0.215) and every riser CROSSES wide (0.771-0.937 m)** — 166 mm of
+spread across eight independently trained policies plus the vendor's, so the
+crossing width is a property of the MOTION and not of the policy. The narrowest
+crossing on offer is 0.771 m on a 1.2 m robot and it rises 1/8; the best
+get-up (`h5pd2`, 7/8) crosses at 0.835 m.
+
+(Read the BAND column, not a peak. A peak median over all episodes mixes
+populations — the failures never enter the band and stay narrow, which is why
+peak can read LOWER than the crossing width for a weak riser.)
+
+### THE ALTERNATIVE ROUTE: the ARMS replace the stride (8/12)
+
+The long stride exists to buy support across a band with nothing to lean on.
+The arms are the other way to buy it — and `arm_push` (load x upward trunk
+speed) was **DEAD on this task**: it read correctly and no term summed it, so a
+run at 150 came back byte-identical to the 4.0 default (4/12 rises, span
+0.742/0.408/0.517 to three decimals). That identical-results signature is what
+exposed it. Third dead knob on this body after `arm_effort` and the unrecorded
+ones. Wired into the ref/clip terms 2026-10-16.
+
+With it live, from `asimov-getup-h5pd2`, all 12 eps from `prone`:
+
+| policy | charge | rises | total | lateral | fore-aft |
+|---|---|---|---|---|---|
+| control `d8a3a0` | none | **10/12** | 0.845 | 0.350 | 0.714 |
+| `a5eb63` stride only | fore-aft 30 | 4/12 | 0.742 | 0.408 | 0.517 |
+| `27d5a6` + arms | + arm_push 150 | **9/12** | 0.805 | **0.324** | 0.713 |
+| **`1edbc6`** | stride 60 @ 0.35 + arms | **8/12** | **0.658** | 0.342 | **0.591** |
+| `b75b6e` consolidated | same, 6 M more | **8/12** | 0.758 | 0.321 | — |
+| `990cc4` symmetric | stride 60 @ **0.10** | 4/12 | — | — | 0.686 |
+
+**The mechanism swap is real and the evidence is the failure mode.** Charging
+the stride ALONE gives 4/12 and the failures do not fall — **7/12 never leave
+the floor** (median peak 0.199 m, only 1/12 rose and fell). Support was removed
+with nothing replacing it. Pay the arms and the same charge gives 9/12; add the
+stronger stride charge and it is 8/12 at 170 mm tighter. Reproducible: two
+independent runs at 8/12, and 6 M further steps do not improve it.
+
+**CORRECTED at higher n.** Paired on 48 episodes: **27/48 against the control's
+37/48**, discordant 7-17, exact McNemar **p = 0.0639** — formally a null but
+borderline and favouring the CONTROL. The 8/12 vs 10/12 above is underpowered
+and should not be read as near-parity. And the two span figures are DIFFERENT
+STATISTICS: 0.658 vs 0.845 is the median over pooled band FRAMES, while 0.936
+vs 0.974 is the median of per-episode MAXIMA — **38 mm** apart at the worst
+instant. Honest claim: much tighter through most of the crossing, barely
+tighter at its worst moment, and probably somewhat less reliable. The mechanism
+stands; the headline does not.
+
+**What it is NOT.** It still crosses the same band, because every route must —
+the pelvis passes through every height from 0 to 0.64 and nothing rests in
+0.30-0.511 m, measured on feet AND on four contacts. A symmetric feet-together
+rise is not reachable (4/12 and no narrowing). So this is a different SUPPORT
+MECHANISM through a crossing that cannot be avoided, not a distinct posture,
+and it is 8/12 against the lunge's 11/12.
+
+### The short-step route on its own: 4/12
+
+Once the axes were split (below), a charge could target the posture its claim
+was about. `span_axis=fore_aft` asks for a SHORTER STRIDE and leaves the
+lateral stance alone — a different move, not a narrower version of the same
+one. Every arm below is identical to the control except where noted: same task
+(`getup_clip`), same warm start (`asimov-getup-h5pd2`), same 3 M steps, `dc`,
+history 5, from `prone`.
+
+| arm | charge | rises | fore-aft | lateral | peak |
+|---|---|---|---|---|---|
+| control seed 1 | none | **10/12** | 0.714 | 0.350 | 0.972 |
+| control seed 2 | none | **10/12** | — | — | — |
+| combined span 30 + limit 50 | `both` | **0/12** | — | — | — |
+| fore-aft 10 @ 0.50 | `fore_aft` | 3/12 | 0.749 | — | — |
+| fore-aft 30 @ 0.40 | `fore_aft` | 3/12 | **0.496** | 0.390 | **0.641** |
+| **fore-aft 30, band-gated** | `fore_aft` + band | **4/12** | **0.517** | 0.408 | 0.742 |
+| consolidated from the above | same, 4 M more | **0/12** | 0.545 | 0.389 | — |
+
+**`teach-asimov_getup_clip-a5eb63` is another way up**: stride 0.714 -> 0.517 m,
+worst instant 0.972 -> 0.742 m, rising 4/12. It is a visibly different move — a
+short step rather than a deep lunge — and it is the first alternative posture
+on this track that rises at all.
+
+**What bounds it.** Two control seeds both scored 10/12, so the drop is the
+charge and not variance. The failures are not falls a handoff could catch:
+7/12 **never rise at all** (median peak 0.199 m), only 1/12 rose and fell — the
+charge suppresses the rise itself, which is why `handoff_pay` is the wrong tool
+here. Weakening the charge did not trade gracefully (3/12 AND a longer stride
+than the control), gating it to the crossing band bought one episode
+(3 -> 4/12), and consolidating from the short-step policy for another 4 M steps
+lost it entirely (0/12). So the charge buys posture and costs rises
+monotonically, and 4/12 is the best operating point found.
+
+### IT IS A LUNGE, NOT THE SPLITS — the span metric conflated two postures
+
+`_foot_span` is `hypot(dx, dy)`: lateral and fore-aft collapsed into ONE
+number, deliberately ("a robot in a front-to-back splits is in the splits").
+That one number has been carrying a verdict it cannot support, and every
+"sprawl" conclusion on this track rests on it.
+
+Decomposed in the BODY's own frame across the crossing (pelvis 0.30-0.52 m),
+`scripts/probe_span_axes.py`, 10 episodes:
+
+| policy | total | **LATERAL** | fore-aft | lateral share |
+|---|---|---|---|---|
+| `asimov-getup-h5pd2` | 0.828 | **0.353** | 0.702 | 43 % |
+| `teach-asimov_getup_clip-d8a3a0` | 0.845 | **0.350** | 0.714 | 41 % |
+
+**Only 0.35 m of the 0.83 is lateral.** The rest is fore-aft — a LUNGE. A human
+stride is 0.7-0.8 m front-to-back and nobody calls that the splits; lateral
+abduction is what loads the hip sideways and what "narrow" was ever meant to
+forbid. And **0.353 m is UNDER the 0.40 m acceptance gate**.
+
+The front-camera render confirms it directly: at t=0.72 s, mid-crossing at trunk
+0.400 m, the legs are not spread — one forward, one back, feet under the body.
+The earlier "legs thrown wide apart" description came from a SIDE camera, where
+fore-aft separation looks exactly like abduction. **A render answers the
+question it is pointed at**: the camera axis decided the conclusion.
+
+So the sprawl framing was an artefact of a collapsed metric plus a camera
+choice, and the deliverable may already exist. What remains true and measured:
+the band holds no pose, the crossing is dynamic, and charging the COMBINED span
+kills the rise (0/12 against 10/12) — but that charge was priced against the
+conflated number, so it was partly charging for a stride.
+
+**On this body, under Menlo's published envelope, the pike->fold crossing
+appears to require a wide base.** The narrow get-up is not blocked by a reward,
+a budget or a curriculum; it is asking for a motion that the only working
+controller does not perform and that the configuration space does not contain a
+resting point for. Either the acceptance width changes, or this needs a
+different trunk-pitch story than 23 joints with no back pitch.
+
+**IT STILL DOES THE SPLITS, and that is inherited rather than introduced.**
+Peak foot span over the rise is **0.944 m** (p90 0.977) against the teacher's
+**0.955 m** (p90 0.962) — the same motion, on a 1.2 m robot, where the
+acceptance gate asks for 0.40 m. It ENDS narrow (0.21 m standing), so the
+sprawl is the launch and not the stance, which is exactly what
+`the-teacher-does-the-splits` predicted: a clone of this teacher cannot be a
+narrow staged get-up, because the demonstration is not one. Any claim that
+this is deployable as-is has to answer the span first; what it IS, is the
+first get-up here that works inside Menlo's published actuator envelope.
+
+Worth separating from an earlier number in this track: the teacher was
+measured at a 0.209 m span in the lab probe, which was the span while
+STANDING at the end of the episode, not the peak during the rise. Both are
+real and they describe different things.
+
+**What is still open.** The span, above — a narrow get-up needs a narrow
+demonstration, not a better clone. Prone at 10/48 — the harvest is
+`supine,prone` pooled and prone is the half it under-represents, so more prone
+demonstrations is the cheap next move. The hold at 28/48 has the known
+alternative answer too: hand off to Menlo's walker, which was 180/200 on the
+one-frame policy. And nothing here has run on an Asimov.
+
+**Three bugs this phase found in the plumbing, all of the same shape — a claim
+the stage could not have contradicted.** `Duck._make_env` assigned
+`actuator_force = "xml"` unconditionally for every non-duck body, silently
+overriding the palette entry that asked for `dc`: the roster row said "inside
+the published envelope" while the physics was the flat clamp. `dc` also had to
+be added to the `writes_model` set, because it rewrites
+`actuator_forcerange` every substep and the lab shares one compiled mjModel
+across the roster — `walk_env` refuses a shared model for exactly this, but it
+cannot SEE the sharing when the model is passed in explicitly. And
+`getup_acceptance.py` — the repo's own gate — raised `TypeError` on every
+imitation run, because `run.json` records `clip_file`/`track_tol`/`force_lag`
+and the gate builds `env_class("getup")`, so `watch_training` reported a
+traceback where a score belonged. And
+`env_kwargs_for_policy_path` returned `{}` for any FETCHED policy (no
+`behavior.json`, no `run.json`), which `slot_env` honours by falling back to the
+body's `default_task` — which is how both vendor policies landed in the WALK
+env, Menlo's correct by luck and openhorizon's standing with nothing to get up
+from. The branch now lives in the function, so the next fetched policy gets it
+free, and the frame publishes each body's `actuator` so a stage can no longer
+disagree with its own label.
 
 ### Phase 5 — the handoff  `[x] 2026-10-10 — IN SIM, and it is the LOAD-BEARING part`
 
@@ -20575,3 +22271,297 @@ doctrine — ladder the physics so the skill is cheap to FIND rather than
 burning samples on blind search — and if it still needs the real thing,
 phases 1-3 port to an mjlab cfg and retrain on the official stack. That is
 the same prototype-here, retrain-there path the README describes for the duck.
+
+### 2026-10-19 — a from-scratch narrow stand, and three instruments that were lying
+
+**The result: `teach-asimov_getup_ref-c2bae8-s1` stands 48/48 from `fold`,
+48/48 narrow, median peak span 0.269 m, peak trunk 0.622 m.** Random init —
+no `initFrom`, no distillation, nothing descended from openhorizon-labs'
+clips — inside Menlo's 78/23 contract with a 5-frame history (390 in) and the
+published `dc` speed-torque envelope. The same rung of the previous chain
+(`257233-s1`) re-scores **18/48** at span 0.355 on the same instrument. The
+two differ by **four** knobs (`free` 0->1, `balance` 0->40, `home` 0->30,
+`limit` 0->50), so the claim is about the economy, not about dropping
+imitation alone.
+
+This is a stand-up from a deep crouch, NOT a get-up from the floor. `fold` is
+pelvis 0.511 m with the feet already under the robot. Below is what closed
+off the floor half.
+
+**1. The sub-`fold` rungs give the policy about eight steps.**
+`AsimovGetupRefEnv.step` cuts on `trunk_z < _anchor_z - CUT_BACK_Z` with
+`CUT_BACK_Z = 0.15` and `_anchor_z` the height the episode STARTED at.
+`rock_back` (0.377 m) and `pike` (0.263 m) are not equilibria, so they sink
+and hit that cut in **7-9 steps (0.14-0.18 s)**, every episode, even with
+`fell_cut=False`. Zero action, 12 eps/rung: `med peak z` EQUALS `med start z`
+for prone, plant_forearms, draw_knees_in, quadruped, pike and rock_back — the
+do-nothing policy never lifts the robot a millimetre from any of them. `fold`
+is the only sub-crouch rung with upward mass (0.520 -> 0.601). Trained 2.37M
+steps on `fold,rock_back` and 2.96M on `+pike`: **0/24** on each new rung
+while `fold` held 24/24.
+
+The sprawl is MANUFACTURED by that cut. Under zero action the span at
+`rock_back` is a narrow 0.214 m; the trained policy reaches **0.530** there
+and **0.731** at `pike`, because flinging the legs is the only thing that can
+move the reward inside eight steps. Nothing was wrong with the reward.
+
+**2. `start_rung="falling"` is inert on this task.** The ref `reset` places
+`start_phase` from `_start_cache` and then sets `qvel[:] = 0.0`, overwriting
+both the pose and the velocity the base env's fall machinery supplies. A
+`fall_depth` sweep over 0.1/0.25/0.5/1.0 came back BYTE-IDENTICAL (24/24,
+peak 0.623, span 0.269 at every depth). A dead hook, not a null.
+
+**3. The rung sampler weights inversely by episode length**
+(`w = 1/rung_len`), equalising STEPS rather than episodes. So a mixed-rung
+score is dominated by whichever rung fails: a combined `fold,rock_back` read
+**5/48** while the decomposition was `fold` 24/24 and `rock_back` 0/24 — at
+~7% `fold` episodes those reconcile exactly. Read as a capability number,
+5/48 says "it forgot everything"; read correctly it says "rehearsal is
+working and the new rung is dead". Never score a multi-rung run on its own
+mixed start distribution.
+
+**4. The catch-basin probe measured the wrong pose** — see the retraction in
+item 2 of the narrow-route section above. The published 0.2 m/s is void.
+
+**5. `ARRIVAL` trains the basin, and at U[0,1] it MOVES it.** The ref env
+could never produce an arrival (every episode began at rest), so
+`MICRODUCK_ASIMOV_GETUP_ARRIVAL` now injects `v ~ U[0, arrival]` with a
+coupled pitch rate. `114654`, 3M steps at U[0,1], paired against the donor on
+matched injected arrivals with the knob forced to 0 in the eval env: **0.00
+m/s 24/24 -> 0/24** (p=0.0000), **0.20 6/24 -> 24/24** (p=0.0000), and
+0.40/0.60/0.80/1.00 all 0/24 both arms. It bought the 0.2 band, lost at-rest,
+and gained nothing above 0.4 — at-rest is ~5% of U[0,1] draws, and above 0.4
+there are no successes to learn from. At rest it still rises to 0.649 m and
+topples at ~1 s, so it is a finishing failure. `779adf` retrains at U[0,0.3].
+
+**And the basin is probably not the obstacle.** The "~2.0 m/s" a 211 mm
+pike->fold climb needs is the LAUNCH speed at the bottom; a ballistic rise
+arrives at `sqrt(2.0^2 - 2*9.81*0.211)` ~ **0 m/s**, inside the basin. The
+binding constraint is producing that launch from a narrow pike at all, which
+the sprawl analysis attributes to kinematics — no back pitch joint, CoM
+560 mm ahead of the feet, 112 deg of trunk rotation needed against 59
+available — not to the catcher.
+
+**Tooling hardened in passing.** `scripts/probe_catch_basin.py` now builds the
+run's OWN task and waypoint and prints the placed trunk height and span in its
+header. `scripts/getup_launch.py` gained the six knobs it crashed on, the five
+REF-env knobs it had been letting the recipe's final stage supply silently
+(including `START`, the most important knob in a curriculum fine-tune), a
+`--text` flag (it hardcoded one recipe), a numeric MOVED diff — `HISTORY`'s
+OFF value is **1**, not 0, so a donor at 5 dropping to 1 was invisible to both
+existing checks while feeding a 78-float observation to a 390-float policy —
+and an `_is_off` fix for booleans, which `run.json` stores as `False` and the
+check read as ON. On its first real use it caught **eleven** moving knobs,
+including that `HISTORY` drop and `MOTOR dc -> xml`.
+
+And a self-inflicted one worth recording: a duplicate `"arm_push"` key added
+to the base env's terms dict **silently zeroed the term**, because a dict
+literal evaluates both values for a duplicate key and `_trunk_up_speed()` is
+monotone — the first call banks the new-best gain and the second returns 0.0,
+so the surviving entry read zero.
+`test_the_arm_reward_cannot_be_farmed_by_flailing` caught it.
+
+### 2026-10-19 (later) — the narrow rise out of pike works; the wall is one 407 mm move
+
+Five single-knob continuations off the 48/48 `fold` catcher, each diffed
+against its donor by `scripts/getup_launch.py`. Median peak trunk z from a
+settled `pike` (start 0.263 m, `fold` 0.520 m) and median peak foot span:
+
+| run | moved knob | peak z | span | what it showed |
+|---|---|---|---|---|
+| `140db6` | `CUT_BACK` 0.15 -> 0.60 | 0.255 | 0.409 | episode length 7 -> ~110 steps; still no rise |
+| `7be35b` | `ARM_WORK` 0 -> 20 | 0.313 | 0.646 | **first rise**; `arm_push` 0.00 -> 227.7 |
+| `c130f7` | `SPAN_COST` 0 -> 4 | 0.364 | 0.407 | narrower AND higher |
+| `54acc8` | `TUCK` 0 -> 450 | 0.401 | 0.487 | +37 mm, but from `arm_push`, not from tucking |
+| `405037` | `SPAN_COST` 4 -> 150 | 0.422 | 0.372 | narrower AND higher again |
+| `af9ba5` | `TUCK_WORK` 0 -> 60 | 0.420 | **0.280** | narrowest; locates the wall |
+
+**Two reward defects, same shape, both fixed.** `arm_push` is
+`load x max(_trunk_up_speed(), 0)` and `_trunk_up_speed()` returns only the
+gain above the episode's BEST height, so from a rung the robot sinks out of
+it is identically zero and **cannot start the motion it pays for** — measured
+0.00 an episode at w=150 from `pike`, where the entire budget was `track`
+85.3 + `contact` 73.0 and `contact` is collected by LYING THERE. `arm_work`
+(signed `load x dz`, farm-resistant by cancellation round a cycle rather than
+by monotonicity) took `arm_push` to 227.7 and then 892 as the rise grew. The
+same defect in `tuck` was fixed the same way with `tuck_work`.
+
+**`tuck` and `rotate` were missing from the `getup_ref` and `getup_clip`
+terms dicts entirely** — read, recorded on every run, summed nowhere. That is
+the fourth knob in this env with that defect, after `span_penalty`,
+`arm_effort` and `arm_push`.
+
+**The sprawl is not load-bearing for this part of the rise.** Forcing the
+stance narrow made it rise HIGHER, twice (`c130f7`, `405037`). The inherited
+"the sprawl IS the launch" claim was measured on openhorizon-labs' clone and
+its descendants, never on a policy trained narrow from scratch.
+
+**RETRACTED THE SAME DAY — THE "RISE" IS A FACE-DOWN HIP THROW.** Everything
+above about peak trunk z is withdrawn as evidence of progress. Rendered
+(`render-rollout --start-phase pike`), the robot is face down in a pike
+RESTING ON ITS NECK AND ELBOWS, hips raised, and it stays there until the
+recipe ends the episode: trunk pitch goes -117 deg to -148 deg, i.e. it gets
+MORE inverted, and the floor contacts read `neck_pitch_lin` and
+`right_elbow_link` throughout. Measuring uprightness at the peak-trunk-z
+frame across the same runs: `140db6` **-0.43**, `405037` **-0.63**, `af9ba5`
+**-0.66** — a stand needs > +0.85. Height and uprightness are
+ANTI-CORRELATED across the whole series, so the metric improved precisely
+because the policy went further face down.
+
+`standing` was 0/24 at every rung in every one of those runs and that was the
+real signal; it was under-weighted in favour of a secondary metric with a
+pleasing trend. This is `peak-height-is-not-a-rise`, already written down in
+this repo after a face-down hip throw scored as a rise once before — and the
+span numbers inherit the same defect, since "narrow" describes a pose that is
+not a stand. What survives is the `fold` column, which is scored by
+`is_standing` (height AND uprightness AND feet-only) and held 24/24
+throughout, and the reward-plumbing findings below, which are properties of
+the code rather than of this policy.
+
+**WHERE THE WALL IS.** The CoM-to-feet horizontal gap at each settled
+waypoint: prone 0.386, plant_forearms 0.627, draw_knees_in 0.549, quadruped
+0.502, pike 0.566, rock_back 0.492, **fold 0.085**, crouch 0.043, stand
+0.075. The whole closure is ONE discontinuous **407 mm** event at
+`rock_back -> fold`; no waypoint has a partially closed gap, so there is
+nothing to ladder and nothing for a policy at `pike` to aim at. That explains
+every failed rung attempt on this leg at once.
+
+What the policy reaches from `pike` is CoM gap **0.499** at trunk **0.420** —
+numerically close to `rock_back` (gap 0.492, trunk 0.377), but NOT
+`rock_back`'s pose: uprightness there is **-0.66** against a face-down pike,
+so matching two scalars is not matching a configuration. The earlier claim
+that a from-scratch policy performs `pike -> rock_back`, the leg the servos
+cannot do at any timing, is WITHDRAWN. From a SETTLED `rock_back` the policy
+does not move at all (peak 0.377 = start).
+
+**Three pre-checks that saved runs.** `tuck_work` earns 177 an episode while
+the physical closure moved 56 -> 67 mm and `limit_penalty` tripled to -88.9,
+so the policy is pressing joint stops — the no-back-pitch kinematics in our
+own numbers. Freeing the span inside the crossing window (`span_band`) is a
+measured NO-OP: the policy already spends 7.8 % of frames above trunk 0.40
+at a span of **0.242**, so the charge is inactive there and the span was
+never what blocked the crossing. And two arrival-basin runs (`114654` at
+U[0,1], `779adf` at U[0,0.3]) net to a wash — 29/48 against the donor's
+30/48 across 0.00 and 0.20 m/s, with 0.40+ stuck at 0/24 in every arm.
+
+**State of the deliverable.** Ours, from scratch, no openhorizon lineage, in
+Menlo's 78x5/23 contract under the published `dc` envelope: a narrow stand
+from `fold` (**48/48**, span 0.238-0.269), verified by `is_standing`. Nothing
+below `fold` stands: every rung is 0/24 and the apparent progress there was a
+face-down hip throw (see the retraction above). The missing link is still one
+move with a number on it — collapse 407 mm of CoM-to-feet gap from a
+momentum-carrying apex at trunk 0.42 m — and reward shaping has now failed at
+it with monotone terms, signed terms, arrival training, assist ladders and
+span scaffolds.
+
+### 2026-10-19 (close) — eleven economies and a 4x budget: pike->fold is not findable here
+
+Continuing after the retraction above, with `standing` and uprightness as the
+headline and a gap/CoM column beside every height. From a settled `pike`, all
+24 eps, every run warm-started inside the 78x5/23 contract under the `dc`
+envelope:
+
+| run | economy | STANDS | up@peak | CoM gap end | span |
+|---|---|---|---|---|---|
+| `7e0545` | gap only (`tuck_work` 200, rest off) | 0/24 | -0.42 | **0.021** | **0.917** |
+| `a1cefb` | + rise terms, `tuck_work` 20 | 0/24 | -0.42 | 0.033 | 0.930 |
+| `67baf9` | + `arm_unload` 3 | 0/24 | -0.42 | 0.034 | 0.866 |
+| `80448b` | best economy, **16M steps** | 0/24 | -0.66 | 0.495 | 0.260 |
+
+**The gap CAN be closed — by collapsing into the splits.** `7e0545` took the
+CoM-to-feet gap 0.566 -> **0.021 m**, the first time anything moved that
+quantity (every other run managed ~60 mm), at a **0.917 m** span — which is
+independently the figure recorded for the narrowest of the teacher's 24
+crossings, now reproduced by a from-scratch policy. But the state is not a
+pose: harvested and priced for recovery, **zero action 0/12, the fold-stand
+policy 0/12, and the policy itself 0/12**, all flat at trunk z ~0.005 within
+2 s. The CoM is over the feet because everything is on the ground.
+
+**`arm_unload` works and eats the task.** It is the only purpose-built knob
+never used on this track, aimed at the measured blocker (0.0 % feet-only
+frames, arms loaded 85-100 %). At w=3 median arm load fell **0.550 -> 0.009**,
+a 60x reduction — and feet-only stayed 0.0 %, because the robot unloaded its
+arms by LYING DOWN: torso on the floor 69.9 % of frames, pelvis 59.5 %, thigh
+65.0 %. Its own docstring predicts this ("a flat charge removes the push-up
+along with the lingering").
+
+**Budget is not the limit.** `80448b` ran **16M steps** on the least
+degenerate economy — four times every other run — and returned the identical
+face-down hip throw (uprightness -0.66). It also degraded the rung that
+works: `fold` narrow fell 24/24 -> 13/24. `c2bae8-s1` remains the best
+artefact of the track.
+
+**A static "walk the feet in" rung does not exist either.** Sweeping hip
+flexion 0.9-2.1 rad and knee 0.05-1.2 rad from `pike` and settling under the
+servos leaves the gap at 0.525-0.575 m at every setting (pike is 0.566),
+because with both forearms and both feet planted the robot is a CLOSED CHAIN
+— flexing lowers the hips without translating the feet. Values above hip 1.20
+are byte-identical, so the action clip saturates there.
+
+**Where this leaves it.** Ours, from scratch, no openhorizon lineage: a
+narrow stand from `fold` — **48/48**, span 0.269, rendered and confirmed
+(upright in 0.72 s, trunk 0.613 m at pitch +4 deg, both feet, `floor:none`,
+held the full 8 s). The floor half of the route is the servo prologue, which
+reaches `pike` open loop. The missing link is `pike -> fold` and it has now
+resisted eleven economies, a 4x budget, three new reward terms and two new
+env knobs, with every attempt satisfied by a different degenerate behaviour.
+That is the documented hand-off: port the env design to an mjlab cfg and
+retrain on the official GPU stack.
+
+### Resolved 2026-10-21 — the get-up stands, and the stillness is a SECOND CONTROLLER
+
+`pike -> fold` was the wrong framing: the unlock was a **signed AND coupled**
+term, `rise_work` — the per-step rate of the env's own
+`rise = height x max(upright, 0)` — which took the floor bands from
+**0/20 to 16-20/20** ever-standing where eleven economies of monotone and
+uncoupled terms had all returned 0/24. `teach-asimov_getup_whole-617d52`
+then rose **42/48 from prone**.
+
+**Then Jonathan said it never settles — it keeps jiggling — and he was
+right.** Two retrains chased it with the reward and both were the wrong
+lever:
+
+* `home 30, calm 10` (20 M steps) moved jiggle **2.47 -> 2.19** against a
+  0.021 target, because `_home_gain` pays joint POSITION and `_calm_charge`
+  prices TRUNK speed — neither can see a limb twitching under a still torso.
+  It did unlock **supine, 1/48 -> 7/8**.
+* `joint_vel 7, over_clip 5` (`teach-asimov_getup-19587b`, 20 M steps) moved
+  limb rate only **326 -> 298 deg/s** while the charge ate ~65 % of the
+  positive budget. It bought real things — CoM outside its support polygon
+  **46.7 % -> 25.0 %**, over-clip while standing **18.3 % -> 1.3 %**, prone
+  hold 3.96 -> 5.37 s — but not stillness.
+
+**No weight was ever going to do it**, and three measurements say so: the
+PLANT does not buzz (zero action standing reads **0.000 rad/s, 0 deg/s**
+limb max on both actuator models), the twitch is not CORRECTIVE (1.878
+outside the support polygon vs 1.796 inside), and it is not CHEAP (the
+policy paid and kept twitching). One network was being asked to rise fast
+and stand still.
+
+**The answer is the handoff, exactly as it was for the HOLD.** Hand to
+Menlo's shipped walker the moment it is up:
+
+| | get-up alone | + vendor walker |
+|---|---|---|
+| jiggle | 1.609 | **0.032** rad/s |
+| off-idle | 0.089 | **0.027** rad |
+
+with **24/24 rises, 24/24 still standing at the buzzer, 24/24 shoves
+survived** and a mean joint error vs the default pose of **1.17 deg**.
+Rendered and confirmed: face down at t=0, up at 0.72 s, walker takes over at
+1.44 s, trunk 0.617 m at pitch +4 / tilt 4 unchanged to the 8 s buzzer.
+**Deploy `teach-asimov_getup-19587b` WITH the handoff.**
+
+**Still open:** span **0.887 m** — the known sprawl, unchanged by any of
+this, and the one acceptance gate still failing.
+
+**Three instruments were lying while this was measured**, all now fixed:
+`term_audit` priced every RAMPED penalty at `_penalty_scale()=0.05` (a 20x
+under-read: `joint_vel_penalty` audited -480/ep while the trainer charged
+-9,601, and the weight was chosen on that); it also printed "DEAD here — no
+weight saves it" for terms that were merely UNDERWEIGHTED (five moved out of
+DEAD once the weight was divided out); and `render-rollout --handoff` could
+never fire on ANY non-duck body, because `handoff_due` read the duck-only
+`env.behavior.handoff_fn` and fell through to the backflip rotation gate —
+so the flag was accepted, the render completed, and the mp4 showed the
+unhanded behaviour.

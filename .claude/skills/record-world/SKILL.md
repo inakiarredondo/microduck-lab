@@ -63,8 +63,12 @@ for a 4-duck pitch, faster for a room.
 
 - `top` (default) — the whole floor from near-plan, the pitch's view. Ducks
   are small; the captions carry the positions.
-- `follow:<duck>` — three-quarter camera tracking that duck at ~1.1 m. Use
-  it for a fall, a grasp, a kick, a wall bump.
+- `follow:<duck>` — three-quarter camera tracking that duck, framed on the
+  SUBJECT's own size: ~1.1 m for a duck, ~5.1 m for a 1.3 m Asimov or G1
+  (`record_world.follow_scale`). Use it for a fall, a grasp, a kick, a wall
+  bump. Until 2026-10-13 every subject got the duck's 1.1 m, so a follow of
+  anything bigger was six tiles of its shins — if you are reading an old
+  sheet of a non-duck body, that is why. `--distance` still overrides.
 - `side` / `front` / `three-quarter` — fixed at the room centre.
 
 ## What it is not

@@ -1843,3 +1843,119 @@ mapping only a person can state, and the windows measured per body.** A
 names — four-legged air time and a trot are a different reward structure, and
 the honest version is a kind with its own env rather than `MicroduckWalkEnv`
 with `foot_geoms` of length four.
+
+**ANSWERED by a real third-party robot (2026-10-03, Menlo Research's
+[Asimov 1](https://github.com/menloresearch/asimov-1) — `robots/asimov.py`,
+`robots/asimov_walk.py`, `robots/asimov_env.py`,
+`.claude/skills/add-a-robot/SKILL.md`).** The table above was written against
+a Menagerie quadruped, where level 1 looked expensive because a quadruped is
+the wrong shape for the walking env and its MJCF publishes almost nothing.
+Asimov is the other case and it is the one worth planning for: a BIPED whose
+owners also published the training config their shipped policy runs under. It
+reached level 1 in a day, and every field the table calls un-guessable was
+**published** rather than guessed:
+
+| the table said | Asimov |
+|---|---|
+| `gyro_sensor` cannot be guessed | `imu_ang_vel`, a real `<gyro>` in the file |
+| `foot_geoms` mapping only a person can state | `left_foot1..4_collision` / `right_...` — two sides, the side in the name |
+| `fall_gravity_z` is a judgement | published: `bad_orientation(70 deg)`, which is the duck's `-0.342` to three decimals |
+| velocity ranges measured per body | published: vx (-0.6, 0.8), vy ±0.5, wz ±0.8 |
+| `obs_dim`, `twist_obs_slice`, `action_scale` belong to the env | published: 78, (6, 9), 0.25 |
+| `sole_tol` / `ground_tol` scale-derivable | **no — MEASURED, and the derivation would have been wrong.** The sole is flat to 0.00000 m, so `sole_tol` picks the whole footprint; `ground_tol` came off the shipped policy's own gait (sole height difference median 10.3 mm, p90 24 mm) |
+
+Three things the table did not anticipate, and they are what the next robot
+should budget for:
+
+* **A model can ship `nu = 0`.** Asimov's MJCF has no actuators at all — its
+  trainer injects them in Python from the published gains — so a level-1 body
+  may have to build its own servos before anything can act. That is also the
+  one place two stacks silently disagree.
+* **A model can bundle its own scene.** Asimov's MJCF carries a `floor` plane
+  and three lights, which made level 0 impossible until `_generated_scene`
+  stopped adding a second floor. Level 0's "an MJCF and an id" was true only
+  for files shaped like Menagerie's, which splits `robot.xml` from `scene.xml`.
+* **Level 1 is not only `RobotSpec`'s fields.** A body also owes `contract()`,
+  `env_class()`, `visual_scene()`, `robot_model()`, `frames()`,
+  `shipped_policies()`, `ready`/`fetch`/`setup_hint` and `attach()`. Declaring
+  `robot_model()` is what lets the conformance suite check a new body with
+  **no branch of its own** — the four named cases in
+  `tests/test_body_conformance._visual_scene` are now bodies that predate the
+  method, not a table every new robot joins.
+
+**And the settling number for the whole exercise is not a test, it is their
+policy.** `Menlo/asimov1-locomotion-0818` walks in this repo's MuJoCo through
+our mirror of their 78-float layout — 0.44 m/s at a 0.5 command, 0.68 at 0.8,
+±0.5 rad/s turns, no falls in 10 s on six commands, and the env reproduces the
+bare driver to within spawn noise (4.21 m against 4.40 m). A wrong permutation
+still produces actions and still moves the robot, so nothing short of this
+distinguishes a copied contract from an invented one.
+
+**What it cost the harness** — four defects, each generic rather than
+Asimov-shaped: the bundled-floor crash above; `fetch-robot`'s listing asking
+an unfetched body for its contract (it would have hit an unfetched G1 too);
+`scripts/probe_mjcf_body.py` framing its camera off WIDTH, which cropped the
+head and feet off a 1.2 m robot; and two suite assumptions — a walker name
+scan that indexed `rig_controls[0]` on a body declaring none, and
+`test_an_open_loop_hold_topples_inside_that_window`, which asserted of all
+legged bodies a fact true only of the duck and the G1. **Asimov holds its
+default pose open-loop for 2 s with no policy at all** (pelvis 0.639 → 0.607,
+upright): 32 kg on 150 N·m/rad servos in a statically stable bent-knee stance.
+That is recorded in `HOLDS_OPEN_LOOP` with its measurement, and it costs the
+settle test its planted regression for that body — see the note there.
+
+**And level 2 followed the same day, through the seam that already worked.**
+The blocker looked like `world/arena.WorldRobot` — written for driver-stepped
+wheeled bodies, and it does assume its robot cannot fall. It is the wrong
+class: a legged body in a room is a **`WorldPerson`**, which is how the G1 has
+always walked a scenario. That class had exactly one hard-coded branch
+(`kind == "g1"`, constructing `G1Walker` by name), and `person_kinds()` now
+resolves `kind` against the registry, `compose` attaches through
+`Body.attach()` and the walker comes from `Body.driver()`. The G1 reaches the
+identical `G1Walker` through `g1.G1Body.driver`, and `tests/test_g1_person.py`
+is the control that says so.
+
+`scenarios/asimov-walkabout.json` is the result: Asimov walks a 12.8 m circuit
+at 0.25 m/s with three ducks following it, pelvis steady at 0.62 m, no falls,
+and `record-world --camera follow:p0` can now point at a person as well as a
+duck. The driver surface a person needs is `G1Walker`'s, named in the
+`add-a-robot` skill.
+
+**But walking a room is not the same as being WATCHABLE in one, and that cost
+three more generic defects — all of them invisible to the suite.** The level-2
+checks above are `record-world` sheets, which are MuJoCo's renderer; the
+browser is a second renderer fed by a JSON mesh dump, and every one of these
+would have hit the next robot too:
+
+* **The dump threw away the model's own normals and inherited the G1's vertex
+  lattice.** Both now read off the model (`extract_visual_scene(normals=True)`,
+  `mjcf_body.visual_vert_scale`) — trap 9 and 10 in the skill. On Asimov the
+  millimetre lattice tilted **74.0 %** of faces past 15 degrees against
+  **0.6 %** at the 10 um his own tessellation asks for; his dump went
+  20.7 → 29.3 MB and he stopped looking melted.
+* **`SimStage.RobotBody` defaulted `look` to `"g1"`.** A second body was
+  therefore drawn through the FIRST one's part table, fell through to its pale
+  shell on every part, and arrived uniform `#d8d8d8` — which reads as a
+  deliberate paint job rather than a missing one. The look is passed now, and
+  `components/AsimovLook.tsx` is his (shells, actuator housings, soles; the
+  split measured off the meshes' bounding boxes, the colours explicitly a look
+  and not the vendor's spec — his MJCF states one grey for all 26 geoms).
+* **The person renderer could not tell "meshes still loading" from "no meshes
+  exist".** Both were "no entry in the map", so a robot scenario opened with
+  the blue capsule placeholder and popped into a robot when the fetch landed.
+  `lib/sim.personDraw` is the three-state rule (`null` = failed, so the capsule
+  stays as the honest fallback; absent = in flight, so nothing is drawn).
+  The gap that leaves is real and worth knowing: **0.3-1.2 s** over eight
+  reads, because his 29.3 MB dump costs the lab 0.26-0.89 s to reach first
+  byte and that varies with what its own 50 Hz loop is doing. Starting
+  the fetch earlier does not fix it — `/world`, all it needs, lands at 0.16 s
+  against the 0.35 s `Promise.all` it currently waits on, and the lab is one
+  event loop, so the saving is ~0.2 s of a ~1 s wait. The lever is the
+  serialisation of tens of megabytes per request, which nothing here caches.
+
+So §7.4's list of what a level-1 body owes needs `visual_scene()` read as
+"and it has to be DRAWN correctly", which is now §7 of the skill.
+
+**Still open:** a legged body enters a room as a PERSON, not as a roster entry
+with senses, brains and its own `eval-*` battery. That is when `WorldRobot`'s
+wheeled assumptions have to be faced, and nothing forces it yet.

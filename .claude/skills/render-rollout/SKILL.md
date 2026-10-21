@@ -264,3 +264,19 @@ That difference is invisible in the reward sums and obvious in the sheet.
   the sheet knowing the twist command is pinned to zero.
 - Implementation: `microduck_local/src/microduck_local/render_rollout.py`;
   helpers locked by `tests/test_render_rollout.py`.
+
+## What a contact sheet CANNOT show
+
+**Stillness.** A sheet samples ~12 frames of an 8 s episode — about 1.4 Hz —
+and jiggle is a 50 Hz phenomenon. The frames of a robot vibrating at
+**2.56 rad/s** look identical to the frames of one holding perfectly still:
+both read `trunk_z=0.63, tilt=1-2 deg, feet L=1 R=1, floor:none`, frame after
+frame. On 2026-10-21 a finished Asimov get-up was reported as held and steady
+off exactly those captions; Jonathan watched the **mp4** and saw it shaking.
+
+So for anything about SMOOTHNESS, rate or vibration, the sheet is the wrong
+instrument and a still image cannot be made into the right one. Either watch
+the video, or print a number: `scripts/score_bands.py` reports `jiggle`
+(mean joint velocity while standing) and `off-idle` (mean |q - DEFAULT_POSE|)
+for this reason. The policy that holds still reads **0.021** and **0.036**;
+the one that shook read **2.47** and **0.184**.
