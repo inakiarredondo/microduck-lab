@@ -133,7 +133,17 @@ def obs_switch_due(o, state) -> bool:
     a = _np.asarray(o)
     up = float(-a[slice(*_W.OBS_GRAVITY)][2])
     jp = a[slice(*_W.OBS_JOINT_POS)]
-    names = list(_W.JOINT_NAMES)
+    # THE OBSERVATION BLOCK IS SLOT-ORDERED, NOT ACTION-ORDERED. This used
+    # `_W.JOINT_NAMES` -- the ACTION order -- to index `jp`, which is written
+    # slot by slot. The two are different permutations of the same 23 joints,
+    # so the "elbow" clause actually read `left_elbow_joint` and
+    # `right_wrist_yaw_joint`, and the "ankle_pitch" clause read
+    # `waist_yaw_joint` and `left_knee_joint`: it never looked at an ankle at
+    # all. The switch still fired, the robot still stood, and the whole thing
+    # scored 24/24 -- which is exactly how a permutation bug survives. With
+    # the right indices the same policy scores 22/24, so the deployable
+    # switch costs 2 of 24 against the privileged test rather than nothing.
+    names = [j for sl in _W.SLOTS for j in sl]
     elbow = max(abs(float(jp[i])) for i, n in enumerate(names) if "elbow" in n)
     ankle = max(abs(float(jp[i])) for i, n in enumerate(names)
                 if "ankle_pitch" in n)

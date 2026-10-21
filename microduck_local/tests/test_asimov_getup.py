@@ -2958,3 +2958,61 @@ def test_every_getup_task_charges_the_ROBOTS_own_costs():
             "and summed nowhere here is recorded onto the run and reported as "
             "set while being worth exactly 0.0."
         )
+
+
+def test_the_deployable_switch_reads_ELBOWS_AND_ANKLES_not_a_permutation():
+    """`obs_switch_due` gates on the elbow and ankle. It must read those.
+
+    The observation's `joint_pos` block is written SLOT by slot; actions,
+    `last_action` and `default_pose` use a DIFFERENT permutation of the same
+    23 joints. This function indexed the slot-ordered block with
+    `JOINT_NAMES` (the action order), so its "elbow" clause actually read
+    `left_elbow_joint` and `right_wrist_yaw_joint`, and its "ankle_pitch"
+    clause read `waist_yaw_joint` and `left_knee_joint` -- it never looked at
+    an ankle.
+
+    It still fired, the robot still stood, and the whole run scored 24/24,
+    which is how a permutation bug survives: nothing errors. With the right
+    indices the same policy scores 23/24, so the claim that the deployable
+    switch "costs nothing" against the privileged test was wrong by one
+    episode in twenty-four.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    import numpy as np
+
+    import microduck_local.robots.asimov_walk as W
+
+    here = Path(__file__).resolve().parent.parent / "scripts"
+    spec = importlib.util.spec_from_file_location(
+        "_ga_switch", here / "getup_acceptance.py")
+    GA = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(GA)
+
+    slot = [j for sl in W.SLOTS for j in sl]
+    lo = W.OBS_JOINT_POS[0]
+
+    def frame(joint: str, value: float) -> np.ndarray:
+        o = np.zeros(W.OBS_DIM, np.float32)
+        o[W.OBS_GRAVITY[0] + 2] = -1.0          # perfectly upright
+        o[lo + slot.index(joint)] = value
+        return o
+
+    def fires(o) -> bool:
+        st = {"n": 0}
+        return any(GA.obs_switch_due(o, st) for _ in range(GA.OBS_DWELL + 2))
+
+    # A bent ELBOW means propped on the forearms -- refuse.
+    assert not fires(frame("left_elbow_joint", GA.OBS_ELBOW + 0.2)), (
+        "a bent elbow must block the handoff; it is the state that fools an "
+        "IMU into reading upright")
+    # A cocked ANKLE likewise. Under the permutation bug this slot was never
+    # read at all, so this is the assertion that catches it.
+    assert not fires(frame("right_ankle_pitch_joint", GA.OBS_ANKLE + 0.2)), (
+        "a cocked ankle must block the handoff; the buggy version read "
+        "waist_yaw and left_knee for this clause and never saw an ankle")
+    # A rotated WRIST is not a gate, and the buggy version refused on it.
+    assert fires(frame("right_wrist_yaw_joint", 1.0)), (
+        "a wrist rotation must NOT block the handoff; the buggy version "
+        "read it as an elbow")

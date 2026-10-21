@@ -746,6 +746,41 @@ uv run scripts/infer_policy.py --walking ../microduck_local/runs/my-run/policy.o
   Expected: 78`. An ONNX driver now feeds each model the width it DECLARES,
   taking the newest frame — which is exactly what the on-device ring
   buffer's head holds.
+- **THIS ROBOT HAS TWO JOINT ORDERS, and conflating them is invisible: the
+  policy still acts, the robot still moves.** Actions, `last_action`,
+  `default_pose` and the MJCF actuators are in `JOINT_NAMES` order; the
+  observation's `joint_pos_rel` and `joint_vel` blocks are written SLOT by
+  slot (`[j for sl in SLOTS for j in sl]`). They are different permutations
+  of the same 23 joints. It bit three separate places in one session —
+  a published policy spec, the standalone runner, and
+  `getup_acceptance.obs_switch_due`, which indexed the slot-ordered block
+  with `JOINT_NAMES` so its "elbow" clause read `left_elbow_joint` and
+  **`right_wrist_yaw_joint`** while its "ankle_pitch" clause read
+  **`waist_yaw_joint`** and **`left_knee_joint`**. It never looked at an
+  ankle. It fired anyway, the robot stood, and the run scored **24/24** —
+  and that 24/24 was published as "the deployable switch costs nothing".
+  With the right indices it is **23/24**, so the claim was wrong by an
+  episode, and the number that was wrong was the one being boasted about.
+  Jonathan asked "are you 100 % sure" and the answer was no.
+  **`robots/asimov_openhorizon.py` shows the discipline that works**: it
+  asserts `obs_joint_order == slot_order()` AND
+  `action.joint_order == JOINT_NAMES` and RAISES on either, so a drift is a
+  crash rather than a plausible number. Copy that, not a comment.
+  `test_the_deployable_switch_reads_ELBOWS_AND_ANKLES_not_a_permutation`
+  pins it by feeding a bent elbow, a cocked ankle and a rotated wrist and
+  checking which block the gate.
+- **An independent re-scorer is worth writing, and its first answer is
+  usually its own bug.** Re-scoring the published get-up from raw physics
+  disagreed with the card (22/24 vs 24/24) — and the first version of that
+  scorer had guessed an elbow index that was actually
+  `right_ankle_pitch_joint`. Had I published the disagreement then, I would
+  have retracted a correct headline using a broken instrument; had I
+  dismissed it, I would have kept a wrong claim. The rule is to fix the
+  instrument until it is derived from the SPEC rather than guessed, THEN
+  believe its disagreement — at which point both scorers agreed at 22/24
+  and pointed straight at `obs_switch_due`. Verify a published artefact by
+  downloading it BACK and scoring the bytes you shipped: the sha256 match
+  is what made it certain the discrepancy was in the scorer, not the upload.
 - **A deliverable attached PER-BEHAVIOR is a deliverable that depends on
   which of seventeen near-identical entries a run happened to name.** The
   Asimov's get-up is only finished when it hands to Menlo's walker and stops
