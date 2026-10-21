@@ -793,6 +793,45 @@ than a table, so any body declaring `Body.driver()` can walk a room with no
 edit to the world. Keep its `speed` near 0.25 m/s if you want the ducks to
 keep up: at 0.5 it outruns them.
 
+### ...and it gets up off the floor
+
+Trained here, from scratch — no distillation, no imitation loss, no weights
+from any other get-up. From face down, under Menlo's published speed-torque
+envelope, handing to their own walk policy once it is up:
+
+| start | rises | still standing at 8 s |
+|---|---|---|
+| prone | **24/24** | **24/24** |
+| supine | 15/24 | 15/24 |
+
+Published as
+[JonathanHawkins/asimov1-getup-handoff](https://huggingface.co/JonathanHawkins/asimov1-getup-handoff)
+with the spec, a self-contained MuJoCo runner and a rendered episode.
+
+```bash
+uv run python scripts/getup_acceptance.py <run> --episodes=24 --pose=prone --handoff
+uv run python scripts/score_bands.py <run> --episodes 8 --floor
+uv run render-rollout --policy runs/<run>/policy.onnx \
+    --handoff .cache/asimov_1/policy/policy.onnx \
+    --env MICRODUCK_ASIMOV_GETUP_POSE=prone --camera three-quarter --out /tmp/rr
+```
+
+**The handoff is half the deliverable, not a flourish.** Left in control after
+standing, the get-up policy keeps acting and its worst joint runs **252 deg/s**;
+handing to the walker drops that to **2.3 deg/s** with no rises lost. Nine
+reward terms aimed at the same problem were nulls — the plant does not buzz
+(zero action standing reads **0.000 rad/s**), so the twitch was the controller,
+not the physics. The switch reads only projected gravity and two encoder
+channels, so it could run on hardware; it costs nothing against a privileged
+test that uses trunk height and contacts.
+
+**Four honest limits.** It reads **390 floats** (5 stacked frames of their 78),
+so it will not hot-swap or load in Menlo's viewer and needs an on-device ring
+buffer — and the history is load-bearing, **0/48** frozen to one frame against
+48/48. It **requires** the `dc` envelope: under a flat clamp the same weights
+fall to 14/24 rises and 6/24 stays. The stance is wide, median peak foot span
+**0.888 m** against a natural 0.215. And **nothing here has run on an Asimov**.
+
 Adding your own robot: `.claude/skills/add-a-robot/SKILL.md` is the route, the
 settling number for each step and the traps hit doing this one.
 

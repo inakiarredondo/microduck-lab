@@ -715,6 +715,21 @@ def build_env(behavior_id: str, env_overrides: dict[str, str], seed: int,
         start = env_overrides.get("MICRODUCK_ASIMOV_GETUP_START")
         if start:
             kw["start_phase"] = start
+        # ...and the POSE, which had no route into `kw` at all. `--env` only
+        # writes `os.environ` here, so `--env getup_label=prone` set a shell
+        # variable nothing reads and the render silently used the run's
+        # recorded rung instead. For a route-rung get-up that rung starts the
+        # Asimov at trunk z 0.285, uprightness +0.49, FEET ONLY on the floor
+        # -- a deep crouch. On 2026-10-21 a clip of exactly that was
+        # captioned "face down -> up" and sent to Jonathan as a floor
+        # get-up; a genuine `prone` reset is trunk z 0.093, uprightness
+        # -0.09, with head, both forearms, a shin and a thigh down.
+        #
+        # Naming a pose also DROPS the rung (below), because `route:LO,HI`
+        # samples its own starts and never consults `getup_label`.
+        pose = env_overrides.get("MICRODUCK_ASIMOV_GETUP_POSE")
+        if pose:
+            kw["getup_label"] = pose
         # Turn off the things that make a render IRREPRODUCIBLE (sensor noise,
         # domain randomisation, a random spawn yaw) but keep the ones that are
         # part of the DYNAMICS the policy trained under. `action_delay` is the
@@ -734,6 +749,21 @@ def build_env(behavior_id: str, env_overrides: dict[str, str], seed: int,
         from .run_record import replay_kwargs
         rec = replay_kwargs(run_dir) if run_dir is not None else {}
         rec.pop("task", None)              # the caller already resolved it
+        # AN EXPLICIT POSE MUST DROP THE RECORDED RUNG. A `start_rung` of
+        # `route:LO,HI` samples its own start states and never consults
+        # `getup_label`, so `--env getup_label=prone` on a route-rung run
+        # renders the ROUTE distribution instead -- which starts the Asimov
+        # at trunk z 0.285, uprightness +0.49, with only its FEET on the
+        # floor. That is a deep crouch, and on 2026-10-21 a clip of it was
+        # captioned "face down -> up" and sent to Jonathan as a get-up. A
+        # genuine `prone` reset is trunk z 0.093, uprightness -0.09, with
+        # head, both forearms, a shin and a thigh down.
+        #
+        # Third instance of this shape in one session (`getup_acceptance`
+        # silently returned byte-identical numbers for prone and supine;
+        # `score_bands` pops the rung and was the only one that was right).
+        if kw.get("getup_label"):
+            rec.pop("start_rung", None)
         kw = {**rec, **kw}                 # an explicit --seconds still wins
         return env_class(robot, task)(obs_noise=False, domain_rand=False,
                                       random_yaw=False,

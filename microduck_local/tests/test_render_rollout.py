@@ -295,3 +295,52 @@ def test_an_onnx_driver_feeds_each_model_the_width_it_DECLARES():
     stacked = np.zeros(390, np.float32)       # 5 frames of their 78
     out = drv.fn(stacked, None)
     assert out.shape == (23,), out.shape
+
+
+def test_naming_a_POSE_actually_starts_on_the_floor():
+    """`--env MICRODUCK_ASIMOV_GETUP_POSE=prone` must reach the env.
+
+    Two faults stacked here, and together they put a clip of the wrong thing
+    in front of Jonathan captioned as a get-up:
+
+    * `--env` only writes `os.environ` for a non-duck body, and `build_env`
+      translated just two keys into kwargs -- so `--env getup_label=prone`
+      set a shell variable nothing reads. A silent no-op.
+    * even once the label lands, a recorded `start_rung` of `route:LO,HI`
+      samples its own start states and never consults it.
+
+    The route distribution starts the Asimov at trunk z ~0.285, uprightness
+    ~+0.49, with only its FEET on the floor -- a deep crouch. A genuine
+    `prone` reset is trunk z ~0.09, uprightness ~-0.09, with head, both
+    forearms, a shin and a thigh down. Scoring one and reporting the other
+    is the difference between "it gets up off the floor" and "it stands up
+    from a squat".
+    """
+    from pathlib import Path
+
+    import numpy as np
+
+    from microduck_local import render_rollout as RR
+
+    runs = Path("runs")
+    run = next((d for d in sorted(runs.glob("teach-asimov_getup*"))
+                if (d / "run.json").is_file()
+                and "route:" in (d / "run.json").read_text()), None)
+    if run is None:
+        pytest.skip("no route-rung asimov get-up run on this machine")
+
+    env = RR.build_env("", {"MICRODUCK_ASIMOV_GETUP_POSE": "prone"}, seed=0,
+                       robot="asimov1", task="getup", run_dir=run)
+    try:
+        zs = []
+        for s in range(4):
+            env.reset(seed=400 + s)
+            zs.append(float(env.data.xpos[env.trunk_body_id][2]))
+    finally:
+        env.close()
+    z = float(np.mean(zs))
+    assert z < 0.20, (
+        f"naming a pose gave a mean start trunk z of {z:.3f} m; a floor "
+        "reset is ~0.09 and the route rung's crouch is ~0.285, so the pose "
+        "did not reach the env"
+    )

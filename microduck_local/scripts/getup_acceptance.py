@@ -245,6 +245,23 @@ def main(runs):
         # used one).
         if POSE:
             kw["getup_label"] = POSE
+            # ...AND DROP THE RUNG, or the label is silently ignored. A
+            # `start_rung` of `route:LO,HI` samples its own start states and
+            # never consults `getup_label`, so on 2026-10-21
+            # `--pose=prone` and `--pose=supine` returned BYTE-IDENTICAL
+            # numbers for a run recording `route:0.04,0.44` -- both were the
+            # route distribution. That distribution starts the robot at
+            # trunk z **0.285, uprightness +0.49, with only its FEET on the
+            # floor**: a deep crouch, not a fall. A genuine `prone` reset is
+            # trunk z **0.093, uprightness -0.09**, with head, both
+            # forearms, a shin and a thigh down.
+            #
+            # So every `span_m` / `home_deg` / `recovers` figure this script
+            # printed for a route-rung run described a CROUCH-to-stand and
+            # was about to be published as a get-up. `scripts/score_bands.py`
+            # pops the rung before setting the label, which is why its floor
+            # rows disagreed -- the disagreement was the tell.
+            kw.pop("start_rung", None)
         if ACTUATOR:
             kw["actuator_force"] = ACTUATOR
         kw.setdefault("limit_cost", 1.0)
