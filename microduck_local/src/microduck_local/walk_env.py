@@ -222,10 +222,24 @@ def shared_model_scope(exclusive: bool = True):
         _MODEL_SCOPE.reset(token)
 
 
+#: How much wider the gym action space is than the applied clip — see the
+#: action_space comment in `__init__`.
+ACTION_SPACE_SLACK = 4.0
+
+
 class MicroduckWalkEnv(gym.Env):
     """Velocity-command walking, rewards distilled from the mjlab velocity recipe."""
 
     metadata = {"render_modes": []}
+
+    #: The body's own speed-torque envelope, for `actuator='dc'` — a class
+    #: with `(model, data)` and a `before_step()`, called before every physics
+    #: substep. None means this body's vendor publishes no peak torque or
+    #: rated speed, and `actuator='dc'` is REFUSED rather than approximated:
+    #: a curve nobody published is a guess about somebody's hardware.
+    #: `robots/asimov_env.AsimovWalkEnv` sets it to
+    #: `robots/asimov_motor.DcMotorClip`.
+    MOTOR_MODEL_CLS = None
 
     # Reward weights. Convention (mirrors AGENTS.md): *_penalty terms are
     # self-negating (the term function returns <= 0) and carry POSITIVE
@@ -276,6 +290,7 @@ class MicroduckWalkEnv(gym.Env):
         zero_command_prob: float = 0.02,
         turn_in_place_prob: float = 0.15,   # GPU TURN_IN_PLACE_FRACTION
         forward_command_prob: float = 0.2,  # mjlab rel_forward_envs (silent in velocity cfg)
+        action_clip: float | None = None,
         obs_noise: bool = True,
         domain_rand: bool = True,
         action_delay: bool = True,
@@ -349,9 +364,12 @@ class MicroduckWalkEnv(gym.Env):
             actuator_force if actuator_force is not None
             else os.environ.get("MICRODUCK_ACTUATOR", actuator)
         ).strip().lower()
-        if self.actuator_model not in ("xml", "bam"):
+        if self.actuator_model not in ("xml", "bam", "dc"):
             raise ValueError(
-                f"actuator must be 'xml' or 'bam', got {self.actuator_model!r}"
+                "actuator must be 'xml' (the MJCF's own servos), 'bam' (the "
+                "duck's XL330 model) or 'dc' (a speed-torque envelope the "
+                "body supplies via MOTOR_MODEL_CLS), got "
+                f"{self.actuator_model!r}"
             )
         # A model handed in explicitly is the caller's business (they promise it
         # is this scene). Otherwise an enclosing shared_model_scope() decides
@@ -542,8 +560,39 @@ class MicroduckWalkEnv(gym.Env):
 
         self.observation_space = gym.spaces.Box(
             -np.inf, np.inf, (self.robot.obs_dim,), np.float32)
+        #: How far from `DEFAULT_POSE` this env lets the policy command. The
+        #: body's own value unless a TASK overrides it, and it must be ONE
+        #: attribute because there are three clip sites — this action space
+        #: (SB3 clips to it in `collect_rollouts` before `step` ever sees the
+        #: action), `step` below, and the reset pose. A per-env override that
+        #: reached only the third read as "the clip does not matter": the
+        #: `getup_clip` A/B at 13.0 came back BYTE-IDENTICAL to the one at 4.0,
+        #: because `step` was still clipping at `self.robot.action_clip`. The
+        #: teacher it is cloning needs more than 4.0 on 15.5 % of its frames.
+        self._act_clip = float(action_clip if action_clip is not None
+                               else self.robot.action_clip)
+        #: The SPACE is deliberately wider than the clip, and that is what makes
+        #: this env able to see what the policy asked for.
+        #:
+        #: SB3 clips every action to the action space before `step` ever runs
+        #: (`on_policy_algorithm.collect_rollouts`: `clipped_actions =
+        #: np.clip(actions, low, high)`, then `env.step(clipped_actions)`). So
+        #: with a space equal to the clip, `last_action` is the CLIPPED value
+        #: during training no matter what the network emitted — and the comment
+        #: in `step` about pricing unbounded growth describes a mechanism that
+        #: could not operate. Measured: a 6 M-step run's exported deterministic
+        #: policy reached a per-step max output of **2055** while
+        #: `over_clip_penalty` recorded **0.0** for the entire run, and an added
+        #: out-of-clip penalty was a DEAD HOOK — the arm of the A/B that had it
+        #: produced a byte-identical policy to the arm that did not.
+        #:
+        #: Widening the space lets the raw value through to the env, which still
+        #: clips what it APPLIES. The slack is 4x because the measured runaway
+        #: was ~150x the clip: the point is to see growth starting, not to
+        #: bound it here.
         self.action_space = gym.spaces.Box(
-            -self.robot.action_clip, self.robot.action_clip, (self.nj,), np.float32)
+            -self._act_clip * ACTION_SPACE_SLACK,
+            self._act_clip * ACTION_SPACE_SLACK, (self.nj,), np.float32)
 
         self._rng = np.random.default_rng(seed)
         # Class constants stay the duck's documented defaults; a spec that
@@ -555,6 +604,35 @@ class MicroduckWalkEnv(gym.Env):
         self._pose_ids = (self.robot.pose_joint_ids
                           if self.robot.pose_joint_ids is not None
                           else np.arange(self.nj))
+
+        #: A per-SUBSTEP actuator hook, or None. `actuator='dc'` fills it from
+        #: this class's `MOTOR_MODEL_CLS`, which a BODY declares — the duck
+        #: has no speed-torque publication and must not silently get an
+        #: invented one, so the base refuses rather than running unlimited
+        #: under a name that says otherwise. ("Make a silent discard loud.")
+        self._motor = None
+
+        if self.actuator_model == "dc":
+            cls = self.MOTOR_MODEL_CLS
+            if cls is None:
+                raise ValueError(
+                    f"actuator='dc' needs a speed-torque envelope and "
+                    f"{type(self).__name__} declares no MOTOR_MODEL_CLS. "
+                    "Only a body whose vendor PUBLISHES peak torque and "
+                    "rated speed can have one (Asimov does: see "
+                    "robots/asimov_motor); inventing the curve would be a "
+                    "guess about somebody's hardware.")
+            if self._model_shared:
+                # Same reason as BAM below: it rewrites actuator_forcerange
+                # every substep from THIS env's qvel, so siblings sharing one
+                # mjModel would clamp each other's torques.
+                raise ValueError(
+                    "actuator='dc' cannot share an mjModel with sibling envs "
+                    "in the same process (it rewrites actuator_forcerange "
+                    "every substep). Use the fork-based vec env, or drop "
+                    "shared_model_scope(exclusive=False)."
+                )
+            self._motor = cls(self.model, self.data)
 
         self.bam = None
         if self.actuator_model == "bam":
@@ -826,7 +904,7 @@ class MicroduckWalkEnv(gym.Env):
         self.last_action = raw.copy()
         # ndarray.clip is the exact call np.clip dispatches to (fromnumeric's
         # _wrapfunc), minus two wrapper layers.
-        clip = self.robot.action_clip
+        clip = self._act_clip
         action = raw.clip(-clip, clip)
 
         # Per-episode 0/1-step command delay, as the BAM DR models on the bus.
@@ -838,8 +916,17 @@ class MicroduckWalkEnv(gym.Env):
         self._write_ctrl(self.robot.scale_action(applied))
 
         if self.bam is None:
-            for _ in range(C.DECIMATION):
-                mujoco.mj_step(self.model, self.data)
+            motor = self._motor
+            if motor is None:
+                for _ in range(C.DECIMATION):
+                    mujoco.mj_step(self.model, self.data)
+            else:
+                # PER SUBSTEP, not per control step: this is where upstream's
+                # own runner recomputes the envelope, and 5 ms of a 1.2 m
+                # robot falling is ~40 mrad of hip travel.
+                for _ in range(C.DECIMATION):
+                    motor.before_step()
+                    mujoco.mj_step(self.model, self.data)
         else:
             # ctrl above still carries the position target (readable by viz /
             # debug code) but drives nothing: the BAM path neutralizes the MJCF

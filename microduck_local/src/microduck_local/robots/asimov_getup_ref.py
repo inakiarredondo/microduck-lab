@@ -1021,6 +1021,51 @@ def fall_path(dest=None):
     return _P(dest or _asimov.CACHE_DIR) / "fall_states.npz"
 
 
+def route_states(lo: float = 0.0, hi: float = 9.9, dest=None):
+    """States a FEASIBLE get-up passes through, filtered to a trunk band.
+
+    The authored waypoints do not sample the route that works. Per-foot CoM
+    distance is 0.577 at `pike` and 0.137 at `fold` with nothing between, and
+    uprightness goes to -0.37 at `pike` -- face down. Twelve reward economies
+    and a 4x budget all failed to cross that.
+
+    The vendor's shipped policy, however, rises **12/12 from prone in this
+    env under the real `dc` envelope**, and its route is different in kind:
+    uprightness stays POSITIVE throughout (+0.19 -> +1.00), both feet are
+    down by 1.0 s, and the per-foot distance closes GRADUALLY and
+    monotonically (0.651 -> 0.115) through a wide stance that narrows only at
+    the end. So the continuum exists and the reference misses it. Harvested
+    by `scripts/harvest_route_states.py`, the bands are monotone in both
+    quantities: trunk 0.50-0.60 upright +0.93 per-foot 0.346; 0.40-0.50 +0.73
+    / 0.417; 0.30-0.40 +0.48 / 0.482; 0.20-0.30 +0.47 / 0.505; 0.00-0.20
+    +0.38 / 0.53-0.57.
+
+    ONLY `qpos`/`qvel` are taken -- geometry the body demonstrably passes
+    through, from episodes that actually ended standing. No actions, no
+    observations, no distillation: a policy started here learns its own
+    actions from scratch, and the demonstration only supplies the question
+    "can you recover from this state?".
+    """
+    import numpy as _np
+
+    from . import asimov as _a
+
+    path = dest or (_a.CACHE_DIR / "route_states.npz")
+    if not _P(str(path)).is_file():
+        raise RuntimeError(
+            f"{path} missing — run scripts/harvest_route_states.py first")
+    d = _np.load(str(path))
+    z = _np.asarray(d["trunk_z"])
+    sel = (z >= lo) & (z < hi)
+    if not sel.any():
+        raise RuntimeError(
+            f"no route states in trunk band [{lo}, {hi}) — the cache spans "
+            f"{z.min():.3f}..{z.max():.3f} m")
+    return {"qpos": _np.asarray(d["qpos"])[sel],
+            "qvel": _np.asarray(d["qvel"])[sel],
+            "trunk_z": z[sel]}
+
+
 def fall_states(dest=None, rebuild: bool = False):
     """States the robot passes through FALLING from `fold` toward `pike`.
 

@@ -112,7 +112,34 @@ def main() -> None:
         os.environ["MICRODUCK_RUN_CMD"] = str(args.cmd)
 
     if robot != "microduck":
+        from .run_record import replay_kwargs
         from .train import env_class
+        # A policy trained for a NON-WALK task is not a walker, and scoring it
+        # here would build the walking env and print a gait's numbers off a
+        # get-up. That is the same mistake this file already refuses for a
+        # wheeled body, one level down: the body is legged, so the kind check
+        # above passes, and nothing then asked what the policy was FOR.
+        #
+        # It is the class of bug that had the lab previewing every Asimov
+        # get-up from the wrong pose and `render-rollout` ignoring the run
+        # entirely — a consumer building an env without asking the run what it
+        # trained under. `run_record.replay_kwargs` is where that question
+        # lives now.
+        rec = replay_kwargs(args.onnx_path)
+        rec_task = str(rec.get("task") or "walk")
+        if rec_task not in ("walk", ""):
+            raise SystemExit(
+                f"eval-walk scores a GAIT, and this policy's run records "
+                f"task={rec_task!r}. Scoring it here would build the WALKING "
+                f"env — a different robot from the one it trained in — and "
+                f"print falls and twist-tracking off it.\n"
+                f"    look at it:  uv run render-rollout --robot {robot} "
+                f"--policy {args.onnx_path}\n"
+                f"    score it:    uv run python scripts/getup_report.py "
+                f"<run dir>" if rec_task.startswith("getup") else
+                f"eval-walk scores a GAIT, and this policy's run records "
+                f"task={rec_task!r}. Use the tool for that task, or "
+                f"`render-rollout --policy …` to look at it.")
         kw = dict(seed=args.seed, push_robot=args.push)
         env = env_class(robot)(**kw)
     elif args.behavior:

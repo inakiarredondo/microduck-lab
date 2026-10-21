@@ -341,3 +341,193 @@ def test_a_cleared_pick_is_not_served_as_one(runs):
     R.write_record(d, pick=True)
     R.write_record(d, pick=False)
     assert "pick" not in _entry(V.discover_policies(), "cleared")
+
+
+def test_a_stopped_run_does_not_keep_its_half_written_snapshot(tmp_path):
+    """`POST /teach/stop` SIGTERMs the trainer, and Python runs NO cleanup on
+    SIGTERM — not `finally`, not `except`, not `atexit`. `_snapshot` writes
+    each artefact to a temp name and `os.replace`s it, so a stage killed
+    between the two keeps the temp forever. Measured 2026-10-06: stopping one
+    stage left `teach-asimov_getup-07942a-s4/model.tmp` at 5,018,382 bytes
+    with no `model.zip` beside it, and every stopped job would leave one.
+
+    The writer cannot fix this however it is written, which is why the sweep
+    is the fix and lives where something outlives the kill.
+    """
+    run = tmp_path / "teach-stopped-s4"
+    run.mkdir()
+    for name in R.SNAPSHOT_TMPS:
+        (run / name).write_bytes(b"half a checkpoint")
+    keep = run / "live.onnx"            # the last GOOD snapshot
+    keep.write_bytes(b"a real policy")
+
+    gone = R.sweep_snapshot_tmps(run)
+
+    assert sorted(gone) == sorted(R.SNAPSHOT_TMPS)
+    assert not any((run / n).exists() for n in R.SNAPSHOT_TMPS)
+    assert keep.read_bytes() == b"a real policy", (
+        "the sweep must not touch the finished artefacts beside the temps"
+    )
+
+
+def test_the_sweep_leaves_a_temp_ANOTHER_process_may_be_writing(tmp_path):
+    """The complement of the filter, which is the half worth checking.
+
+    `write_record` makes its temp with `tempfile.mkstemp`, so the name carries
+    a random infix and a concurrent writer may have one open RIGHT NOW — in
+    this repo the lab and a trainer write the same run's record. A `*.tmp`
+    glob in the sweep would therefore be a race that destroys a record
+    mid-write, so the sweep names its three files explicitly.
+    """
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "model.tmp").write_bytes(b"stale")
+    live = run / f"{R.RECORD_NAME}.a1b2c3.tmp"      # a mkstemp name, in flight
+    live.write_bytes(b"being written")
+
+    gone = R.sweep_snapshot_tmps(run)
+
+    assert gone == ["model.tmp"]
+    assert live.exists(), (
+        "a record temp carries a random infix and may be open in another "
+        "process — the sweep must not glob *.tmp"
+    )
+
+
+def test_the_sweep_covers_EVERY_temp_the_trainers_WRITE(tmp_path):
+    """One name list, or the sweep silently stops covering one.
+
+    Three trainers write snapshot temps (train.py, train_behavior.py,
+    train_brain.py). If any of them adds or renames one and
+    `SNAPSHOT_TMPS` is not updated, nothing fails — the stale file just
+    accumulates again. So the names are compared against the source.
+    """
+    import re
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1] / "src" / "microduck_local"
+    written: set[str] = set()
+    for mod in ("train.py", "train_behavior.py", "train_brain.py"):
+        src = (root / mod).read_text()
+        # the literal temp names each trainer saves to, e.g. "model.tmp"
+        written |= {m for m in re.findall(r'"([A-Za-z0-9_.]+\.tmp)"', src)}
+    assert written, "no temp names found — did the writers change shape?"
+    missing = written - set(R.SNAPSHOT_TMPS)
+    assert not missing, (
+        f"these temps are written but never swept: {sorted(missing)} — add "
+        f"them to run_record.SNAPSHOT_TMPS"
+    )
+
+
+def test_the_lab_sweeps_when_the_TRAINER_EXITS_not_when_it_finishes_cleanly():
+    """The stale temp is left by a STOP, so a sweep gated on success misses
+    exactly the case it exists for. It must also run before
+    `_advance_stage()` rebinds `self.dir` to the next stage's directory.
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(V.TrainingJob)
+    tree = ast.parse("class _C:\n" + "\n".join(
+        "    " + ln for ln in src.splitlines()[1:]))
+    sweeps = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call)
+              and getattr(n.func, "attr", "") == "sweep_snapshot_tmps"]
+    assert sweeps, "the lab must clear a dead trainer's temps"
+    advance = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "_advance_stage"]
+    assert min(n.lineno for n in sweeps) < min(n.lineno for n in advance), (
+        "sweep before _advance_stage, or it cleans the NEXT stage's directory"
+    )
+    # ...and it must not sit INSIDE the clean-exit guard. Checked on the
+    # tree, not on the text: the first spelling of "sweep_snapshot_tmps" in
+    # this method is in a COMMENT, so a `src.index` comparison found the
+    # prose, read as passing, and let a planted regression through — the same
+    # dead-guard shape as the `_mde` units mismatch in verify_run.py.
+    def mentions_done_record(node: ast.expr) -> bool:
+        return any(isinstance(n, ast.Name) and n.id == "done_record"
+                   for n in ast.walk(node))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If) or not mentions_done_record(node.test):
+            continue
+        inside = [n for b in node.body for n in ast.walk(b)
+                  if isinstance(n, ast.Call)
+                  and getattr(n.func, "attr", "") == "sweep_snapshot_tmps"]
+        assert not inside, (
+            "the sweep is inside a `done_record` guard: a sweep gated on a "
+            "clean exit misses the STOP, which is the only case that leaves "
+            "a temp behind"
+        )
+
+
+def test_every_trainer_clears_stale_temps_at_the_START_of_a_run():
+    """A CLI run has no lab watching it exit, and a resumed directory would
+    carry a previous kill's temp forward. All three trainers sweep at start.
+    """
+    from pathlib import Path as _Path
+
+    root = _Path(__file__).resolve().parents[1] / "src" / "microduck_local"
+    for mod in ("train.py", "train_behavior.py", "train_brain.py"):
+        src = (root / mod).read_text()
+        assert "sweep_snapshot_tmps(out)" in src, (
+            f"{mod} must clear a previous interrupted run's temps before it "
+            f"starts writing into the same directory"
+        )
+
+
+def test_the_lab_sweeps_a_STOPPED_stage_whose_status_is_no_longer_training(tmp_path):
+    """The sweep must not be gated on `status == "training"`.
+
+    This is the mistake, caught live on 2026-10-06 after it had already been
+    written, tested and reported as working. The obvious home for the sweep is
+    the `poll()` branch that handles a trainer exiting — and that branch reads
+    `if self.proc.poll() is not None and self.status == "training"`, while
+    `stop()` sets `"stopped"` BEFORE the process exits, deliberately, because
+    that is what keeps poll() from chaining the next stage. So the sweep sat
+    in a branch a stop can never enter, and a stop is the ONLY thing that
+    leaves a temp behind: planted `model.tmp` and `live.onnx.tmp` survived a
+    real `/teach/stop` untouched, in a run with no `model.zip`, so nothing
+    else could have taken them either.
+
+    Driven through `poll()` on a stub rather than live, because live the
+    trainer's own 25 k-step snapshot keeps winning the race and
+    `os.replace`ing the planted temps away — three live attempts in a row
+    were inconclusive for that reason, and two of them looked like passes.
+    """
+    import subprocess
+    from types import SimpleNamespace
+
+    run = tmp_path / "teach-stopped-s1"
+    run.mkdir()
+    for name in R.SNAPSHOT_TMPS:
+        (run / name).write_bytes(b"half a checkpoint")
+
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    job = SimpleNamespace(
+        dir=run, proc=dead, _swept=set(), run_name="teach-stopped-s1",
+        status="stopped",          # <- what stop() set, before the exit
+        restarting=False, progress={}, _offset=0, _live_mtime=0.0,
+        _fps_points=[],
+        # poll() falls through to _snapshot_workers() for a job whose exit
+        # branch it skips — which is the whole point here, so stub it.
+        _snapshot_workers=lambda: [],
+    )
+
+    V.TrainingJob.poll(job)
+
+    assert not any((run / n).exists() for n in R.SNAPSHOT_TMPS), (
+        "a stopped stage's half-written snapshot must be cleared — a sweep "
+        "reachable only while status == 'training' never runs on a stop"
+    )
+    assert job._swept == {str(run)}, "and it must record that it swept"
+
+    # Idempotent: a stopped job keeps being polled every tick.
+    (run / "model.tmp").write_bytes(b"written again, somehow")
+    V.TrainingJob.poll(job)
+    assert (run / "model.tmp").exists(), (
+        "keyed by directory, so a dir is swept once — a second sweep would "
+        "race any later writer"
+    )

@@ -75,6 +75,8 @@ _BUILTINS: tuple[_Builtin, ...] = (
              setup_hint="uv run fetch-robot mars"),
     _Builtin(id="moss", module=".moss", attr="MOSS",
              setup_hint="uv run fetch-robot moss"),
+    _Builtin(id="asimov1", module=".asimov", attr="ASIMOV1",
+             setup_hint="uv run fetch-robot asimov1"),
 )
 
 #: Id namespaces whose bodies are DISCOVERED from a cache: `{prefix: module}`,

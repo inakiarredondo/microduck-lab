@@ -6,12 +6,12 @@ import math
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from microduck_local.brain.moss_search import ObjectMemory, Patrol, area_from_world
+from microduck_local.robots import moss
 from microduck_local.sensors.detector import Detection, DetectionFrame
 from microduck_local.world.scenario import Wall
-
-import pytest
-from microduck_local.robots import moss
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),

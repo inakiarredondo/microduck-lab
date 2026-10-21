@@ -461,10 +461,54 @@ def extract_scene() -> dict:
             "mat": m.material(mat_id).name if mat_id >= 0 else "",
             "rgba": [round(float(x), 4) for x in rgba],
         })
+    # HOME: every body's world transform at the rest keyframe, so a consumer
+    # can draw this robot STANDING STILL without a frame stream. The /sim
+    # page's duck FIGURINE is the one that needs it (`scenario.Prop.look`):
+    # a figurine is the real robot's CAD posed once and frozen, and without
+    # these the viewer would have every body at the origin in a heap.
+    #
+    # `bbox` is that posed robot's extent from real mesh vertices, which is
+    # what a figurine is scaled and seated by — its feet on the floor, its
+    # body on the prop's axis. Measured here rather than in the viewer so the
+    # browser and `world/compose.py _duck_figurine` seat it identically.
+    d = mujoco.MjData(m)
+    if m.nkey:
+        mujoco.mj_resetDataKeyframe(m, d, 0)
+    else:
+        mujoco.mj_resetData(m, d)
+    mujoco.mj_forward(m, d)
+    home = []
+    for b in range(m.nbody):
+        q = np.zeros(4)
+        mujoco.mju_mat2Quat(q, d.xmat[b])
+        home.append({"pos": [round(float(v), 5) for v in d.xpos[b]],
+                     "quat": [round(float(v), 5) for v in q]})
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    for i in range(m.ngeom):
+        if (m.geom_type[i] != mujoco.mjtGeom.mjGEOM_MESH
+                or m.geom_group[i] not in (2, MOUTH_GROUP)):
+            continue
+        mid = int(m.geom_dataid[i])
+        va, vn = int(m.mesh_vertadr[mid]), int(m.mesh_vertnum[mid])
+        w = m.mesh_vert[va:va + vn] @ d.geom_xmat[i].reshape(3, 3).T + d.geom_xpos[i]
+        lo, hi = np.minimum(lo, w.min(0)), np.maximum(hi, w.max(0))
     return {
         "bodies": [m.body(b).name for b in range(m.nbody)],
         "meshes": meshes,
         "geoms": geoms,
+        "home": home,
+        # [centre x, centre y, FLOOR z] and the standing height, metres
+        "bbox": {"origin": [round(float((lo[0] + hi[0]) / 2), 5),
+                            round(float((lo[1] + hi[1]) / 2), 5),
+                            round(float(lo[2]), 5)],
+                 "height": round(float(hi[2] - lo[2]), 5)},
+        # How big this robot IS, for a camera — measured the one way every
+        # body's is (`measured_size`), which is NOT the visual-mesh box above:
+        # the two disagree by 5 % on the duck's height and 28 % on its width,
+        # and a shot that framed the duck by one and the Asimov by the other
+        # would be two different framings wearing one name.
+        "size": measured_size("microduck"),
     }
 
 
@@ -486,7 +530,59 @@ def robot_scene(robot: str) -> dict:
     if not _ready(body):
         hint = _registry.setup_hint(robot) or f"uv run fetch-robot {robot}"
         raise FileNotFoundError(f"{robot} assets missing — run `{hint}`")
-    return body.visual_scene()
+    size = measured_size(robot)
+    return {**body.visual_scene(), **({"size": size} if size else {})}
+
+
+def measured_size(robot: str) -> dict | None:
+    """`{height, width}` — how big this body is, metres, for a CAMERA.
+
+    One measurement, one definition, every body: the whole robot's geom AABBs
+    in world axes at its own stand keyframe (`robots/body.measure_extent_m`).
+    Nothing in a scene dump answers this today — the duck's `bbox` is its
+    VISUAL meshes (5 % shorter and 28 % narrower than the robot, since the
+    collision geoms are neither), and every other body answers `{bodies,
+    meshes, geoms}` and nothing about its size at all.
+
+    The caller is the viewer's 🎥 record camera, which framed every take at
+    the one distance a 0.277 m duck wants and so filmed a 1.296 m Asimov from
+    inside its chest. Width is in it because apparent size is not height:
+    MOSS is 0.406 m tall and 0.569 m across, the Go2 0.394 by 0.754.
+
+    Measured rather than declared, for the reason `lab_spacing_m` is
+    measured: a hand-typed number drifts from its model the moment the MJCF
+    changes shape, and `MjcfBody` has no author to type one at all.
+
+    `None` on any failure, with the reason printed — a scene that will not
+    compile must not take the MESHES down with it. The viewer then frames at
+    the duck's size, which is what it did before this existed.
+    """
+    cached = _SIZE.get(robot)
+    if cached is not None:
+        return cached or None            # {} memoises "measured, failed"
+    import mujoco
+
+    from ..robots.body import measure_extent_m
+    body = _registry.registry().get(robot)
+    try:
+        model = mujoco.MjModel.from_xml_path(str(body.scene_fn()))
+        height, width, _ = measure_extent_m(
+            model, getattr(body, "stand_keyframe", None) or None)
+        size = {"height": round(height, 5), "width": round(width, 5)}
+    except Exception as exc:             # no body, no model, no keyframe
+        print(f"[lab] {robot}: no size to frame a shot with "
+              f"({type(exc).__name__}: {exc})", flush=True)
+        size = {}
+    _SIZE[robot] = size
+    return size or None
+
+
+#: Per-body `{height, width}`, measured on first ask. Not an `lru_cache`
+#: because a body that is not READY yet must be measurable again once it is —
+#: `robot_scene` refuses before reaching here, but `extract_scene` does not,
+#: and a failed measure of a half-downloaded model must not be the answer
+#: forever.
+_SIZE: dict[str, dict] = {}
 
 
 def scene_body_names(robot: str) -> tuple[str, ...]:
@@ -610,7 +706,31 @@ def policy_refusal(path: str | Path | None, robot: str,
         except Exception:
             mine = None              # a body that declares none: fall through
         if mine is not None and not mine.matches(want):
-            return (f"speaks {want.id}, a {robot} speaks {mine.id}")
+            # ONE exception, and it is not a loosening: a STACKED version of
+            # this body's own contract, running in an env that produces
+            # exactly its width. `export_onnx` mints those as
+            # `<robot>-<78*N>-hist<N>-control` for the history arm, and they
+            # genuinely do not satisfy the hot-swap contract — which is what
+            # this function is for everywhere else. But refusing them here
+            # meant an N-frame policy could be TRAINED and never WATCHED: the
+            # Asimov get-up that finally rises inside the published actuator
+            # envelope reads 390 floats, and the lab silently declined to put
+            # it on the stage. That breaks the rule this repo cares most about
+            # ("if it moves the robot, Jonathan can see it") in the one case
+            # where there is finally something to see.
+            #
+            # The `obs_dim == have_obs` term below is REDUNDANT and kept only
+            # to make the condition self-documenting: rung 2's width check is
+            # what actually stops a 390-input policy entering a 78-float env,
+            # and planting the term away leaves the refusal working. Said
+            # here because a comment that calls a redundant clause
+            # load-bearing is how the next person deletes the wrong one.
+            stacked = (want.id.startswith(f"{robot}-")
+                       and want.id.endswith("-control")
+                       and f"-hist" in want.id
+                       and int(want.obs_dim) == int(have_obs))
+            if not stacked:
+                return (f"speaks {want.id}, a {robot} speaks {mine.id}")
     if want_obs is not None and int(want_obs) != int(have_obs):
         return f"wants {int(want_obs)} obs, a {robot} produces {int(have_obs)}"
     return None

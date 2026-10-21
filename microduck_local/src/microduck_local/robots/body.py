@@ -466,6 +466,29 @@ def widest_horizontal_extent_m(model: Any, data: Any) -> float:
     that importing this module still costs nothing — the module docstring's
     `Any` annotations exist for the same reason.
     """
+    return _width_m(*geom_aabb_world(model, data))
+
+
+def _width_m(lo: Any, hi: Any) -> float:
+    """The widest horizontal extent of an `(lo, hi)` world AABB. One line, one
+    definition: three functions here answer the width and they must not drift
+    into three different maxima."""
+    return float(max(hi[0] - lo[0], hi[1] - lo[1]))
+
+
+def geom_aabb_world(model: Any, data: Any) -> tuple[Any, Any]:
+    """`(lo, hi)`: the whole robot's geom AABBs in WORLD axes, as two 3-vectors.
+
+    The loop `widest_horizontal_extent_m` used to hold inline, lifted the
+    moment a SECOND caller wanted the vertical extent too — a camera has to
+    frame a 1.2 m biped off its height, where the stage only ever cared how
+    wide it is. That function's own docstring names a duplicated ten-line AABB
+    loop as a measurement that can drift from itself, so there is one.
+
+    World geoms (`geom_bodyid == 0`: the floor plane, a skybox) are skipped,
+    or an infinite plane would answer for every body. `data` must already be
+    posed and `mj_forward`ed.
+    """
     import numpy as np
 
     lo = np.full(3, np.inf)
@@ -478,7 +501,49 @@ def widest_horizontal_extent_m(model: Any, data: Any) -> float:
         ext = np.abs(rot) @ model.geom_aabb[g, 3:]
         lo = np.minimum(lo, centre - ext)
         hi = np.maximum(hi, centre + ext)
-    return float(max(hi[0] - lo[0], hi[1] - lo[1]))
+    return lo, hi
+
+
+def posed_geom_aabb_world(model: Any, keyframe: str | None = None
+                          ) -> tuple[Any, Any]:
+    """`(lo, hi)` for `model` posed at `keyframe` — `geom_aabb_world` with the
+    reset and the `mj_forward` done for you.
+
+    Every caller that wants a body's SIZE wants it at the pose the body
+    actually stands in, and the three lines that get it there (`MjData`,
+    reset to the keyframe, forward) are the part easy to get subtly wrong:
+    `AGENTS.md`'s "Compare geometry at `mj_resetData` (qpos0), never at
+    'keyframe 0'" is a day lost to exactly that. `keyframe=None` measures at
+    `qpos0`, for a model that has none.
+    """
+    import mujoco
+
+    data = mujoco.MjData(model)
+    if keyframe:
+        mujoco.mj_resetDataKeyframe(model, data, model.key(keyframe).id)
+    mujoco.mj_forward(model, data)
+    return geom_aabb_world(model, data)
+
+
+def measure_extent_m(model: Any, keyframe: str | None = None
+                     ) -> tuple[float, float, tuple[float, float, float]]:
+    """`(height_m, width_m, origin)` for the whole robot at `keyframe`.
+
+    Its standing height, its widest horizontal extent, and `[centre x,
+    centre y, FLOOR z]` — the same triple `lab/robots.extract_scene` measures
+    off the duck's visual meshes, for every OTHER body, which answers only
+    `{bodies, meshes, geoms}` (`robots/g1.extract_visual_scene`).
+
+    A CAMERA is what wants this: a shot framed for a 0.277 m duck puts its
+    lens 0.78 m from the subject, and the same shot of a 1.296 m Asimov is
+    inside the robot. Width is in it because apparent size is not height —
+    MOSS is 0.406 m tall and 0.569 m across, the Go2 0.394 by 0.754 — so a
+    framing that scales on height alone crops every wide, low body.
+    """
+    lo, hi = posed_geom_aabb_world(model, keyframe)
+    return (float(hi[2] - lo[2]), _width_m(lo, hi),
+            (float((lo[0] + hi[0]) / 2), float((lo[1] + hi[1]) / 2),
+             float(lo[2])))
 
 
 def measure_lab_spacing_m(model: Any, keyframe: str | None = None
@@ -493,13 +558,7 @@ def measure_lab_spacing_m(model: Any, keyframe: str | None = None
 
     `keyframe=None` measures at `qpos0`, for a model that has none.
     """
-    import mujoco
-
-    data = mujoco.MjData(model)
-    if keyframe:
-        mujoco.mj_resetDataKeyframe(model, data, model.key(keyframe).id)
-    mujoco.mj_forward(model, data)
-    width = widest_horizontal_extent_m(model, data)
+    _, width, _ = measure_extent_m(model, keyframe)
     if not width > 0:
         raise ValueError(
             "the body measures 0 m across at "
@@ -538,4 +597,6 @@ WANTED: Sequence[str] = (
 
 
 __all__ = ["LAB_PITCH_RATIO", "WANTED", "Body", "BodyBase", "RobotFrames",
-           "conforms", "measure_lab_spacing_m", "widest_horizontal_extent_m"]
+           "conforms", "geom_aabb_world", "posed_geom_aabb_world",
+           "measure_extent_m", "measure_lab_spacing_m",
+           "widest_horizontal_extent_m"]

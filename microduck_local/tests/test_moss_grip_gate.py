@@ -1,10 +1,10 @@
 """tidy_moss's lift gate on the wrist depth camera (`grip_depth_max_m`)."""
 import dataclasses
 
+import pytest
+
 from microduck_local.brain.runtime import Senses
 from microduck_local.brain.tidy_moss import TidyMoss
-
-import pytest
 from microduck_local.robots import moss
 
 pytestmark = pytest.mark.skipif(

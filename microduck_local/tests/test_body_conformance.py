@@ -383,7 +383,12 @@ def test_the_walker_name_scan_catches_a_wrong_name_of_every_kind(robot):
     model = _model(robot)
     spec = _resolved(S.get(robot))
     side, geoms = next(iter(spec.foot_geoms.items()))
-    rig = spec.rig_controls[0]
+    # `rig_controls` is OPTIONAL (`robots/spec.RobotSpec` defaults it empty and
+    # the viewer drops a control naming a joint the body lacks), so a body
+    # that declares none has no rig plant to make — asimov1 is the first, and
+    # indexing [0] raised IndexError, which reads like the scan failing when
+    # it is the plant that does not exist.
+    rig = spec.rig_controls[0] if spec.rig_controls else None
     plants = [
         ("base_body", dict(base_body="no_such_link")),
         ("gyro_sensor", dict(gyro_sensor="no_such_sensor")),
@@ -391,10 +396,11 @@ def test_the_walker_name_scan_catches_a_wrong_name_of_every_kind(robot):
         ("foot_geoms", dict(foot_geoms={**spec.foot_geoms,
                                         side: ("no_such_pad",) + geoms[1:]})),
         ("com_bodies", dict(com_bodies=spec.com_bodies + ("no_such_body",))),
-        ("rig_controls", dict(rig_controls=(
-            {**rig, "parts": {**rig["parts"], "no_such_joint": 1.0}},)
-            + spec.rig_controls[1:])),
     ]
+    if rig is not None:
+        plants.append(("rig_controls", dict(rig_controls=(
+            {**rig, "parts": {**rig["parts"], "no_such_joint": 1.0}},)
+            + spec.rig_controls[1:])))
     for kind, override in plants:
         miss = _missing_walker_names(model, dataclasses.replace(spec, **override))
         assert any(m.startswith(kind) for m in miss), (
@@ -713,6 +719,23 @@ def test_the_shipped_hold_policy_keeps_the_body_up_for_two_seconds(robot):
         f"{robot}: {worst['ncon']} contacts — a solver blow-up, not a stand")
 
 
+#: Legged bodies that HOLD their default pose with no policy at all, with
+#: the measurement that put them here. The duck and the G1 both topple (0.98 s
+#: and 1.22 s), which is where "open-loop holds topple" comes from — but it is
+#: a fact about those two robots, not about legs.
+#:
+#:   asimov1  2.0 s, base z 0.607 (spawn 0.639), gravity_z -0.998, no
+#:            termination. 32 kg on 150 N*m/rad hip and knee servos with a
+#:            24 cm foot, spawned in a statically stable bent-knee stance:
+#:            the servos alone carry it. MEASURED 2026-10-03.
+#:
+#: A body listed here costs the settle test its planted regression — this
+#: case can no longer show those assertions biting for it — so the honest
+#: reading of a green settle test on `asimov1` is "it did not fall", not
+#: "the assertions were proven to catch a fall".
+HOLDS_OPEN_LOOP = frozenset({"asimov1"})
+
+
 @pytest.mark.parametrize("robot", WALKERS)
 def test_an_open_loop_hold_topples_inside_that_window(robot):
     """The planted regression for the settle test, and the measurement that
@@ -744,12 +767,21 @@ def test_an_open_loop_hold_topples_inside_that_window(robot):
     fell = (worst["terminated_at"] is not None
             or worst["z"] <= spec.fall_height
             or worst["gravity_z"] >= spec.fall_gravity_z)
+    if robot in HOLDS_OPEN_LOOP:
+        # The other direction, and it is still a plant: a change that made
+        # this body fall open-loop would be caught here, where before it
+        # would have read as this test finally "passing".
+        assert not fell, (
+            f"{robot} is recorded as holding the default pose open-loop and "
+            f"did not: z {worst['z']:.3f}, gravity_z {worst['gravity_z']:+.3f}"
+            " — either the servos, the pose or the spawn height moved")
+        return
     assert fell, (
         f"{robot} held the default pose open-loop for {HOLD_SECONDS} s "
         f"(z {worst['z']:.3f}, gravity_z {worst['gravity_z']:+.3f}). For a "
-        "legged body that is GOOD NEWS — and it means the settle test above "
-        "is passing for a reason its docstring no longer describes: "
-        "re-measure and rewrite both.")
+        "legged body that is GOOD NEWS — add it to HOLDS_OPEN_LOOP with the "
+        "measurement, and say in the settle test what proves ITS assertions "
+        "bite for that body, because this case no longer does.")
 
 
 def _driver_hold(robot_id: str, seconds: float, *, dead_servo: bool = False):
@@ -1187,9 +1219,13 @@ def _visual_scene(robot_id: str) -> tuple[dict, int]:
         from microduck_local.robots import moss
         return scene, int(moss.robot_spec().compile().nmesh)
     body = S.get(robot_id)
-    if getattr(body, "kind", "") == "generic":
-        # A level-0 body's model is its own MJCF, so the count comes off that
-        # — but NOT as `nmesh`, and this is a measurement, not a shortcut.
+    if hasattr(body, "robot_model"):
+        # ANY body that declares `robot_model()` is counted here and needs
+        # no branch above — which is the point: the four named cases are the
+        # bodies that predate the method, not a table every new robot joins.
+        # asimov1 was the first to arrive this way and added no line here.
+        #
+        # The count is NOT `nmesh`, and this is a measurement, not a shortcut.
         # `nmesh` counts every mesh the model loaded, and MEASURED on
         # Menagerie's `trs_so_arm100` five of its eighteen are COLLISION-only
         # meshes (`Fixed_Jaw_Collision_1`, three `Moving_Jaw_Collision_*`):
@@ -1198,10 +1234,17 @@ def _visual_scene(robot_id: str) -> tuple[dict, int]:
         # is how many distinct meshes the VISUAL group references, counted
         # here off the model rather than asked of the dump.
         model = body.robot_model()
+        # The group the BODY draws, asked of it when it says and detected off
+        # the model when it does not — so declaring `robot_model()` is the
+        # only thing a new body owes this checker.
+        group = getattr(body, "visual_group", None)
+        if group is None:
+            from microduck_local.robots.mjcf_body import visual_geom_group
+            group = visual_geom_group(model)
         return scene, len({
             int(model.geom_dataid[g]) for g in range(model.ngeom)
             if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
-            and int(model.geom_group[g]) == body.visual_group})
+            and int(model.geom_group[g]) == group})
     raise AssertionError(f"no nmesh source for {robot_id!r} — see _visual_scene")
 
 

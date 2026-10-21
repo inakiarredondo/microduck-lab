@@ -743,6 +743,59 @@ caveats there because the lab pins `domain_rand=False` and steps its ducks
 serially in one frame loop; a lab launched with `MICRODUCK_ACTUATOR=bam` falls
 back to private models.
 
+## Bringing in somebody else's robot (Menlo's Asimov 1)
+
+The G1 below was added by us, from assets we chose. **Asimov 1** is the other
+case: an open-source 1.2 m, 32 kg, 23-joint humanoid whose owners
+([Menlo Research](https://github.com/menloresearch/asimov-1)) also publish the
+training config their shipped policy runs under. It is a level-1 body here —
+it has a `RobotSpec`, a walking env and a policy contract, and it appears in
+the lab.
+
+```bash
+uv run fetch-robot asimov1                                   # model, 43 MB
+uv run python -m microduck_local.robots.asimov_walk --fetch  # their policy
+uv run python scripts/probe_asimov_walk.py                   # does it walk?
+uv run duck-lab .cache/asimov_1/policy/policy.onnx            # watch it
+```
+
+**Nothing is vendored**: the model is GPL-2.0 / CERN-OHL-S-2.0 and the policy
+BSD-3-Clause, both fetched at a pinned sha with their licence files, which
+`fetch-robot` prints. The MJCF ships `nu = 0` — no actuators at all, because
+their trainer injects them in Python — so `robots/asimov_walk.walk_spec()`
+builds the 23 Synapticon servos from their published gains.
+
+The number that says the integration is faithful is not a test: **their own
+policy walks in this repo's MuJoCo** — 0.44 m/s at a 0.5 command, 0.68 at 0.8,
+±0.5 rad/s turns, no falls in 10 s on six commands, deterministically. Their
+78-float observation puts the twist command at `obs[6:9]` and permutes the
+joints into three CAN-bus slots; that layout is mirrored from their `env.yaml`
+and cross-checked against their viewer's index lists, never inferred.
+
+Two honest limits. The reward windows in `AsimovWalkEnv` are the G1's and are
+**not measured for this body**, so the env is sound for playback and the lab
+but nothing trained in it means anything until they are. And nothing here has
+run on an Asimov — the sim2real evidence is Menlo's, measured on their stack,
+which is what the contract's `deploy` sentence says so it travels with any
+ONNX exported from here.
+
+It also walks a `/sim` level. `scenarios/asimov-walkabout.json` puts it on a
+12.8 m patrol with three ducks following it:
+
+```bash
+uv run record-world scenarios/asimov-walkabout.json --camera follow:p0 \
+    --seconds 45 --out /tmp/rw-asimov
+```
+
+A walking robot enters a room as a **person** (`world/arena.WorldPerson`),
+which is how the G1 has always done it — `kind` is a registry id now rather
+than a table, so any body declaring `Body.driver()` can walk a room with no
+edit to the world. Keep its `speed` near 0.25 m/s if you want the ducks to
+keep up: at 0.5 it outruns them.
+
+Adding your own robot: `.claude/skills/add-a-robot/SKILL.md` is the route, the
+settling number for each step and the traps hit doing this one.
+
 ## Training another robot (the Unitree G1)
 
 The harness was one body deep: `walk_env.py` resolved `trunk_base`, `floor`,

@@ -294,6 +294,14 @@ def main() -> None:
 
     out = brains_dir() / args.run_name
     out.mkdir(parents=True, exist_ok=True)
+    # A PREVIOUS run in this directory may have been killed between a
+    # snapshot's temp write and its os.replace. The lab clears those when it
+    # sees the trainer exit, but a CLI run has no lab watching it and a
+    # resumed directory would carry the stale temp forward — so start clean.
+    # (Nothing is writing here yet: this is before the callback exists.)
+    from .run_record import sweep_snapshot_tmps
+    for _stale in sweep_snapshot_tmps(out):
+        print(f"cleared stale {_stale} from a previous interrupted run")
     mix = tuple(float(x) for x in args.polite_mix.split(",") if x.strip()) if args.polite_mix else ()
     if striker:
         fns = [make_striker_env_fn(args.seed * 1000 + i, task, args.fixed_preset)

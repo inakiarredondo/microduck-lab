@@ -1988,10 +1988,17 @@ def visual_scene() -> dict:
     lattice both of its faces round onto that face and the browser z-fights
     the dark plate against the grey box. At 0.1 mm the plate keeps its
     0.2 mm standoff, for 6.24 → 6.65 MB (MEASURED 2026-09-26).
+
+    **And his own normals, not the browser's.** He is drawn by the viewer's
+    GENERIC look, which has no hand-made material table to disturb, and the
+    normals it welded for itself were off from the ones MuJoCo draws with by
+    a median of 37.8 deg — more than 15 deg on 78.3 % of his face corners,
+    the worst of any body measured here. All 77 of his visual meshes carry
+    per-vertex normals; `g1.extract_visual_scene` now ships them.
     """
     from .g1 import extract_visual_scene
     return extract_visual_scene(robot_spec().compile(), group=VISUAL_GROUP,
-                                vert_scale=0.0001)
+                                vert_scale=0.0001, normals=True)
 
 
 def home_qpos(model: mujoco.MjModel, prefix: str = "") -> np.ndarray:
@@ -2177,6 +2184,15 @@ class MossBody(BodyBase):
         # the retired mount is scored on the new one with nothing to say so
         # (478dad: -4.4 points, 2026-09-27). See `ARM_CAMERA_MOUNT`.
         out["arm_camera_mount"] = ARM_CAMERA_MOUNT
+        # WHICH OBJECT this run trains on, by `moss_env.GRASP_PROPS` name.
+        # Only recorded when it is PINNED, because `prop_variety` draws a new
+        # one every episode and a single name beside it would be a lie about
+        # what the run saw — the variety flag is the record in that case.
+        # Every task reads it: all three envs are `MossPickEnv` subclasses and
+        # all three put an object in the jaws.
+        _prop = os.environ.get("MICRODUCK_MOSS_PROP", "")
+        if _prop:
+            out["prop"] = _prop
         # WHICH OBSERVATION THIS RUN TRAINS ON, as a recorded kwarg rather than
         # a process environment variable. A policy trained with the can's axis
         # in slots 28-30 and one trained without are NOT interchangeable: the

@@ -88,8 +88,32 @@ REPLAY_KWARGS = (
     # score means. `test_a_recorded_knob_is_a_REPLAYED_knob` fails the build
     # on the next one that is neither replayed nor deliberately excluded.
     "prologue", "max_span", "launch_span", "fall_depth", "clip_file",
-    "span_cost", "span_target", "tuck_pay", "rotate_pay", "roll_pay", "ground_cost",
-    "balance_cost", "home_pay", "limit_cost", "push_bw", "calm_cost", "swing_pay", "handoff_pay",
+    "span_cost", "span_target", "tuck_pay", "rotate_pay", "roll_pay",
+    "fell_cut", "push_every", "rise_vel_cost", "ground_cost",
+    "balance_cost", "home_pay", "limit_cost", "push_bw", "calm_cost",
+    "joint_vel_cost", "over_clip_cost",
+    "swing_pay", "handoff_pay",
+    # THE THREE SCAFFOLDING KNOBS, added 2026-10-15. Recording them is only
+    # half the loop — this list is the other half, and it is the half that
+    # bit: `scripts/score_gap_chain.py` and `getup_acceptance.py` rebuild
+    # eval envs from `replay_kwargs`, so while `getup_attitude` was missing
+    # here every score of a run that trained WITH the attitude scaffold was a
+    # score of a robot without it, and the runs had to be re-scored by setting
+    # `MICRODUCK_ASIMOV_GETUP_ATTITUDE` in the shell by hand.
+    "getup_attitude", "fold_pay", "arm_unload", "arrival",
+    # The span charge's AXIS and BAND. Recorded by the trainer and
+    # dropped by every replay until 2026-10-19, so a run trained with a
+    # fore-aft charge inside a pelvis band was re-scored with the
+    # conflated span and no band — a different experiment.
+    "span_axis", "span_band", "cut_back", "arm_work", "tuck_work", "tuck2", "rotate_work", "rise_work",
+    # ...and THE ACTUATOR, added 2026-10-13. It belongs in this list more
+    # plainly than anything above it: `actuator_force="dc"` clamps every
+    # joint inside its published speed-torque envelope, so replaying a dc run
+    # under the default "xml" hands the policy a robot with up to 3x the
+    # torque it trained against, at every speed it actually uses. That is not
+    # a preview of the run; it is a different machine, and the symptom would
+    # be a get-up that looks BETTER in the lab than it is.
+    "actuator_force",
     # MOSS / MARS rungs and variants
     "pick_rung", "approach_rung", "stow_rung", "prop", "arm_camera_mount",
     "base_lock", "publish_size", "publish_attitude",

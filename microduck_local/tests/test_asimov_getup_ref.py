@@ -425,7 +425,72 @@ def test_the_arm_penalty_is_gone_from_the_tracking_reward():
                           # policy to stand did it with EIGHT joints outside
                           # the model's limits, resting on the stops.
                           "home", "calm_penalty", "swing", "limit_penalty",
-                          "action_rate_penalty"}, terms.keys()
+                          "action_rate_penalty",
+                          # THE TWO CHARGES THAT BELONG TO THE ROBOT,
+                          # added 2026-10-21 via
+                          # `AsimovGetupEnv._regulariser_terms`. Both
+                          # were written inline on the base task and
+                          # summed NOWHERE here, for 209 of 449
+                          # get-up runs: the policy jiggled at a
+                          # median 326 deg/s while standing (the
+                          # shipped walker does 3) and left the 4.0
+                          # action clip on 37 % of steps, max 16.0.
+                          # Neither can eat this task -
+                          # `joint_vel_penalty` is gated on `up` so it
+                          # is zero for the whole rise, and
+                          # `over_clip_penalty` is exactly zero inside
+                          # the clip. `arm_effort_penalty` and
+                          # `rise_vel_penalty` are NOT added, and the
+                          # test below this one is why.
+                          "joint_vel_penalty", "over_clip_penalty",
+                          # THE ARRIVAL pay, added 2026-10-15 and zero here
+                          # (`fold_pay` defaults to 0). Per-step pay for
+                          # dwelling in a state the narrow stand policy can
+                          # catch: joints within 0.10 rad of `fold`, lift
+                          # <= 0.20 m/s, feet only, span <= 0.30. Every
+                          # earlier arrival term scored the TRUNK, and a
+                          # state matching fold's trunk to 30 mm but 0.29 rad
+                          # away in joint space is caught 0 of 78 times.
+                          "fold_arrival",
+                          # THE ARM-UNLOAD charge, added 2026-10-15, zero
+                          # here (`arm_unload` defaults to 0) — and NOT the
+                          # `arm_effort_penalty` this test exists to keep
+                          # out. That one charged arm MOTOR TORQUE, which is
+                          # 58-66 % of rated through `quadruped` and `pike`,
+                          # so it charged for the only phase that lifts. This
+                          # one charges contact-force LOAD and only while the
+                          # trunk is NOT RISING, so a genuine push pays
+                          # nothing: measured on a real rollout it bites on
+                          # 50.9 % of frames and leaves the 47 % of rising
+                          # frames free. It is what finally got the hands off
+                          # the floor — feet-only frames 0.0 % -> 35.3 %,
+                          # arm load 0.694 -> 0.000.
+                          "arm_unload_penalty",
+                          # PUSHING UP THROUGH AN ARM, wired into this
+                          # reward 2026-10-16. NOT the arm_effort_penalty
+                          # this test exists to keep out: that one CHARGED
+                          # arm motor torque and so charged for the only
+                          # phase that lifts, which is this test's own
+                          # stated reason. This one PAYS load x upward trunk
+                          # speed -- the same direction as that reasoning.
+                          # It was in the base getup terms and absent here,
+                          # so arm_push read correctly and summed NOWHERE: a
+                          # run at 150 and one at the 4.0 default came back
+                          # byte-identical (4/12 rises, 0.742/0.408/0.517).
+                          # `arm_work` (2026-10-19) is the SIGNED version of
+                          # the same idea, added because `arm_push` cannot
+                          # START a rise: gated on new-best trunk height, it
+                          # earned 0.00 an episode at w=150 from `pike`, where
+                          # the robot only sinks. Signed work is dense from
+                          # step one and still unfarmable, by cancellation
+                          # round a cycle rather than by monotonicity.
+                          # `tuck` and `rotate` (2026-10-19): read, recorded
+                          # and summed NOWHERE here until then — the fourth
+                          # knob in this env to be live on the base task and
+                          # dead on this one. Both default to 0.0.
+                          "arm_push", "arm_work", "tuck",
+                          "rotate", "tuck_work", "tuck2",
+                          "rotate_work", "rise_work"}, terms.keys()
 
 
 def test_the_reported_waypoint_is_the_one_ACHIEVED_not_the_one_TARGETED():
@@ -609,7 +674,43 @@ def test_free_mode_pays_the_product_and_no_known_exploit_beats_standing():
                           # policy to stand did it with EIGHT joints outside
                           # the model's limits, resting on the stops.
                           "home", "calm_penalty", "swing", "limit_penalty",
-                          "action_rate_penalty"}, terms
+                          "action_rate_penalty",
+                          # THE TWO CHARGES THAT BELONG TO THE ROBOT,
+                          # added 2026-10-21 via
+                          # `AsimovGetupEnv._regulariser_terms`. Both
+                          # were written inline on the base task and
+                          # summed NOWHERE here, for 209 of 449
+                          # get-up runs: the policy jiggled at a
+                          # median 326 deg/s while standing (the
+                          # shipped walker does 3) and left the 4.0
+                          # action clip on 37 % of steps, max 16.0.
+                          # Neither can eat this task -
+                          # `joint_vel_penalty` is gated on `up` so it
+                          # is zero for the whole rise, and
+                          # `over_clip_penalty` is exactly zero inside
+                          # the clip. `arm_effort_penalty` and
+                          # `rise_vel_penalty` are NOT added, and the
+                          # test below this one is why.
+                          "joint_vel_penalty", "over_clip_penalty",
+                          # Both added 2026-10-15 and both ZERO here
+                          # (`fold_pay` and `arm_unload` default to 0), so the
+                          # exploit arithmetic below is unaffected. Neither is
+                          # an exploit route either: `arm_unload_penalty` only
+                          # ever SUBTRACTS, and `fold_arrival` pays only
+                          # inside a conjunction of four hard gates — joints
+                          # within 0.10 rad of `fold`, lift <= 0.20 m/s, FEET
+                          # ONLY, span <= 0.30 — which is the standing state
+                          # this test checks nothing beats, not a rival to it.
+                          # `arm_work` is not an exploit route either: it is
+                          # SIGNED, so any closed trajectory nets zero, and
+                          # standing with the arms unloaded earns it exactly
+                          # 0.00 (measured on `c2bae8-s1` at `fold`).
+                          "fold_arrival", "arm_unload_penalty",
+                          # `tuck`/`rotate` are monotone best-so-far pays at
+                          # 0.0 by default, so they add nothing to the
+                          # exploit arithmetic below.
+                              "arm_push", "arm_work", "tuck", "rotate",
+                              "tuck_work", "tuck2", "rotate_work", "rise_work"}, terms
 
     w = env.W_FREE_RISE
 

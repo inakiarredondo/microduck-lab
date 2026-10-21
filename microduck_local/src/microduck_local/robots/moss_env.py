@@ -193,6 +193,83 @@ GRASP_PROPS: dict[str, GraspProp] = {
     "block": GraspProp(id="block", shape="box", size=(0.02, 0.02, 0.02),
                        mass=0.02, jaw_ctrl_m=0.014, grasp_height_m=0.020,
                        rgba=(0.95, 0.75, 0.2, 1.0)),
+    # A MICRODUCK FIGURINE: the desk toy, not the robot. 60 mm across, 93 mm
+    # tall, 27 g. The lab's other body as something MOSS tidies away, for the
+    # showcase clip — and it is a FIGURINE because the real one does not fit,
+    # measured three ways before any of this was built (2026-10-02):
+    #
+    #   * MASS. The walk MJCF weighs 737 g. On the can's own 9-spot grid the
+    #     jaw holds 7/9 at 18 g and 7/9 at 30 g, 5/9 at 50 g, 2/9 at 70 g and
+    #     0/9 at 100 g. It is the pads SLIPPING and not the arm stalling —
+    #     every arm joint clamps at 2.2 N.m and 737 g at the 0.26 m grasp
+    #     needs ~1.9 of it — so friction ought to buy it back and does not:
+    #     mu 5.0 at 100 g is still only 3/9.
+    #   * JAW. The jaws clear 90 mm wide open (pad centres 98, inner faces
+    #     8 mm closer). The duck's trunk is 97 x 105 mm.
+    #   * BIN. His bin's mouth is 154 x 192 mm and 151 mm deep. The duck's
+    #     tight bbox is 168 x 189 x 279 mm. It does not go in on any axis.
+    #
+    # 0.333 scale is what mass decides (737 g x 0.333^3 = 27 g, inside the
+    # 30 g band), and it clears the other two with room: 56 x 63 x 93 mm.
+    #
+    # THE COLLIDER IS A CYLINDER AND THE PICTURE IS A DUCK. A box with the
+    # figurine's own 56 x 63 mm footprint does not work and the way it fails
+    # is worth keeping: squared to 60 x 60 its DIAGONAL is 85 mm against an
+    # 82 mm inner gap, so it wedges the jaws open — finger qpos driven to
+    # 0.0443, past its own 0.041 limit — and then the arm lifts the wedge.
+    # That read as 4/4 at every jaw command including an 8 mm nominal GAP,
+    # with a byte-identical 0.083 m lift, which is what a jam looks like when
+    # you only score the lift. A cylinder has no yaw, and the duck's plan
+    # silhouette is round to within a few mm anyway. The viewer draws the
+    # real duck meshes at 1/3 scale over it (`world/scenario.Prop.look`).
+    #
+    # THE COLLIDER IS THE DUCK'S BODY, AND IT IS GRIPPED THERE. The first
+    # version was a 60 mm cylinder gripped 40 mm up, and it looked wrong on
+    # camera for a reason worth keeping: 40-50 mm up is the figurine's NECK.
+    # Measured across the drawn figurine, width by height band:
+    #
+    #      0-10 mm  19.0 x 49.6 mm      40-50 mm  29.0 x 22.6 mm  <- the neck
+    #     10-20 mm   7.0 x 49.2 mm      50-60 mm  28.3 x 22.3 mm
+    #     20-30 mm  26.7 x 49.7 mm      70-80 mm  42.2 x 32.3 mm  (head)
+    #     30-40 mm  25.9 x 49.7 mm      80-90 mm  42.5 x 31.5 mm
+    #
+    # So the jaws were closing to 56 mm around a 23-29 mm neck inside a 60 mm
+    # collider: 31 mm of air, and the pads visibly shut on nothing. The body
+    # is the wide part (49.7 mm, 0-40 mm up), so the collider is 50 mm and the
+    # grip is at 30 mm. The figurine's body is really 26 x 50 mm rather than
+    # round, and a BOX collider matching that scores 8/9 against the
+    # cylinder's 7/9 — but only at the yaw that presents its 50 mm face, and
+    # a figurine lands at any yaw, so the 26 mm face would be a 9 mm gap per
+    # side. The cylinder matches the WIDE axis, which never intersects the
+    # drawn duck and leaves air only on the thin one.
+    #
+    # The two numbers, same method and same grid as the can's table
+    # (`scripts/probe_moss_prop.py`; the CAN re-run unchanged scores 7/9 in
+    # the same harness, which is how these are known not to be the harness),
+    # at grasp height 0.030 on the 50 mm collider:
+    #
+    #     jaw ctrl   inner   on a 50 mm body   lifted
+    #      0.012     32 mm    18 mm squeeze     7/9
+    #      0.015     38 mm    12 mm squeeze     7/9
+    #      0.018     44 mm     6 mm squeeze     7/9
+    #      0.021     50 mm     flush            6/9
+    #      0.024     56 mm     6 mm GAP         4/9
+    #
+    # It holds on interference and fails exactly when a gap opens, which is
+    # the signature that separates this from the box's jam. 0.018 is kept for
+    # the same reason 0.027 is kept for the can: the gentlest command that
+    # still holds. Grasp height at jaw 0.018: 0.020 -> 6/9, 0.025 -> 6/9,
+    # 0.030 -> 7/9, 0.035 -> 3/9 (the palm sits ~60 mm up and starts taking
+    # it, and above the body the duck narrows into the neck).
+    #
+    # NOT a new training problem: `sample_prop`'s "can"/"tall" family already
+    # draws cylinders r 0.022-0.034, h 0.030-0.075 at 10-60 g, so a 0.030 x
+    # 0.0465 at 27 g is inside the envelope the shipped pick trained on.
+    "duckling": GraspProp(id="duckling", shape="cylinder",
+                          size=(0.025, 0.0465), mass=0.027,
+                          jaw_ctrl_m=0.018, grasp_height_m=0.030,
+                          condim=6, friction=(0.9, 0.005, 0.002),
+                          rgba=(0.98, 0.78, 0.20, 1.0)),
 }
 DEFAULT_PROP = "can"
 

@@ -34,7 +34,20 @@ GATES = {                       # what "done" means, stated up front
     "home_deg":     (10.0, "MEAN joint error vs default_pose, degrees (<=)"),
     "home_max_deg": (20.0, "WORST single joint vs default_pose, degrees (<=)"),
     "jam_rad":      (0.010, "median radians outside a joint limit (<=)"),
-    "span_m":       (0.40, "median peak foot span, metres (<=)"),
+    # 0.40 m, and this file never said where that came from — which is the
+    # one thing this repo's own rules forbid ("never trust a number nobody
+    # measured"). The DERIVED reference is Menlo's own `STAND` keyframe, the
+    # pose they ship as standing: **0.215 m** of foot span, measured
+    # 2026-10-15. So 0.40 is ~1.9x the robot's natural stance and 0.215 is
+    # what "does not sprawl" actually means on this body.
+    #
+    # The threshold is LEFT at 0.40 deliberately: every published verdict in
+    # docs/roadmap.md was read against it, and moving it would silently
+    # rewrite them all. Read it as a loose bar with the real reference beside
+    # it — for scale, the distilled get-up sits at 0.932 m (4.3x natural) and
+    # openhorizon's teacher at 0.955 m, while the narrow stand trained here
+    # reaches 0.326 m (1.5x).
+    "span_m":       (0.40, "median peak foot span, m (<=; natural stance 0.215)"),
     "recovers":     (0.75, "fraction of SHOVED episodes still standing at the end"),
 }
 
@@ -65,6 +78,12 @@ def load(run):
 HANDOFF = False
 POSE = ""        # "" = each run's own; else a label or comma-separated set
 OBS_SWITCH = False   # --obs-switch: the DEPLOYABLE predicate (see below)
+#: --actuator=xml|dc: "" = each run's own recorded choice. A LOUD override,
+#: like POSE, because it changes the robot and not the scoring: "dc" clamps
+#: every joint inside Menlo's published speed-torque envelope
+#: (robots/asimov_motor), which is what every policy trained before
+#: 2026-10-13 never saw.
+ACTUATOR = ""
 
 #: THE SHIPPABLE MODE SWITCH, and why it is a different thing from the one
 #: the lab uses. `_getup_handoff_due` asks `standing_report` (world-frame
@@ -123,6 +142,29 @@ def obs_switch_due(o, state) -> bool:
     return state["n"] >= OBS_DWELL
 
 
+def _actuator_note(run) -> str:
+    """Say whether `--actuator` MOVED this run's actuator, not merely that it
+    was passed.
+
+    The first version announced "the policy on a DIFFERENT robot from the one
+    it learned on" whenever `--actuator=dc` was given — including for a run
+    that trained under `dc`, where it is the opposite of true. A banner that
+    cries wolf on a correct configuration is how a real mismatch gets read
+    past.
+    """
+    from pathlib import Path as _P
+
+    from microduck_local.run_record import replay_kwargs as _rk
+    trained = dict(_rk(_P("runs") / run)).get("actuator_force", "xml")
+    if str(trained) == str(ACTUATOR):
+        return (f"\n    [actuator {ACTUATOR!r} — which is what this run "
+                f"TRAINED under, so this is its own robot]")
+    return (f"\n    [ACTUATOR OVERRIDDEN to {ACTUATOR!r} — this run TRAINED "
+            f"on {trained!r}. 'dc' is Menlo's published speed-torque "
+            f"envelope and 'xml' is the flat per-group clamp, so this is the "
+            f"policy on a DIFFERENT robot from the one it learned on]")
+
+
 def mcnemar(a, b):
     """Exact two-sided McNemar on two paired boolean sequences.
 
@@ -176,6 +218,25 @@ def main(runs):
         # horizon the deliverable is defined at, with only the deployment's
         # own cuts — the rule this repo has under "Compare paired".
         kw.pop("handoff_pay", None)
+        # THE IMITATION KNOBS, which the DEPLOYMENT env does not take. An
+        # imitation run trains in `AsimovGetupClipEnv` and its `run.json`
+        # records `clip_file`, `track_tol`, `force_lag` and friends; this gate
+        # builds `env_class("getup")`, which raises `TypeError` on every one
+        # of them — so a clip run could not be scored by the repo's own gate
+        # at all (`watch_training` reported the traceback instead of a
+        # result). Dropped BY NAME, not by swallowing TypeError, because a new
+        # knob then has to be classified rather than silently surviving: the
+        # deliverable is a get-up in the deployment env, and a knob that only
+        # exists in the tracking env cannot be part of scoring it.
+        # NOTE `history` is NOT in this list, deliberately. It is part of the
+        # POLICY's observation, not of the tracking task: dropping it builds a
+        # 78-float env for a 390-input policy and the normalizer dies on
+        # `(78,) vs (390,)`, which is what this gate did to the first
+        # five-frame run it was pointed at. The honest failure; the dangerous
+        # version would be an env that silently fitted.
+        for _k in ("clip_file", "track_tol", "ref_speed", "free",
+                   "start_phase", "force_lag"):
+            kw.pop(_k, None)
         # A DELIBERATE, LOUD override of the posture the policy trained on.
         # Rule 1 of train-loop is "evaluate under the flags it TRAINED with",
         # so changing one has to be stated, not slipped in: this is here to
@@ -184,6 +245,8 @@ def main(runs):
         # used one).
         if POSE:
             kw["getup_label"] = POSE
+        if ACTUATOR:
+            kw["actuator_force"] = ACTUATOR
         kw.setdefault("limit_cost", 1.0)
         if not kw.get("limit_cost"):
             kw["limit_cost"] = 1.0
@@ -270,13 +333,27 @@ def main(runs):
             _getup = act
             _state = {"on": False, "n": 0}
 
+            # THE TWO POLICIES DO NOT READ THE SAME VECTOR. A history
+            # get-up reads 390 floats (5 stacked frames of Menlo's 78,
+            # NEWEST LAST — see the contract string `export-walk` prints);
+            # their walker reads 78. Handing it the stacked vector raised
+            # `Got: 390 Expected: 78` the first time this was run against a
+            # 5-frame policy, because this wrapper was written when the
+            # get-up read 78 too and `o` could be passed to both. The
+            # walker gets the NEWEST frame; `obs_switch_due` likewise reads
+            # a single 78-obs frame, so it takes the same slice.
+            _n_walk = 78
+
+            def _newest(o, _n=_n_walk):
+                return o if o.size <= _n else o[-_n:]
+
             def act(o, _s=_state, _g=_getup, _w=_walk, _T=_T):
                 if not _s["on"]:
-                    due = (obs_switch_due(o, _s) if OBS_SWITCH
+                    due = (obs_switch_due(_newest(o), _s) if OBS_SWITCH
                            else _T._getup_handoff_due(env))
                     if due:
                         _s["on"] = True
-                return (_w if _s["on"] else _g)(o)
+                return _w(_newest(o)) if _s["on"] else _g(o)
             run_episode.reset_handoff = lambda: (_state.__setitem__("on", False),
                                                  _state.__setitem__("n", 0),
                                                  setattr(env, "_handoff_streak", 0),
@@ -309,7 +386,8 @@ def main(runs):
               + ("   [DEPLOYABLE obs-only switch]" if OBS_SWITCH else "")
               + (f"   [POSE OVERRIDDEN to {POSE!r} — this run TRAINED on "
                  f"{dict(replay_kwargs(Path('runs') / run)).get('getup_label')!r}]"
-                 if POSE else ""))
+                 if POSE else "")
+              + (_actuator_note(run) if ACTUATOR else ""))
         ok = True
         for key, (gate, what) in GATES.items():
             v = got[key]
@@ -375,6 +453,9 @@ if __name__ == "__main__":
             argv.remove(a)
         elif a.startswith("--pose="):
             globals()["POSE"] = a.split("=", 1)[1]
+            argv.remove(a)
+        elif a.startswith("--actuator="):
+            globals()["ACTUATOR"] = a.split("=", 1)[1]
             argv.remove(a)
         elif a == "--obs-switch":
             globals()["OBS_SWITCH"] = True

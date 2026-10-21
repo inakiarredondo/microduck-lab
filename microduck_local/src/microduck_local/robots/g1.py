@@ -406,8 +406,15 @@ def _quat_apply_inverse(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
     return vec - w * t + np.cross(xyz, t)
 
 
+#: Lattice the AUTHORED normals are written on when `extract_visual_scene` is
+#: asked for them: a thousandth of a unit vector, which is 0.06 deg — two
+#: orders finer than anything shading shows, and three characters a component.
+NORMAL_SCALE = 0.001
+
+
 def extract_visual_scene(model: mujoco.MjModel, prefix: str = "",
-                         group: int = 2, vert_scale: float = 0.001) -> dict:
+                         group: int = 2, vert_scale: float = 0.001,
+                         normals: bool = False) -> dict:
     """The real G1 visual meshes.
 
     Verts are INTEGER multiples of `vert_scale` metres so the JSON is ~21 MB
@@ -425,6 +432,26 @@ def extract_visual_scene(model: mujoco.MjModel, prefix: str = "",
     grows 6 % (3.80 → 4.02 MB), so a small robot pays a rounding error in
     bytes instead of in shape. The default stays 1 mm: the G1 does not need
     the digits, and this is a per-body choice (`robots/mars.visual_scene`).
+
+    **`normals` ships the model's OWN vertex normals instead of leaving the
+    viewer to invent them**, as `mesh.n` ints on `normalScale`. A CAD mesh
+    carries authored normals (MuJoCo keeps them per vertex, `mesh_normal`,
+    and duplicates a position that needs two), MuJoCo's renderer draws with
+    them, and this dump used to drop them on the floor — so the browser welded
+    by position and averaged the faces, which both AVERAGES ACROSS a hard edge
+    the author split and tilts every small face by the vertex lattice.
+    MEASURED, as the angle between the invented normal and the authored one,
+    per face corner: the Go2 is off by more than 15 deg on 13.9 % of corners
+    (more than 45 deg on 4.7 %) and the SO-ARM100 on 55.0 % (22.8 %), with a
+    median of 25.6 deg. That is the cloudy, dented, melted look, and it is not
+    a resolution problem — it is a dropped array.
+
+    Off by default, because the G1's and MARS's looks were TUNED against the
+    invented normals (`G1Look.weldAndSmooth`, `MarsLook`) and nobody has
+    re-measured them with the real ones; `robots/mjcf_body.MjcfBody` — every
+    body nobody here has looked at — asks for them. A model with no normals,
+    or whose normals are not per-vertex, is dumped without them whatever this
+    says, and the viewer falls back to inventing.
 
     `group` is which geom group holds the VISUALS. 2 is the Lucky Robots
     MJCF's convention and the default, so nothing about the G1 changes;
@@ -461,10 +488,14 @@ def extract_visual_scene(model: mujoco.MjModel, prefix: str = "",
             v = np.round(model.mesh_vert[va:va + vn] / vert_scale).astype(np.int32)
             f = model.mesh_face[fa:fa + fn]
             mesh_ids[mid] = len(meshes)
-            meshes.append({
+            entry = {
                 "v": v.reshape(-1).tolist(),
                 "f": f.reshape(-1).tolist(),
-            })
+            }
+            n = _authored_normals(model, mid) if normals else None
+            if n is not None:
+                entry["n"] = n
+            meshes.append(entry)
         mat_id = int(model.geom_matid[i])
         rgba = model.mat_rgba[mat_id] if mat_id >= 0 else model.geom_rgba[i]
         geoms.append({
@@ -476,8 +507,60 @@ def extract_visual_scene(model: mujoco.MjModel, prefix: str = "",
             "name": model.mesh(mid).name,
             "rgba": [round(float(x), 4) for x in rgba],
         })
-    return {"bodies": bodies, "meshes": meshes, "geoms": geoms,
-            "vertScale": vert_scale}
+    out = {"bodies": bodies, "meshes": meshes, "geoms": geoms,
+           "vertScale": vert_scale}
+    if any("n" in m for m in meshes):
+        out["normalScale"] = NORMAL_SCALE
+    return out
+
+
+def _authored_normals(model: mujoco.MjModel, mid: int) -> list[int] | None:
+    """Mesh `mid`'s own vertex normals as `NORMAL_SCALE` ints, or None.
+
+    None whenever they cannot be shipped as one array parallel to `v`: no
+    normals at all, a different count from the vertices, or a face that
+    indexes its normals somewhere other than its vertices. The last is the
+    one worth refusing rather than working around — MuJoCo's compiler splits
+    a position that carries two normals, so `mesh_facenormal == mesh_face`
+    holds on every mesh of both Menagerie models measured here, and a model
+    where it does not is one whose hard edges this shape cannot carry. The
+    viewer then invents normals for that mesh, which is what it did for all
+    of them before.
+
+    **A normal on the wrong SIDE of its own surface is turned round.** Real
+    CAD exports carry them: MEASURED, 5.29 % of MOSS's 145,489 visual
+    vertices have an authored normal pointing into the solid (no mesh of his
+    77 is wholly inverted — it is scattered, worst on the gripper jaws at
+    713/1505), against 0.11 % of the Go2's faces. MuJoCo's renderer lights
+    both sides and never shows it; three.js does not, so shipping them raw
+    put dark patches on MOSS's arm and deck that are not on the robot. The
+    sign comes from the geometry — the area-weighted mean of the faces that
+    meet at the vertex — and only the sign: the author's DIRECTION is kept
+    everywhere, including every hard edge. That bounds the repair from
+    below, because the sign it falls back to is the one
+    `computeVertexNormals` would have produced anyway.
+    """
+    va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+    na, nn = int(model.mesh_normaladr[mid]), int(model.mesh_normalnum[mid])
+    fa, fn = int(model.mesh_faceadr[mid]), int(model.mesh_facenum[mid])
+    if nn == 0 or nn != vn or fn == 0:
+        return None
+    face = model.mesh_face[fa:fa + fn]
+    if not np.array_equal(face, model.mesh_facenormal[fa:fa + fn]):
+        return None
+    n = np.asarray(model.mesh_normal[na:na + nn], dtype=np.float64)
+    length = np.linalg.norm(n, axis=1, keepdims=True)
+    length[length == 0] = 1.0
+    n = n / length
+    v = np.asarray(model.mesh_vert[va:va + vn], dtype=np.float64)
+    # Area-weighted (the cross product is NOT normalised): a sliver should not
+    # outvote the face the vertex actually sits on.
+    cross = np.cross(v[face[:, 1]] - v[face[:, 0]], v[face[:, 2]] - v[face[:, 0]])
+    acc = np.zeros_like(n)
+    for corner in range(3):
+        np.add.at(acc, face[:, corner], cross)
+    n[np.einsum("ij,ij->i", acc, n) < 0] *= -1
+    return np.round(n / NORMAL_SCALE).astype(np.int32).reshape(-1).tolist()
 
 
 @lru_cache(maxsize=1)
@@ -542,6 +625,11 @@ class G1Walker:
         self.root_qpos = int(model.jnt_qposadr[root])
         self.root_qvel = int(model.jnt_dofadr[root])
         self.pelvis = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, self.prefix + "pelvis")
+        #: The body a `world/arena.WorldPerson` tracks this walker by. Named
+        #: rather than looked up as `.pelvis` by the arena, because "the root
+        #: body is called pelvis" is true of this robot and of Asimov and is
+        #: not a protocol — a quadruped's is not.
+        self.base_body_id = self.pelvis
         self.body_ids = [
             b for b in range(model.nbody)
             if model.body(b).name.startswith(self.prefix)]
@@ -786,6 +874,19 @@ class G1Body(RobotSpec):
         """Put one G1 in a `/sim` world. `collision` is the duck's knob
         and has no meaning here — the G1 has one MJCF."""
         spec.attach(g1_spec(), prefix=prefix, frame=frame)
+
+    def driver(self, model, prefix: str):
+        """`G1Walker` on this model — the same object `world/arena.WorldPerson`
+        used to construct by name.
+
+        Takes a PREFIX, like every other `Body.driver`, and `G1Walker` takes
+        the id it was built from; `world.compose.duck_prefix` is `id + "/"`,
+        so the inverse is the one `rstrip`. Declaring this is what let the
+        arena stop branching on `kind == "g1"` — the `if robot ==` pattern
+        `docs/mars-roadmap.md` §6.5 exists to delete — and what lets a SECOND
+        legged body walk a room with no edit there.
+        """
+        return G1Walker(model, str(prefix).rstrip("/"))
 
 
 class _LazyG1Spec:

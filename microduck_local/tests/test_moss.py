@@ -775,6 +775,81 @@ def test_a_leg_behind_another_mount_is_measured_but_never_silently():
                     publish_proximity=False)
 
 
+def test_every_moss_policy_consumer_asks_the_run_for_ALL_its_flags():
+    """The -4.4 points above cost a SECOND time, in the consumers.
+
+    Recording the mount fixed `eval_env_kwargs`. It did not fix the scripts
+    that score a policy: `eval_moss_stow` and `eval_moss_approach` asked the
+    run nothing and built the env on the current mount while all eight runs on
+    disk trained behind the retired one, so they re-ran 478dad's -4.4 on every
+    MOSS policy either of them ever scored. `eval_moss_pick` hand-assembled
+    `obs_env_kwargs` plus the mount and so dropped `base_lock`, the one flag in
+    `DYN_FLAGS` — which `moss_env` warns about ninety lines above it: a guard
+    that covers SOME of the flags reads as covering all of them.
+
+    So the case is structural, not per-flag. Anything that loads an ONNX and
+    builds a MOSS env passes `**eval_env_kwargs(...)`, the single helper that
+    answers for the observation AND the dynamics. The doctored sources at the
+    end are the positive control: they prove the scan still bites in the run
+    it is executed in, not only on the day it was written.
+    """
+    import ast
+    import re as _re
+
+    def _fn(f):
+        return f.id if isinstance(f, ast.Name) else getattr(f, "attr", "") or ""
+
+    def _mentions(node):
+        return any(isinstance(n, ast.Call) and _fn(n.func) == "eval_env_kwargs"
+                   for n in ast.walk(node))
+
+    def offenders(src: str) -> list[tuple[int, str]]:
+        """Every `Moss*Env(...)` built without the run's flags reaching it."""
+        tree = ast.parse(src)
+        # `kw = eval_env_kwargs(p)` and `KW = dict(..., **eval_env_kwargs(p))`
+        # are both how the live scripts spell it, so one binding hop counts.
+        bound = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                 and _mentions(n.value)
+                 for t in n.targets if isinstance(t, ast.Name)}
+        out = []
+        for n in ast.walk(tree):
+            if not (isinstance(n, ast.Call)
+                    and _re.fullmatch(r"Moss\w*Env", _fn(n.func))):
+                continue
+            if not any(k.arg is None
+                       and (_mentions(k.value)
+                            or (isinstance(k.value, ast.Name) and k.value.id in bound))
+                       for k in n.keywords):
+                out.append((n.lineno, _fn(n.func)))
+        return out
+
+    root = Path(__file__).resolve().parents[1]
+    scanned, bad = 0, []
+    for py in sorted(list((root / "src").rglob("*.py"))
+                     + list((root / "scripts").rglob("*.py"))):
+        src = py.read_text()
+        if "InferenceSession" not in src:      # not a policy consumer
+            continue
+        found = offenders(src)
+        scanned += 1
+        bad += [(py.relative_to(root).as_posix(), ln, cls) for ln, cls in found]
+    assert scanned >= 6, f"the scan found only {scanned} MOSS policy consumers"
+    assert not bad, ("these score a policy under flags it never trained with — "
+                     f"pass **eval_env_kwargs(path): {bad}")
+
+    # positive control: each shape that HAS shipped broken must be caught
+    assert offenders("ort.InferenceSession(p)\n"
+                     "env = MossStowEnv(seed=0, stow_rung=1)")
+    assert offenders("ort.InferenceSession(p)\n"
+                     "env = MossPickEnv(seed=0, **obs_env_kwargs(p))")
+    # ...and the two legitimate spellings must NOT be
+    assert not offenders("ort.InferenceSession(p)\n"
+                         "env = MossPickEnv(seed=0, **eval_env_kwargs(p))")
+    assert not offenders("ort.InferenceSession(p)\n"
+                         "KW = dict(wrist_free=True, **eval_env_kwargs(p))\n"
+                         "env = MossPickEnv(seed=0, **KW)")
+
+
 def test_a_wrist_camera_on_the_approach_axis_is_refused(monkeypatch):
     """On the axis there is no "away from it" to call the image's up; the
     unguarded version compiled a NaN frame that silently detected nothing."""

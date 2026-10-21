@@ -234,3 +234,64 @@ def test_handoff_due_defers_to_a_behavior_that_owns_the_condition():
     # (and would have raised reaching .data) — the behavior's word is final.
     e.behavior = types.SimpleNamespace(handoff_fn=lambda env: False)
     assert handoff_due(e) is False
+
+
+def test_handoff_fires_on_a_NON_DUCK_body():
+    """`--handoff` could never fire on an Asimov, G1, MARS or MOSS.
+
+    `handoff_due` read `env.behavior.handoff_fn` -- `behavior` is a field
+    only the DUCK's env has -- then fell through to the BACKFLIP rotation
+    gate `_bf_rot`, which is also absent there. So it returned False for
+    every frame of every non-duck render, silently: the render completed,
+    every caption read `drv=<the trick policy>`, and the mp4 showed the
+    unhanded behaviour while the flag said otherwise. Fourth instance of
+    this shape (AGENTS.md records three in one day).
+
+    The env exposes the one definition, `handoff_ready` -- the same method
+    `asimov_tasks._getup_handoff_due` delegates to, so the condition the
+    reward trains against and the one rendered here cannot drift.
+    """
+    from microduck_local import render_rollout as RR
+
+    class _NotADuck:
+        """A non-duck env: no `behavior`, no `_bf_rot`."""
+
+        def __init__(self, ready):
+            self._ready = ready
+
+        def handoff_ready(self):
+            return self._ready
+
+    assert RR.handoff_due(_NotADuck(True)) is True, (
+        "a non-duck body that reports handoff_ready() must hand off; this "
+        "returned False for every frame of every non-duck render"
+    )
+    assert RR.handoff_due(_NotADuck(False)) is False, (
+        "and it must still respect the env saying NOT yet"
+    )
+
+
+def test_an_onnx_driver_feeds_each_model_the_width_it_DECLARES():
+    """A handoff partner need not read the same vector as the policy.
+
+    Asimov's get-up takes 390 floats (5 stacked frames of Menlo's 78, newest
+    last); their walker takes 78. Handing the stacked vector to the walker
+    raised `Got: 390 Expected: 78` the moment the handoff actually fired --
+    which only happened once the predicate above was fixed, so the two bugs
+    hid each other.
+    """
+    from pathlib import Path
+
+    import numpy as np
+
+    from microduck_local import render_rollout as RR
+
+    walker = Path(".cache/asimov_1/policy/policy.onnx")
+    if not walker.is_file():
+        pytest.skip("Menlo's walker not fetched")
+    drv = RR.load_driver(str(walker)) if hasattr(RR, "load_driver") else None
+    if drv is None:
+        pytest.skip("driver loader not exposed under the expected name")
+    stacked = np.zeros(390, np.float32)       # 5 frames of their 78
+    out = drv.fn(stacked, None)
+    assert out.shape == (23,), out.shape

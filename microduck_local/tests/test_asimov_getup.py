@@ -135,6 +135,35 @@ def test_train_env_kwargs_puts_the_curriculum_on_the_run(no_knob_env, monkeypatc
                   # been edited; the run trained the previous null under a new
                   # name. Sixth time for this bug in this file.
                   "roll_pay": 0.0,
+                  # whether a robot that stood and FELL ends the episode.
+                  # On for training; off for the recovery loop and the lab,
+                  # where `Duck.step` resets on `terminated` and a viewer
+                  # would otherwise see a respawn that looks like a recovery.
+                  "fell_cut": True,
+                  # seconds STANDING between shoves; 0 keeps the training
+                  # cadence, which counts wall time and so hits the robot
+                  # again the instant a 3.4 s rise finishes.
+                  "push_every": 0.0,
+                  # limb speed during the RISE, which the original
+                  # joint_vel_penalty never charged because it is gated on
+                  # already being upright.
+                  "rise_vel_cost": 0.0,
+                  # WHICH ACTUATOR, added 2026-10-13 — and this is the knob
+                  # that makes every run above it a claim about a different
+                  # robot. "xml" clamps the PD output at the URDF's
+                  # continuous effort with no speed dependence; "dc" clamps
+                  # it inside the published speed-torque envelope. Default
+                  # "xml" so no historical run's recorded kwargs change
+                  # meaning; the retrain sets it explicitly.
+                  "actuator_force": "xml",
+                  # HOW MANY FRAMES, added 2026-10-13 when `history` moved up
+                  # to AsimovGetupEnv and this task could suddenly use it. A
+                  # run at 5 frames and one at 1 are not two seeds of one
+                  # experiment — they cannot even load in the same env (390
+                  # floats against 78), and the ablation says 1 cannot do this
+                  # task at all (the reference policy goes 24/24 -> 0/24 with
+                  # its ring frozen to the present).
+                  "history": 1,
                   # getting the FEET UNDER THE MASS, added 2026-10-09 — the
                   # move every other term charges for
                   "tuck_pay": 0.0,
@@ -153,6 +182,12 @@ def test_train_env_kwargs_puts_the_curriculum_on_the_run(no_knob_env, monkeypatc
                   # standing pose was measured 19 deg from `default_pose`
                   # (57 deg at the waist) with 8 joints past their stops.
                   "home_pay": 0.0, "limit_cost": 0.0,
+                  # Added 2026-10-21. Their defaults are the CLASS
+                  # CONSTANTS, not 0.0: "off" for these two means the
+                  # charge the robot has always carried, so a run that
+                  # recorded 0.0 would have DELETED it.
+                  "joint_vel_cost": E.W_JOINT_VEL,
+                  "over_clip_cost": E.W_OVER_CLIP,
                   # SHOVES, added 2026-10-10. In 38 M steps this robot was
                   # never once disturbed, so a recovery was a state no
                   # rollout contained — "it never corrects" could not have
@@ -170,7 +205,39 @@ def test_train_env_kwargs_puts_the_curriculum_on_the_run(no_knob_env, monkeypatc
                   # TRAIN FOR THE HANDOFF, added 2026-10-10. The deliverable
                   # is a catchable state for Menlo's walker, not a solo
                   # 8-second stand — which is why the policy jams.
-                  "handoff_pay": 0.0}
+                  "handoff_pay": 0.0,
+                  # THE THREE SCAFFOLDING KNOBS, added 2026-10-15, and the
+                  # first of them is why this assertion exists at all in its
+                  # EXACT form: `getup_attitude` was added to the env and not
+                  # to the recorder, then trained at 120 for a whole
+                  # 8,429,568-step chain while `run.json` said `None`. The
+                  # env reads its own environment, so nothing errored — and
+                  # `score_gap_chain` / `getup_acceptance` rebuild eval envs
+                  # from `replay_kwargs`, which means every later score was of
+                  # a robot WITHOUT the scaffold it trained with. Seventh time
+                  # for this bug in this file.
+                  #
+                  # `getup_attitude`: a clamped PD on uprightness toward
+                  # `fold`'s +0.83, because the LIFT assist buys height by
+                  # tipping the trunk over its planted forearms (upright at
+                  # the peak -0.53 at assist 0.00 down to -1.00 at 0.85, and
+                  # zero action reproduces it).
+                  # `fold_pay`: per-step pay for dwelling in a state the
+                  # narrow stand policy can catch — joints within 0.10 rad of
+                  # `fold`, lift <= 0.20 m/s, feet only, span <= 0.30.
+                  # `arm_unload`: a charge on weight carried through the arms
+                  # while NOT rising, which is what finally got the hands off
+                  # the floor (feet-only frames 0.0 % -> 35.3 %).
+                  # `span_axis` / `span_band`: the span charge measures ONE
+                  # axis and only inside a pelvis band, because `_foot_span`
+                  # conflates the two and the Asimov sprawl is a LUNGE —
+                  # 0.353 m lateral against 0.702 m fore-aft — so a charge on
+                  # the conflated span prices the wrong axis.
+                  "getup_attitude": 0.0, "fold_pay": 0.0,
+                  "arm_unload": 0.0, "arm_work": 0.0,
+                  "tuck_work": 0.0, "tuck2": 0.0, "rotate_work": 0.0, "rise_work": 0.0,
+                  "span_axis": "both",
+                  "span_band": ""}
 
 
 def test_the_walk_task_records_no_getup_knobs(no_knob_env):
@@ -2517,3 +2584,377 @@ def test_the_roll_terms_are_OFF_by_default_and_recorded_when_on():
     assert terms["on_back"] < on.W_STANDING * 2, (
         "a per-step pay for LYING on the back must not rival standing")
     assert "roll_pay" in REPLAY_KWARGS
+
+
+def test_limb_speed_is_charged_DURING_the_rise_not_only_once_up():
+    """`joint_vel_penalty` is gated on `up`, so the rise was never charged.
+
+    Measured peak joint rate: walking 3 deg/s median, RISING 532 median and
+    1753 max — at or above a human punch. The hazard is the get-up, not the
+    fall (which topples away from the pusher 19/19), and nothing priced it.
+    """
+    from microduck_local.robots import spec as S
+
+    # OFF by default, so every earlier run reproduces.
+    off = S.get("asimov1").env_class("getup")(
+        domain_rand=False, obs_noise=False, seed=0, getup_label="supine")
+    off.reset(seed=0)
+    assert off._compute_reward()[1]["rise_vel_penalty"] == 0.0
+
+    env = S.get("asimov1").env_class("getup")(
+        domain_rand=False, obs_noise=False, seed=0, getup_label="supine",
+        rise_vel_cost=10.0)
+    env.reset(seed=0)
+
+    # LYING DOWN (not `up`): the new term charges, the old one does not.
+    _r, terms = env._compute_reward()
+    assert terms["rise_vel_penalty"] <= 0.0
+    assert terms["joint_vel_penalty"] == 0.0, (
+        "the original term is gated on `up` — that is the gap this fills")
+
+    # the two are COMPLEMENTARY, never both live: whatever the pose, exactly
+    # one of them can be non-zero, so limb speed is charged everywhere.
+    for _ in range(40):
+        env.step(env.action_space.sample() * 0.0)
+        _r, terms = env._compute_reward()
+        assert not (terms["rise_vel_penalty"] < 0 and terms["joint_vel_penalty"] < 0)
+
+    # ...and it scales with the weight. BOTH envs stepped identically from
+    # the same seed, because at reset the joint velocities are zero and the
+    # first version of this compared a 40-step-old env against a fresh one.
+    import numpy as _np
+
+    pair = [S.get("asimov1").env_class("getup")(
+        domain_rand=False, obs_noise=False, seed=0, getup_label="supine",
+        rise_vel_cost=w) for w in (10.0, 20.0)]
+    act = None
+    for e in pair:
+        e.reset(seed=0)
+        if act is None:
+            act = (_np.ones(e.action_space.shape, _np.float32) * 0.3)
+        for _ in range(10):
+            e.step(act)
+    a = pair[0]._compute_reward()[1]["rise_vel_penalty"]
+    b = pair[1]._compute_reward()[1]["rise_vel_penalty"]
+    assert a < 0.0, "ten steps of real motion must cost something"
+    assert b == pytest.approx(2 * a, rel=1e-6)
+
+
+def test_the_observation_ring_is_CLEAN_after_a_reset(no_knob_env):
+    """At `history > 1`, every frame must hold the same thing after a reset.
+
+    `reset` calls `_get_obs` MORE THAN ONCE — the base builds an observation,
+    then this class repositions the robot (a prologue rung, a fall state, a
+    pose-cache draw) and builds another. While `_get_obs` advanced the ring on
+    every read, that left four copies of a PRE-reposition frame beside one
+    real one: a 5-frame velocity transient at the start of every episode that
+    no episode contained, silently, in training only.
+
+    Planted regressions (both confirmed to fail this):
+      * `if not self._obs_stack` instead of `if not self._obs_live or not
+        self._obs_stack` -> the frames differ after reset. This IS the
+        original bug.
+      * never setting `_obs_live` in `step` -> the second assertion fails,
+        because the ring then never advances and the policy is blind to motion.
+
+    Deliberately NOT claimed: moving the `_obs_stack = []` clear to after
+    `super().reset()` was planted and this test still passed, because
+    `_obs_live` already forces a rebuild — so the clear is belt-and-braces and
+    the order is not load-bearing. Said here rather than left implied, since a
+    plant list that names a regression it does not catch is worse than a short
+    one.
+    """
+    import numpy as np
+    from microduck_local.robots import spec as S
+
+    env = S.get("asimov1").env_class("getup")(
+        domain_rand=False, obs_noise=False, seed=0, history=5,
+        getup_label="prone")
+    assert env.observation_space.shape == (390,), env.observation_space
+    o, _ = env.reset(seed=0)
+    for k in range(1, 5):
+        assert np.allclose(o[:78], o[78 * k:78 * (k + 1)]), (
+            f"frame {k} differs from frame 0 straight after a reset — the ring "
+            "advanced during reset instead of rebuilding")
+    for _ in range(6):
+        o, *_ = env.step(np.zeros(env.action_space.shape, np.float32))
+    assert not np.allclose(o[:78], o[-78:]), (
+        "the ring never advanced while stepping — the policy cannot see motion")
+    a, _ = env.reset(seed=1)
+    assert np.allclose(a[:78], a[-78:]), (
+        "a second reset left the previous episode's frames in the ring")
+
+
+def test_history_1_is_BIT_IDENTICAL_to_no_history(no_knob_env):
+    """The contract arm must not be perturbed by the control arm existing.
+
+    This one has NO planted regression that fails it, and that is worth
+    stating: at N == 1 the stacked path and the plain path are genuinely
+    equivalent — `78 * 1` is 78 and a one-slot ring returns its only frame —
+    so there is nothing to catch today. It is kept as a GUARD against a future
+    change that makes N == 1 diverge (an extra slot, a different fill, a
+    normalisation applied only on the stacked path), not as evidence that
+    anything is currently right.
+    """
+    import numpy as np
+    from microduck_local.robots import spec as S
+
+    rows = {}
+    for h in (None, 1):
+        env = S.get("asimov1").env_class("getup")(
+            domain_rand=False, obs_noise=False, seed=0, history=h,
+            getup_label="prone")
+        o, _ = env.reset(seed=3)
+        seq = [o.copy()]
+        for _ in range(8):
+            o, *_ = env.step(np.zeros(env.action_space.shape, np.float32))
+            seq.append(o.copy())
+        rows[h] = np.asarray(seq)
+        assert env.observation_space.shape == (78,), (h, env.observation_space)
+    assert np.array_equal(rows[None], rows[1]), (
+        "history=1 is not bit-identical to history unset")
+
+
+def test_arm_work_is_signed_and_cannot_be_farmed_by_oscillation():
+    """`arm_work` pays SIGNED work through the arms, so a bounce nets zero.
+
+    WHY THE TERM EXISTS. `arm_push` is `load x max(_trunk_up_speed(), 0)` and
+    `_trunk_up_speed()` returns only the gain ABOVE the episode's best trunk
+    height. That makes it unfarmable — after the first bounce nothing exceeds
+    the best again — and it also makes it unable to START a rise. Measured on
+    `teach-asimov_getup_ref-140db6` from `pike`, `arm_push` earned **0.00 per
+    episode at w=150**, because the robot only ever sinks and so never
+    exceeds its start height. The whole budget there was `track` 85.3 +
+    `contact` 73.0 with every other term exactly zero, so nothing at all paid
+    for getting up.
+
+    Signed work is dense from the first step and still unfarmable, by a
+    DIFFERENT mechanism: the integral of signed `dz` round a closed cycle is
+    zero, so oscillation churns the per-step value and nets nothing. This
+    pins both halves of that claim — a large per-step magnitude with a small
+    net — because asserting only the net would also pass for a term that is
+    dead.
+    """
+    import numpy as np
+
+    from microduck_local.robots import asimov
+    from microduck_local.robots import spec as S
+
+    if not asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+
+    def series(act, label="all", steps=120):
+        env = S.get("asimov1").env_class("getup")(
+            domain_rand=False, obs_noise=False, action_delay=False, seed=0,
+            arm_work=1.0, arm_push=0.0, arm_effort=0.0, action_clip=13.0,
+            getup_label=label)
+        env.reset(seed=1)
+        env.reward_sums.clear()
+        prev, deltas = 0.0, []
+        for k in range(min(steps, int(env.max_steps))):
+            _o, _r, term, trunc, _i = env.step(act(env, k))
+            cur = float(env.reward_sums.get("arm_work", 0.0))
+            deltas.append(cur - prev)
+            prev = cur
+            if term or trunc:
+                break
+        return np.asarray(deltas)
+
+    bounce = series(lambda e, k: (np.sin(k * 0.6) * 3.0
+                                  * np.ones(e.nj)).astype(np.float32))
+    churn, net = np.abs(bounce).sum(), abs(bounce.sum())
+    assert churn > 1.0, (
+        f"arm_work churned only {churn:.3f} over a bounce — the term is DEAD, "
+        "not unfarmable, and the net assertion below would pass vacuously")
+    assert net < 0.25 * churn, (
+        f"a bounce nets {net:.3f} of {churn:.3f} churned — signed work is "
+        "supposed to cancel round a closed cycle, so this is farmable")
+
+    # ...AND IT IS DENSE FROM STEP ONE, which is the whole point. Zero action
+    # from the pose mix sinks, and the term must SAY SO rather than reading
+    # 0.00 the way `arm_push` does from a rung the robot cannot leave.
+    still = series(lambda e, k: np.zeros(e.nj, np.float32))
+    assert still.sum() < 0.0, (
+        f"zero action nets {still.sum():+.3f}: a policy resting on its "
+        "forearms while the trunk sinks must be charged, or the term has the "
+        "same can't-initiate defect as `arm_push`")
+
+
+@pytest.mark.parametrize("rung", ["route:0.45,0.62", "falling", "pike"])
+def test_every_start_rung_clears_the_per_episode_baselines(rung):
+    """A rung that returns early from `reset` must still clear EVERY
+    per-episode baseline.
+
+    The `_fall_q` and `_handover_q` branches used to return having cleared
+    only `_best_rise`, `_stood` and `_held`, so `falling`, `pike`, `seat`,
+    `handover` and `route` runs carried `_best_trunk_z`, `_prev_trunk_z`,
+    `_prev_tuck_gap`, `_prev_tuck2`, `_best_upright`, `_best_supine`,
+    `_best_tuck`, `_best_head`, `_peak_rise`, `_held_best` and the whole push
+    clock ACROSS episodes — monotone terms comparing two different episodes,
+    which this file already records twice as a cause of a term paying 0.00.
+    It surfaced as a hard crash only when `calm_cost` was first switched on
+    for such a run (`_calm_charge` reads `_stood_at`, created by
+    `_reset_push`): the trainer raised on the first step of every episode and
+    sat at **0 of 4,000,000 steps** while the lab reported `running: True`.
+
+    Asserting on the SECOND reset, after steps have dirtied the baselines —
+    a first reset would pass even with the bug present.
+    """
+    import numpy as np
+
+    from microduck_local.robots import asimov
+    from microduck_local.robots import spec as S
+
+    if not asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+    try:
+        env = S.get("asimov1").env_class("getup")(
+            domain_rand=False, obs_noise=False, action_delay=False, seed=0,
+            actuator_force="dc", history=5, start_rung=rung, calm_cost=10.0,
+            fall_depth=1.0, fell_cut=False, max_episode_s=8.0)
+    except RuntimeError as e:                       # cache not harvested here
+        pytest.skip(str(e)[:60])
+
+    env.reset(seed=0)
+    for _ in range(12):                             # dirty every baseline
+        env.step(np.zeros(env.action_space.shape, np.float32))
+    assert env._best_trunk_z is not None, "the step loop did not dirty them"
+
+    env.reset(seed=1)
+    stale = [n for n in ("_best_trunk_z", "_prev_trunk_z", "_prev_tuck_gap",
+                         "_prev_tuck2", "_best_upright", "_best_supine",
+                         "_best_tuck", "_best_head")
+             if getattr(env, n, "MISSING") is not None]
+    assert not stale, (
+        f"{rung}: {stale} survived the reset — a monotone term will compare "
+        "this episode against the last one")
+    assert env._stood_at is None, "_reset_push did not run on this rung"
+    assert env._held == 0 and env._held_best == 0
+
+
+def assert_term_is_not_farmable(term, weight, *, label="all", churn_min=1.0,
+                                net_frac=0.25, steps=120, **env_kw):
+    """REUSABLE FARM TEST for any signed reward term.
+
+    A signed term is farm-resistant by CANCELLATION: the integral of a signed
+    rate round a closed cycle is zero, so an oscillation churns the per-step
+    value and nets nothing. This pins BOTH halves, because asserting only the
+    small net ALSO passes for a term that is simply dead — which is the shape
+    of a green test that checks nothing.
+
+    Measured on `arm_work`: a bounce captures **100 % of its churn** under the
+    rejected `max(dz, 0)` clamp and **under 25 %** signed.
+
+    `tuck_work` and `rotate_work` shipped WITHOUT a test like this and were
+    both gamed in training — `tuck_work` bought the 0.917 m splits,
+    `rotate_work` bought a roll onto the back. Call this for every new signed
+    term.
+    """
+    import numpy as np
+
+    from microduck_local.robots import spec as S
+
+    kw = dict(action_clip=13.0, getup_label=label)
+    kw[term] = weight
+    kw.update(env_kw)
+    env = S.get("asimov1").env_class("getup")(
+        domain_rand=False, obs_noise=False, action_delay=False, seed=0, **kw)
+    env.reset(seed=1)
+    env.reward_sums.clear()
+    prev, deltas = 0.0, []
+    for k in range(min(steps, int(env.max_steps))):
+        act = (np.sin(k * 0.6) * 3.0 * np.ones(env.nj)).astype(np.float32)
+        _o, _r, t, tr, _i = env.step(act)
+        cur = float(env.reward_sums.get(term.replace("_pay", ""), 0.0))
+        deltas.append(cur - prev)
+        prev = cur
+        if t or tr:
+            break
+    d = np.asarray(deltas)
+    churn, net = float(np.abs(d).sum()), abs(float(d.sum()))
+    assert churn > churn_min, (
+        f"{term} churned only {churn:.3f} — the term is DEAD, not unfarmable, "
+        "and the net assertion below would pass vacuously")
+    assert net < net_frac * churn, (
+        f"{term} nets {net:.3f} of {churn:.3f} churned — a closed cycle should "
+        "cancel, so this is farmable by oscillation")
+    return churn, net
+
+
+@pytest.mark.parametrize("term,weight", [("arm_work", 1.0), ("rise_work", 20.0)])
+def test_every_signed_term_survives_the_shared_farm_test(term, weight):
+    """Each signed term must pass the reusable exploit test above.
+
+    Add a row here when you add a signed term — `tuck_work` and `rotate_work`
+    had no such test and were both gamed in training.
+    """
+    from microduck_local.robots import asimov
+
+    if not asimov.ready():
+        pytest.skip("Asimov's model is not fetched")
+    churn, net = assert_term_is_not_farmable(term, weight)
+    assert churn > 0 and net >= 0
+
+
+#: The seven terms a REFERENCE-TRACKING get-up replaces on purpose. The ref
+#: and clip tasks score progress against an authored waypoint (`track`,
+#: `reach`, `rise_work`) instead of against absolute trunk height, so the
+#: base task's height-shaped terms are genuinely not wanted there. Anything
+#: NOT on this list that the base charges and a subclass does not is the bug
+#: this test exists for — it has now happened five times in this one file.
+_TASK_TERMS_THE_REF_REPLACES = frozenset({
+    "stand", "rise", "progress", "standing", "head_up", "on_back", "roll",
+    # NOT regularisers that were forgotten -- two charges on the LIFTING
+    # phase, excluded from the tracking tasks on purpose.
+    # `arm_effort_penalty` is excluded by measurement: `quadruped` and `pike`
+    # need the elbows at 58-66 % of rated torque on this body, so it charged
+    # the robot for the only phase that lifts it
+    # (`test_asimov_getup_ref.test_the_arm_penalty_is_gone_from_the_tracking_reward`).
+    # `rise_vel_penalty` is gated on `not up`, which IS the rise. A first
+    # version of `_regulariser_terms` returned both and the ref env's
+    # exact-set tests caught it -- which is why this allowlist is named and
+    # commented rather than inferred from whatever currently passes.
+    "arm_effort_penalty", "rise_vel_penalty",
+})
+
+
+def test_every_getup_task_charges_the_ROBOTS_own_costs():
+    """Limb speed, arm effort and over-clip commands belong to the HARDWARE.
+
+    No curriculum makes a 326 deg/s limb or a command four times the clip
+    safe, so every get-up task must sum all four. They were written inline in
+    the base `_compute_reward` and nowhere else, which left every route run —
+    every policy this repo has shipped for the floor — training with all four
+    absent. `teach-asimov_getup_whole-c4bdba` went over its 4.0 clip on 37 %
+    of steps (max 16.0) and jiggled at a median 326 deg/s while standing,
+    against the shipped walker's 3 deg/s in the same posture.
+    """
+    import numpy as np
+
+    from microduck_local.robots.asimov_env import (
+        AsimovGetupClipEnv,
+        AsimovGetupEnv,
+        AsimovGetupRefEnv,
+    )
+
+    def summed(cls):
+        env = cls()
+        try:
+            env.reset(seed=0)
+            for _ in range(3):
+                env.step(np.zeros(env.action_space.shape, np.float32))
+            return set(env.reward_sums)
+        finally:
+            env.close()
+
+    base = summed(AsimovGetupEnv)
+    # A green result must not be able to mean "swept nothing".
+    assert len(base) >= 25, f"base task has only {len(base)} terms"
+    for cls in (AsimovGetupRefEnv, AsimovGetupClipEnv):
+        missing = (base - summed(cls)) - _TASK_TERMS_THE_REF_REPLACES
+        assert not missing, (
+            f"{cls.__name__} does not sum {sorted(missing)}, which "
+            f"{AsimovGetupEnv.__name__} charges. A knob live on the base task "
+            "and summed nowhere here is recorded onto the run and reported as "
+            "set while being worth exactly 0.0."
+        )

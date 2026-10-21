@@ -1218,13 +1218,39 @@ def mount_world(app: FastAPI, *, load_infer: Callable[[str], Infer] | None,
     def get_world() -> dict:
         return st.payload()
 
+    @app.get("/scene/robot/{robot_id}")
+    def get_robot_scene(robot_id: str) -> dict:
+        """Visual meshes for ONE BODY — same shape as GET /scene.
+
+        `/scene/g1` was this with the id baked into the URL, which is why a
+        second walking body rendered as the viewer's grey capsule placeholder
+        the first time one walked a room: the meshes were never asked for.
+        Any body that declares `visual_scene()` is servable here, and a body
+        that does not says so as a 404 rather than as a robot nobody can see.
+        """
+        from .robots import registry
+
+        try:
+            body = registry.get(robot_id)
+        except KeyError:
+            raise HTTPException(
+                404, f"no body {robot_id!r} — this install knows "
+                     f"{', '.join(registry.ids())}") from None
+        if not body.ready():
+            raise HTTPException(
+                404, f"{robot_id} assets missing — run `{body.setup_hint()}`")
+        try:
+            return body.visual_scene()
+        except NotImplementedError:
+            raise HTTPException(
+                404, f"{robot_id} declares no visual_scene(), so there is "
+                     "nothing to draw it with") from None
+
     @app.get("/scene/g1")
     def get_g1_scene() -> dict:
-        """Visual meshes for a G1 person — same shape as GET /scene, different robot."""
-        from .robots.g1 import g1_ready, visual_scene
-        if not g1_ready():
-            raise HTTPException(404, "G1 assets missing — run `uv run fetch-g1`")
-        return visual_scene()
+        """The G1's meshes. Kept as its own route because the viewer has
+        always fetched this path; it is `/scene/robot/g1`."""
+        return get_robot_scene("g1")
 
     @app.post("/world/load")
     async def load_world(req: LoadReq) -> dict:

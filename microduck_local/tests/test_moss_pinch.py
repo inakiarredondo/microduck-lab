@@ -5,12 +5,11 @@ import math
 
 import mujoco
 import numpy as np
+import pytest
 
 from microduck_local.robots import moss
 from microduck_local.robots import moss_env as ME
 from microduck_local.robots.moss_pinch import MossKinematics
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),

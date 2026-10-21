@@ -253,9 +253,22 @@ def load_driver(spec: str) -> Driver:
 
     sess = ort.InferenceSession(str(path))
     in_name = sess.get_inputs()[0].name
+    # FEED THE MODEL THE WIDTH IT DECLARES. A `--handoff` partner need not
+    # read the same vector as the policy being rendered: Asimov's get-up
+    # takes 390 floats (5 stacked frames of Menlo's 78, NEWEST LAST — see
+    # the contract `export-walk` prints) while their shipped walker takes
+    # 78, so handing the stacked vector to the walker raised `Got: 390
+    # Expected: 78` the moment the handoff actually fired. The newest frame
+    # is the one a single-frame policy wants, and on-device it is exactly
+    # what the ring buffer's head holds.
+    want = sess.get_inputs()[0].shape[-1]
+    want = int(want) if isinstance(want, int) else None
 
     def infer(obs, env):
-        return sess.run(None, {in_name: obs[None]})[0][0].astype(np.float32)
+        o = obs
+        if want is not None and o.shape[-1] != want and o.shape[-1] > want:
+            o = o[-want:]
+        return sess.run(None, {in_name: o[None]})[0][0].astype(np.float32)
 
     return Driver(_policy_label(path), infer)
 
@@ -269,6 +282,24 @@ def handoff_due(env) -> bool:
     inline because it predates the field and is what every existing
     showcase chain hands off on.
     """
+    # ASK THE ENV FIRST. `env.behavior` is a field only the DUCK's env has,
+    # so on any other body this read returned None and fell through to the
+    # BACKFLIP rotation gate below — which is also None there, so
+    # `--handoff` could never fire on an Asimov, a G1, a MARS or a MOSS. It
+    # failed silently: the render completed, every caption read
+    # `drv=<the get-up policy>`, and the mp4 showed the unhanded behaviour
+    # while the flag said otherwise. That is the FOURTH instance of this
+    # shape (AGENTS.md records three in one day: `handoff_fn`,
+    # `handoff_recenter`, `env_kwargs_for_behavior`), and the module was
+    # never swept even though that entry says to grep for it.
+    #
+    # `handoff_ready` is the ONE definition — the same method
+    # `asimov_tasks._getup_handoff_due` delegates to, so the condition the
+    # reward trains against, the one the lab deploys and the one rendered
+    # here cannot drift apart.
+    ready = getattr(env, "handoff_ready", None)
+    if callable(ready):
+        return bool(ready())
     fn = getattr(getattr(env, "behavior", None), "handoff_fn", None)
     if fn is not None:
         return bool(fn(env))
@@ -655,7 +686,8 @@ def sheet_footer(probe: Probe) -> list[str]:
 # ------------------------------------------------------------------------ cli
 
 def build_env(behavior_id: str, env_overrides: dict[str, str], seed: int,
-              robot: str = "microduck", task: str = "walk"):
+              robot: str = "microduck", task: str = "walk",
+              run_dir: Path | None = None):
     """Exactly how eval and the lab build a behavior env: randomizers off, so
     what the sheet shows is the policy and not the noise.
 
@@ -673,6 +705,16 @@ def build_env(behavior_id: str, env_overrides: dict[str, str], seed: int,
         secs = env_overrides.get("MICRODUCK_EPISODE_S")
         if secs:
             kw["max_episode_s"] = float(secs)
+        # ...and `--start-phase` the same way. The run's recorded set is the
+        # right DEFAULT (that is the fix below), but a get-up run records every
+        # rung it sampled, so a render of the picked policy showed a floor
+        # episode ending on an elbow at trunk 0.188 m while the rung it actually
+        # stands from was never drawn. The default stays the run; naming a rung
+        # overrides it, which is the same precedence as a teach request's own
+        # env knobs over the recipe's last stage.
+        start = env_overrides.get("MICRODUCK_ASIMOV_GETUP_START")
+        if start:
+            kw["start_phase"] = start
         # Turn off the things that make a render IRREPRODUCIBLE (sensor noise,
         # domain randomisation, a random spawn yaw) but keep the ones that are
         # part of the DYNAMICS the policy trained under. `action_delay` is the
@@ -680,6 +722,19 @@ def build_env(behavior_id: str, env_overrides: dict[str, str], seed: int,
         # disabling it is a distribution shift, and it cost a G1 kick policy
         # that holds 5/5 in its training conditions one seed in five here —
         # so the render disagreed with the evaluation and the render was wrong.
+        # THE RUN'S OWN RECORDED KNOBS. Without them this renders every task
+        # policy under the env's DEFAULTS — which for the Asimov get-up means
+        # starting at the `pike`, where those policies score 0/12, instead of
+        # the `fold` they were trained from, where they stand 12/12 and hold
+        # 7.76 s. The comment above already records ONE instance of this class
+        # being caught (`action_delay`, a G1 kick that held 5/5 in training and
+        # 1/5 here) and the single flag was fixed rather than the rule. This is
+        # the rule: `run_record.replay_kwargs`, shared with the lab's preview so
+        # there is one definition rather than two that drift.
+        from .run_record import replay_kwargs
+        rec = replay_kwargs(run_dir) if run_dir is not None else {}
+        rec.pop("task", None)              # the caller already resolved it
+        kw = {**rec, **kw}                 # an explicit --seconds still wins
         return env_class(robot, task)(obs_noise=False, domain_rand=False,
                                       random_yaw=False,
                                       seed=seed, **kw)
@@ -714,6 +769,10 @@ def main() -> None:
                     help="behavior id (default: read runs/<run>/behavior.json)")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--episodes", type=int, default=2)
+    ap.add_argument("--start-phase", default=None, metavar="RUNG[,RUNG...]",
+                    help="render from these get-up rungs instead of the set the "
+                         "run recorded (e.g. fold). The run's own set is the "
+                         "default; this overrides it.")
     ap.add_argument("--seconds", type=float, default=None,
                     help="episode length (default: the behavior's own; an explicit "
                          "--env MICRODUCK_EPISODE_S wins)")
@@ -749,6 +808,8 @@ def main() -> None:
     # BehaviorEnv's hard override; an explicit --env of the same key wins.
     if args.seconds is not None:
         overrides.setdefault("MICRODUCK_EPISODE_S", str(args.seconds))
+    if args.start_phase:
+        overrides.setdefault("MICRODUCK_ASIMOV_GETUP_START", args.start_phase)
 
     # The policy's own contract, not its directory: `resolve` asks the ONNX's
     # `metadata_props` FIRST, which is the only rung that survives the file
@@ -798,7 +859,8 @@ def main() -> None:
         except (OSError, ValueError):
             task = None
     env = build_env(behavior, overrides, seed=args.seed, robot=robot,
-                    task=task or "walk")
+                    task=task or "walk",
+                    run_dir=Path(args.policy).parent if args.policy else None)
     probe = Probe(env)
     cam = make_camera(args.camera, args.distance,
                       stand_z=getattr(env, "stand_z", None))

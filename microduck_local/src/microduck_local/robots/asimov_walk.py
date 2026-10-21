@@ -276,6 +276,25 @@ GAIN_GROUPS: tuple[tuple[str, float, float, float, float, float], ...] = (
 )
 
 
+def _motor_choice() -> str:
+    """"xml" or "dc" for `actuator_force`, from `AsimovWalkEnv.MOTOR_ENV`.
+
+    Read in the TRAINER so the choice lands in `run.json`. "An env that reads
+    its own environment trains fine and leaves no record of what it trained
+    on" is the bug this file has now had six times, and the costliest possible
+    instance of it is this knob: it decides whether the policy is physically
+    executable at all.
+    """
+    from .asimov_env import AsimovWalkEnv as _AE
+    act = (os.environ.get(_AE.MOTOR_ENV, "") or "xml").strip().lower()
+    if act not in ("xml", "dc"):
+        raise ValueError(
+            f"{_AE.MOTOR_ENV} must be 'xml' or 'dc', got {act!r} — 'bam' is "
+            "the duck's servo model, and no third envelope is published for "
+            "this robot")
+    return act
+
+
 def gains_for(joint: str) -> tuple[float, float, float, float, float]:
     """`(kp, kd, effort, armature, friction)` for one joint name."""
     for frag, kp, kd, effort, armature, friction in GAIN_GROUPS:
@@ -1364,6 +1383,25 @@ class AsimovBody(_SPEC_BASE):
                 # knob a run SETS and does not RECORD is the bug this file
                 # has now had five times.
                 "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
+                "fell_cut": bool(int(os.environ.get(E.FELL_CUT_ENV, "")
+                                     or 1)),
+                "push_every": float(os.environ.get(E.PUSH_EVERY_ENV, "")
+                                    or 0.0),
+                "rise_vel_cost": float(os.environ.get(E.RISE_VEL_ENV, "")
+                                       or 0.0),
+                # WHICH ACTUATOR. The single most consequential knob on this
+                # body and the last one to get recorded: "xml" clamps the PD
+                # output at the URDF's continuous effort with NO speed
+                # dependence, "dc" clamps it inside the published speed-torque
+                # envelope (robots/asimov_motor). Every Asimov get-up trained
+                # here before 2026-10-13 trained on "xml" -- a robot that is
+                # weak at rest and unlimited in motion -- and exceeds Menlo's
+                # own joint ratings on 82 % of its rise frames as a result. A
+                # policy trained under each is not two seeds of one
+                # experiment; it is two different robots.
+                "actuator_force": _motor_choice(),
+                # whether a robot that stood and fell ENDS the episode. On
+                # for training, off for the recovery loop and the lab.
                 "span_cost": float(os.environ.get(E.SPAN_COST_ENV, "")
                                    or 0.0),
                 "span_target": float(os.environ.get(E.SPAN_TARGET_ENV, "")
@@ -1376,6 +1414,10 @@ class AsimovBody(_SPEC_BASE):
                 "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
                                       or 0.0),
                 "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+                "joint_vel_cost": float(os.environ.get(E.JOINT_VEL_ENV, "")
+                                        or E.W_JOINT_VEL),
+                "over_clip_cost": float(os.environ.get(E.OVER_CLIP_ENV, "")
+                                        or E.W_OVER_CLIP),
                 "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
                 "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
                 "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
@@ -1386,6 +1428,49 @@ class AsimovBody(_SPEC_BASE):
                 # is paid. A free run and a tracking one optimise different
                 # objectives and are not two seeds of one experiment.
                 "free": bool(int(os.environ.get(RE.FREE_ENV, "0") or 0)),
+                "arrival": float(os.environ.get(RE.ARRIVAL_ENV, "")
+                                 or 0.0),
+                "cut_back": float(os.environ.get(RE.CUT_BACK_ENV, "")
+                                  or RE.CUT_BACK_Z),
+                # TEN knobs the sweep found readable-but-unrecorded on this
+                # branch alone. Every one is read by the ctor, so a clip run
+                # that set any of them trained under it and left no record —
+                # and two runs against different values are not two seeds of
+                # one experiment. `getup_label`, `start_phase` and `ref_speed`
+                # in particular pick the START DISTRIBUTION and the tempo.
+                "getup_attitude": float(os.environ.get(E.ATTITUDE_ENV, "")
+                                        or 0.0),
+                "fold_pay": float(os.environ.get(E.FOLD_ENV, "") or 0.0),
+                "arm_unload": float(os.environ.get(E.ARM_UNLOAD_ENV, "")
+                                    or 0.0),
+                # WHICH AXIS the span charge prices. Recorded because a run
+                # charged on `fore_aft` and one charged on the combined
+                # `hypot` are different experiments: the working get-up is
+                # 0.353 m lateral + 0.702 m fore-aft, so the combined charge
+                # is partly paying for a STRIDE.
+                "span_axis": os.environ.get(E.SPAN_AXIS_ENV, "") or "both",
+            "span_band": os.environ.get(E.SPAN_BAND_ENV, "") or "",
+                "span_band": os.environ.get(E.SPAN_BAND_ENV, "") or "",
+                "getup_blend": float(os.environ.get(E.BLEND_ENV, "") or 0.0),
+                "arm_push": float(os.environ.get(E.ARM_PUSH_ENV, "")
+                                  or E.W_ARM_PUSH),
+                "arm_work": float(os.environ.get(E.ARM_WORK_ENV, "")
+                                  or 0.0),
+                "tuck_work": float(os.environ.get(E.TUCK_WORK_ENV, "")
+                                   or 0.0),
+                "tuck2": float(os.environ.get(E.TUCK2_ENV, "")
+                               or 0.0),
+                "rotate_work": float(os.environ.get(E.ROTATE_WORK_ENV, "")
+                                     or 0.0),
+                "rise_work": float(os.environ.get(E.RISE_WORK_ENV, "")
+                                   or 0.0),
+                "arm_effort": float(os.environ.get(E.ARM_EFFORT_ENV, "")
+                                    or E.W_ARM_EFFORT),
+                "head_up": float(os.environ.get(E.HEAD_ENV, "")
+                                 or E.W_HEAD_UP),
+                "getup_label": os.environ.get(E.POSE_ENV) or "supine",
+                "start_phase": os.environ.get(RE.START_ENV, "") or "",
+                "ref_speed": float(os.environ.get(RE.SPEED_ENV, "") or 1.0),
             }
         if task == "getup_ref":
             from .asimov_env import AsimovGetupEnv as E
@@ -1415,6 +1500,10 @@ class AsimovBody(_SPEC_BASE):
                 # product rise. Recorded because a free policy and a tracking
                 # one optimise different objectives entirely.
                 "free": bool(int(os.environ.get(RE.FREE_ENV, "0") or 0)),
+                "arrival": float(os.environ.get(RE.ARRIVAL_ENV, "")
+                                 or 0.0),
+                "cut_back": float(os.environ.get(RE.CUT_BACK_ENV, "")
+                                  or RE.CUT_BACK_Z),
                 # PRONE by default, and the reason is measured: from supine
                 # this robot cannot rise at all, at any speed, by any scripted
                 # route. See `asimov_getup_ref.WAYPOINTS[0]`.
@@ -1423,6 +1512,16 @@ class AsimovBody(_SPEC_BASE):
                                      or spec().action_clip),
                 "arm_push": float(os.environ.get(E.ARM_PUSH_ENV, "")
                                   or E.W_ARM_PUSH),
+                "arm_work": float(os.environ.get(E.ARM_WORK_ENV, "")
+                                  or 0.0),
+                "tuck_work": float(os.environ.get(E.TUCK_WORK_ENV, "")
+                                   or 0.0),
+                "tuck2": float(os.environ.get(E.TUCK2_ENV, "")
+                               or 0.0),
+                "rotate_work": float(os.environ.get(E.ROTATE_WORK_ENV, "")
+                                     or 0.0),
+                "rise_work": float(os.environ.get(E.RISE_WORK_ENV, "")
+                                   or 0.0),
                 "arm_effort": float(os.environ.get(E.ARM_EFFORT_ENV, "")
                                     or E.W_ARM_EFFORT),
                 "head_up": float(os.environ.get(E.HEAD_ENV, "") or E.W_HEAD_UP),
@@ -1472,6 +1571,25 @@ class AsimovBody(_SPEC_BASE):
                 # knob a run SETS and does not RECORD is the bug this file
                 # has now had five times.
                 "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
+                "fell_cut": bool(int(os.environ.get(E.FELL_CUT_ENV, "")
+                                     or 1)),
+                "push_every": float(os.environ.get(E.PUSH_EVERY_ENV, "")
+                                    or 0.0),
+                "rise_vel_cost": float(os.environ.get(E.RISE_VEL_ENV, "")
+                                       or 0.0),
+                # WHICH ACTUATOR. The single most consequential knob on this
+                # body and the last one to get recorded: "xml" clamps the PD
+                # output at the URDF's continuous effort with NO speed
+                # dependence, "dc" clamps it inside the published speed-torque
+                # envelope (robots/asimov_motor). Every Asimov get-up trained
+                # here before 2026-10-13 trained on "xml" -- a robot that is
+                # weak at rest and unlimited in motion -- and exceeds Menlo's
+                # own joint ratings on 82 % of its rise frames as a result. A
+                # policy trained under each is not two seeds of one
+                # experiment; it is two different robots.
+                "actuator_force": _motor_choice(),
+                # whether a robot that stood and fell ENDS the episode. On
+                # for training, off for the recovery loop and the lab.
                 "span_cost": float(os.environ.get(E.SPAN_COST_ENV, "")
                                    or 0.0),
                 "span_target": float(os.environ.get(E.SPAN_TARGET_ENV, "")
@@ -1484,11 +1602,43 @@ class AsimovBody(_SPEC_BASE):
                 "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
                                       or 0.0),
                 "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+                "joint_vel_cost": float(os.environ.get(E.JOINT_VEL_ENV, "")
+                                        or E.W_JOINT_VEL),
+                "over_clip_cost": float(os.environ.get(E.OVER_CLIP_ENV, "")
+                                        or E.W_OVER_CLIP),
                 "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
                 "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
                 "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
                 "swing_pay": float(os.environ.get(E.SWING_ENV, "") or 0.0),
                 "handoff_pay": float(os.environ.get(E.HANDOFF_ENV, "")
+                                     or 0.0),
+                # THE ATTITUDE SCAFFOLD, the ARRIVAL pay and the ARM-UNLOAD
+                # charge — all three added 2026-10-15 and all three recorded
+                # here, because the first of them trained a whole 8.4 M-step
+                # chain at 120 while `run.json` said `None`. Nothing errored:
+                # the env read its own environment, trained fine, and left no
+                # record — and `score_gap_chain` / `getup_acceptance` rebuild
+                # eval envs from `replay_kwargs`, so an unrecorded scaffold
+                # means every later score is of a DIFFERENT robot.
+                "getup_attitude": float(os.environ.get(E.ATTITUDE_ENV, "")
+                                        or 0.0),
+                "fold_pay": float(os.environ.get(E.FOLD_ENV, "") or 0.0),
+                "arm_unload": float(os.environ.get(E.ARM_UNLOAD_ENV, "")
+                                    or 0.0),
+                # WHICH AXIS the span charge prices. Recorded because a run
+                # charged on `fore_aft` and one charged on the combined
+                # `hypot` are different experiments: the working get-up is
+                # 0.353 m lateral + 0.702 m fore-aft, so the combined charge
+                # is partly paying for a STRIDE.
+                "span_axis": os.environ.get(E.SPAN_AXIS_ENV, "") or "both",
+            "span_band": os.environ.get(E.SPAN_BAND_ENV, "") or "",
+                "span_band": os.environ.get(E.SPAN_BAND_ENV, "") or "",
+                # Pre-existing gaps the knob sweep turned up on this branch:
+                # both are read by the ctor and were recorded on `getup` but
+                # not here, so a `getup_ref` run that set either could not be
+                # reproduced from its own record.
+                "getup_blend": float(os.environ.get(E.BLEND_ENV, "") or 0.0),
+                "launch_span": float(os.environ.get(E.LAUNCH_SPAN_ENV, "")
                                      or 0.0),
             }
         if task != "getup":
@@ -1516,6 +1666,34 @@ class AsimovBody(_SPEC_BASE):
             # EVERY branch; this file has had the set-but-not-recorded bug
             # five times, and a sixth the day this term was added.
             "roll_pay": float(os.environ.get(E.ROLL_ENV, "") or 0.0),
+            "fell_cut": bool(int(os.environ.get(E.FELL_CUT_ENV, "")
+                                 or 1)),
+            "push_every": float(os.environ.get(E.PUSH_EVERY_ENV, "")
+                                or 0.0),
+            "rise_vel_cost": float(os.environ.get(E.RISE_VEL_ENV, "")
+                                   or 0.0),
+            # WHICH ACTUATOR. The single most consequential knob on this
+            # body and the last one to get recorded: "xml" clamps the PD
+            # output at the URDF's continuous effort with NO speed
+            # dependence, "dc" clamps it inside the published speed-torque
+            # envelope (robots/asimov_motor). Every Asimov get-up trained
+            # here before 2026-10-13 trained on "xml" -- a robot that is
+            # weak at rest and unlimited in motion -- and exceeds Menlo's
+            # own joint ratings on 82 % of its rise frames as a result. A
+            # policy trained under each is not two seeds of one
+            # experiment; it is two different robots.
+            "actuator_force": _motor_choice(),
+            # HOW MANY FRAMES THE POLICY SEES. Added here on 2026-10-13, when
+            # `history` moved from `AsimovGetupRefEnv` up to `AsimovGetupEnv`
+            # — which made it usable by THIS task and, for a few hours, usable
+            # without being recorded. That is the bug this file has had six
+            # times and this would be the worst instance: a run at 5 frames
+            # and a run at 1 are not the same controller and cannot even be
+            # loaded by the same env (390 floats against 78). 1 is Menlo's
+            # hot-swap contract; above it needs an on-device ring buffer,
+            # which is what openhorizon ship. The ablation says one frame
+            # cannot do this task at all.
+            "history": int(os.environ.get(E.HISTORY_ENV, "1") or 1),
             # THE ACTION CLIP. Recorded because it is reachability on this
             # body, not tuning: the inherited 4.0 reaches 1.0 rad from the
             # standing pose and the working get-up needs 2.88. A run at 4.0 and
@@ -1529,6 +1707,16 @@ class AsimovBody(_SPEC_BASE):
             # height. See `AsimovGetupEnv.ARM_PUSH_ENV`.
             "arm_push": float(os.environ.get(E.ARM_PUSH_ENV, "")
                               or E.W_ARM_PUSH),
+            "arm_work": float(os.environ.get(E.ARM_WORK_ENV, "")
+                              or 0.0),
+            "tuck_work": float(os.environ.get(E.TUCK_WORK_ENV, "")
+                               or 0.0),
+            "tuck2": float(os.environ.get(E.TUCK2_ENV, "")
+                           or 0.0),
+            "rotate_work": float(os.environ.get(E.ROTATE_WORK_ENV, "")
+                                 or 0.0),
+            "rise_work": float(os.environ.get(E.RISE_WORK_ENV, "")
+                               or 0.0),
             "arm_effort": float(os.environ.get(E.ARM_EFFORT_ENV, "")
                                 or E.W_ARM_EFFORT),
             "head_up": float(os.environ.get(E.HEAD_ENV, "") or E.W_HEAD_UP),
@@ -1565,11 +1753,26 @@ class AsimovBody(_SPEC_BASE):
             "balance_cost": float(os.environ.get(E.BALANCE_ENV, "")
                                   or 0.0),
             "home_pay": float(os.environ.get(E.HOME_ENV, "") or 0.0),
+            "joint_vel_cost": float(os.environ.get(E.JOINT_VEL_ENV, "")
+                                    or E.W_JOINT_VEL),
+            "over_clip_cost": float(os.environ.get(E.OVER_CLIP_ENV, "")
+                                    or E.W_OVER_CLIP),
             "limit_cost": float(os.environ.get(E.LIMIT_ENV, "") or 0.0),
             "push_bw": float(os.environ.get(E.PUSH_ENV, "") or 0.0),
             "calm_cost": float(os.environ.get(E.CALM_ENV, "") or 0.0),
             "swing_pay": float(os.environ.get(E.SWING_ENV, "") or 0.0),
             "handoff_pay": float(os.environ.get(E.HANDOFF_ENV, "") or 0.0),
+            # The three scaffolding knobs added 2026-10-15. See the identical
+            # block on the `getup_ref` branch for why an unrecorded one is a
+            # silent experiment rather than a cosmetic gap.
+            "getup_attitude": float(os.environ.get(E.ATTITUDE_ENV, "")
+                                    or 0.0),
+            "fold_pay": float(os.environ.get(E.FOLD_ENV, "") or 0.0),
+            "arm_unload": float(os.environ.get(E.ARM_UNLOAD_ENV, "") or 0.0),
+            # See the note on the other branches: lateral and fore-aft are
+            # different postures and a charge must say which it means.
+            "span_axis": os.environ.get(E.SPAN_AXIS_ENV, "") or "both",
+            "span_band": os.environ.get(E.SPAN_BAND_ENV, "") or "",
         }
         return out
 
@@ -1589,10 +1792,20 @@ class AsimovBody(_SPEC_BASE):
             f"asimov1 has no {task!r} task — it has {', '.join(self.TASKS)}")
 
     def shipped_policies(self) -> tuple[dict, ...]:
-        """The one policy that came with this robot, as a palette entry."""
+        """The policies that came WITH this robot, as palette entries.
+
+        Two vendors, and the distinction is the whole point of listing both:
+        Menlo ship the WALKER and nothing else, so `asimov1-shipped` scores
+        0/24 from the floor and is not a get-up. The one that gets up is
+        openhorizon-labs' (Apache-2.0, fetched separately) — 24/24, median
+        1.00 s, inside the published speed-torque envelope.
+        """
+        from . import asimov_openhorizon as _oh
+
+        out: list[dict] = list(_oh.lab_entries())
         if not policy_ready():
-            return ()
-        return ({
+            return tuple(out)
+        return tuple(out) + ({
             "id": "asimov1-shipped",
             "label": "Asimov 1 walk (Menlo)",
             "group": "shipped",
@@ -1601,7 +1814,8 @@ class AsimovBody(_SPEC_BASE):
             "note": "Menlo's own AMP+PPO locomotion policy, measured HERE "
                     "deterministically: 0.44 m/s at a 0.5 command, 0.68 at "
                     "0.8, turns 0.48 rad/s at 0.6, no falls in 10 s on any "
-                    "of six commands",
+                    "of six commands. Menlo's ONLY shipped policy: it is a "
+                    "walker, and from the floor it rises 0/24.",
         },)
 
     def attach(self, spec_, prefix: str, frame) -> None:

@@ -52,6 +52,50 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=260, help="control steps an episode")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--history", type=int, default=1,
+                    help="frames of Menlo's 78-float observation the STUDENT "
+                         "reads (78*N inputs). 1 was the only option until "
+                         "2026-10-13, when the ablation showed the teacher's "
+                         "5-frame ring is load-bearing: freeze it to the "
+                         "present and their get-up goes 24/24 -> 0/24. So a "
+                         "one-frame student cannot represent this teacher, "
+                         "and N=5 is the first width that can (our 390 floats "
+                         "are a strict superset of their 375).")
+    ap.add_argument("--arm-weight", type=float, default=1.0,
+                    help="multiply the squared error on shoulder/elbow/wrist "
+                         "by this. 1.0 is the old equal-weight loss. The arm "
+                         "is where this clone visibly differs from the "
+                         "teacher: trajectory RMS over the push-off is 0.464 "
+                         "rad at the elbow and 0.078 at the ankle roll, and "
+                         "an equally-weighted mean lets the optimiser trade "
+                         "the joint that decides the motion for one already "
+                         "right.")
+    ap.add_argument("--phase-weight", type=float, default=1.0,
+                    help="multiply the squared error on PUSH-OFF frames by "
+                         "this. Measured on the teacher's own rises: the "
+                         "trunk climbs at 0.77-0.90 m/s inside "
+                         "--phase-band and at 0.125 m/s below it, and **65 %% "
+                         "of collected frames sit below the band** — so the "
+                         "moment that decides the get-up is outnumbered 2:1 "
+                         "by the setup that precedes it. Unlike the per-JOINT "
+                         "weight (which cost 29 of 41 rises), this reweights "
+                         "WHEN rather than WHICH.")
+    ap.add_argument("--phase-band", default="0.19,0.50",
+                    help="trunk-z metres treated as the push-off. The default "
+                         "is measured, not chosen: the fastest-climbing "
+                         "quartile of the teacher's frames sits at 0.23-0.51 m "
+                         "and the climb rate steps up 7x at 0.19.")
+    ap.add_argument("--clean-weight", type=float, default=1.0,
+                    help="multiply the squared error on ITERATION 0's rows "
+                         "(the teacher-driven demonstrations) by this on "
+                         "every later DAgger fit. 1.0 is the old behaviour, "
+                         "under which iteration 3's 36k-pair aggregate is "
+                         "dominated by hard student states and the clean "
+                         "demonstrations carrying the skill are diluted.")
+    ap.add_argument("--actuator", default="xml", choices=("xml", "dc"),
+                    help="'dc' enforces Menlo's published speed-torque "
+                         "envelope (robots/asimov_motor). The teacher rises "
+                         "24/24 inside it; our own policies rise 0/48.")
     ap.add_argument("--action-clip", type=float, default=13.0,
                     help="the collection env's clip. 13.0, not the spec's 4.0: "
                          "the teacher exceeds 4.0 on 15.5 %% of its frames and "
@@ -114,6 +158,11 @@ def main() -> int:
               f"{ {k: v for k, v in env_kw.items() if k not in ('seed',)} }",
               flush=True)
     env_kw["action_clip"] = a.action_clip
+    # THE STUDENT'S OWN WIDTH AND THE ROBOT IT COLLECTS ON. Both must be the
+    # same here and in `distill.fit`, or the clone is fitted on one robot's
+    # data and built for another's observation.
+    env_kw["history"] = a.history
+    env_kw["actuator_force"] = a.actuator
     env = S.get("asimov1").env_class("getup_clip")(**env_kw)
     m, d = env.model, env.data
     pol = R.Policy(str(THEIRS / "policies/getup.onnx"), spec, m)
@@ -166,6 +215,14 @@ def main() -> int:
         return predict
 
     OBS, ACT = [], []
+    #: Trunk height at each kept sample — `--phase-weight` reads it to find
+    #: the push-off. Kept beside OBS/ACT rather than recomputed, because the
+    #: only moment it is cheaply available is while the episode is running.
+    ZS: list[float] = []
+    #: How many rows came from ITERATION 0 — the teacher-driven
+    #: demonstrations. They sit first in the aggregate and are what
+    #: `--clean-weight` keeps load-bearing once student states pile up.
+    n_clean = 0
     student = None
     if a.student_from:
         print(f"iteration 0 collects on the TEACHER as always — it is the base "
@@ -193,6 +250,16 @@ def main() -> int:
             # flags — the harness was the whole story.
             pol.reset()
             obs = env._get_obs()
+            # THE OBSERVATION RING GOES LIVE. This loop drives `mj_step`
+            # itself for the teacher-driven iteration, so it never reaches
+            # `AsimovGetupEnv.step`, which is what normally sets this — and
+            # while it is False `_get_obs` REBUILDS the history every call.
+            # Without this line every collected observation holds N identical
+            # frames: a history-less input in a 78*N shape. The clone then
+            # fits it perfectly (MSE 0.000359) and meets a real history at
+            # evaluation (MSE 0.273526 on the SAME states), which reads like
+            # covariate shift and is not.
+            env._obs_live = True
             stood_yet = False
             for k in range(a.steps):
                 pol.step(d)                      # teacher sees the true state
@@ -207,6 +274,7 @@ def main() -> int:
                 keep = (student is None) or (not a.post_stand_only) or stood_yet
                 if keep:
                     OBS.append(obs.copy()); ACT.append(lab.copy())
+                    ZS.append(zz)          # trunk height, for --phase-weight
                     n_kept += 1
                 n_tot += 1
                 n_over += int(np.abs(lab).max() > env._act_clip)
@@ -226,6 +294,15 @@ def main() -> int:
                     for _ in range(decim):
                         d.qfrc_applied[:] = 0.0
                         d.ctrl[act_id] = pol.target
+                        # THE ACTUATOR MODEL, which `env.step` would apply and
+                        # this hand-rolled loop would not. Without it
+                        # `--actuator dc` collects at the FLAT clamp while the
+                        # env, the run record and the student's own rollouts
+                        # all say `dc` — the teacher would be demonstrating a
+                        # motion on a stronger robot than the student is ever
+                        # asked to reproduce it on, and nothing would say so.
+                        if env._motor is not None:
+                            env._motor.before_step()
                         mujoco.mj_step(m, d)
                     obs = env._get_obs()
                 else:                            # DAgger: the STUDENT drives
@@ -257,6 +334,8 @@ def main() -> int:
               f"{100*n_over/max(n_tot,1):.1f} %",
               flush=True)
 
+        if it == 0:
+            n_clean = len(OBS)
         # float32: `distill.fit` builds torch tensors straight from these and
         # a float64 label raises "Found dtype Double but expected Float".
         obs_a = np.asarray(OBS, np.float32)
@@ -273,7 +352,48 @@ def main() -> int:
                                else f"{a.run_name}-it{it}")
         # `twist_cmd` is zero for a get-up on purpose — nothing is commanded.
         # Every OTHER flat slot is a harness bug, and `dead_slots` raises on it.
+        # PER-JOINT: the arm, which is where the motion differs.
+        jw = np.ones(len(W.JOINT_NAMES), np.float32)
+        if a.arm_weight != 1.0:
+            arm = [i for i, n in enumerate(W.JOINT_NAMES)
+                   if any(k in n for k in ("shoulder", "elbow", "wrist"))]
+            jw[arm] = a.arm_weight
+        # PER-SAMPLE: keep iteration 0's clean demonstrations load-bearing in
+        # the aggregate instead of letting later student states swamp them.
+        sw = np.ones(len(obs_a), np.float32)
+        if a.clean_weight != 1.0 and n_clean:
+            sw[:n_clean] = a.clean_weight
+        # PER-PHASE: the push-off, by trunk height. Multiplies into whatever
+        # the clean weight already set, so the two compose rather than one
+        # silently winning.
+        n_phase = 0
+        if a.phase_weight != 1.0:
+            lo, hi = (float(x) for x in a.phase_band.split(","))
+            z = np.asarray(ZS[:len(obs_a)], np.float32)
+            band = (z >= lo) & (z <= hi)
+            sw[band] *= a.phase_weight
+            n_phase = int(band.sum())
+            print(f"[iter {it}] push-off band {lo:g}-{hi:g} m covers "
+                  f"{n_phase} of {len(sw)} frames "
+                  f"({100 * band.mean():.0f} %), weighted x{a.phase_weight:g}",
+                  flush=True)
+        # Counts the CLEAN rows explicitly rather than `sw != 1`, which also
+        # catches phase-weighted rows and would report the wrong thing the
+        # moment both weights are on.
+        n_cw = n_clean if (a.clean_weight != 1.0 and n_clean) else 0
+        print(f"[iter {it}] loss weights: arm x{a.arm_weight:g} on "
+              f"{int((jw != 1).sum())} joints; clean x{a.clean_weight:g} on "
+              f"{n_cw} rows; push-off x{a.phase_weight:g} on {n_phase} rows; "
+              f"{int((sw != 1).sum())} of {len(sw)} rows reweighted overall",
+              flush=True)
         mse = distill.fit(obs_a, act_a, out, epochs=a.epochs, seed=a.seed,
+                          joint_weights=(None if a.arm_weight == 1.0 else jw),
+                          sample_weights=(None if (a.clean_weight == 1.0
+                                                   and a.phase_weight == 1.0)
+                                          else sw),
+                          env_kwargs={"history": a.history,
+                                      "actuator_force": a.actuator,
+                                      "action_clip": a.action_clip},
                           robot="asimov1", task="getup_clip",
                           allow_dead=("twist_cmd",))
         print(f"[iter {it}] fitted {len(obs_a)} pairs -> {out.name}  "

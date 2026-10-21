@@ -3431,3 +3431,131 @@ def test_a_preview_never_inherits_a_training_terminal_or_a_demo_assist(
     assert out["getup_label"] == "supine,prone"
     assert set(V.NOT_FROM_THE_RUN) == {"handoff_pay", "getup_assist",
                                        "getup_blend"}
+
+
+def test_the_switch_hands_BACK_when_the_robot_goes_down():
+    """It used to be one way, so a shoved robot stayed down for good.
+
+    Measured over 12 x 30 s episodes under 506 N shoves: one way 12 stands /
+    0 recoveries / 0 of 12 up at the end; two way 44 / 32 / 11 of 12. The
+    down-predicate reads PROJECTED GRAVITY — what the robot can sense — and
+    its dwell is the settle clause, because handing the get-up a state
+    mid-fall is the mistake that cost 7.5M steps.
+    """
+    from microduck_local.robots import asimov_walk as AW
+
+    d = types.SimpleNamespace(
+        robot="asimov1", obs=np.zeros(78), handed=True, _down_n=0,
+        handoff_infer=object(),
+        DOWN_UPRIGHT=V.Duck.DOWN_UPRIGHT, DOWN_DWELL=V.Duck.DOWN_DWELL)
+    gi = slice(*AW.OBS_GRAVITY)
+
+    # STANDING: gravity projects to -1 on z, so uprightness is +1.
+    d.obs[gi] = [0.0, 0.0, -1.0]
+    assert V.Duck._down_due(d) is False
+    assert d._down_n == 0
+
+    # DOWN: uprightness ~0. One tick is not enough — the dwell is a SETTLE.
+    d.obs[gi] = [-1.0, 0.0, 0.0]
+    fired = [V.Duck._down_due(d) for _ in range(V.Duck.DOWN_DWELL)]
+    assert fired[:-1] == [False] * (V.Duck.DOWN_DWELL - 1), (
+        "a single down frame must not hand back — the fall is still in "
+        "progress")
+    assert fired[-1] is True
+
+    # STANDING AGAIN clears the partial dwell, so a wobble cannot accumulate.
+    d._down_n = 0
+    d.obs[gi] = [-1.0, 0.0, 0.0]
+    V.Duck._down_due(d)
+    d.obs[gi] = [0.0, 0.0, -1.0]
+    assert V.Duck._down_due(d) is False
+    assert d._down_n == 0
+
+    # A BODY WITH NO KNOWN GRAVITY SLICE never hands back, rather than
+    # reading someone else's observation layout — four bugs of that shape
+    # already in this file.
+    duck = types.SimpleNamespace(robot="microduck", obs=np.zeros(61),
+                                 handed=True, _down_n=0)
+    assert V.Duck._down_due(duck) is False
+
+
+def test_the_shove_is_streamed_so_a_viewer_can_SEE_it():
+    """`push` is read off `xfrc_applied`, not kept in a parallel copy.
+
+    That array is what MuJoCo integrates, so the arrow cannot drift from the
+    force actually applied. The vertical row is excluded on purpose: it is
+    the demo assist's channel, which the "spotting" chip already reports.
+    """
+    import numpy as _np
+
+    env = types.SimpleNamespace(
+        trunk_body_id=3,
+        data=types.SimpleNamespace(xfrc_applied=_np.zeros((6, 6)),
+                                   xpos=_np.zeros((6, 3))))
+    env.data.xpos[3] = [1.0, 2.0, 0.6]
+    d = types.SimpleNamespace(env=env)
+
+    # nothing applied -> nothing drawn
+    assert V._push_payload(d) is None
+
+    # a lateral shove -> origin at the trunk, direction and newtons reported
+    env.data.xfrc_applied[3, 1] = 506.0
+    got = V._push_payload(d)
+    assert got["at"] == [1.0, 2.0, 0.6]
+    assert got["vec"] == [0.0, 506.0, 0.0]
+    assert got["n"] == 506.0
+
+    # the ASSIST's vertical channel must not be drawn as a shove
+    env.data.xfrc_applied[3] = 0.0
+    env.data.xfrc_applied[3, 2] = 300.0
+    assert V._push_payload(d) is None, (
+        "the vertical row is the demo assist, reported by the spotting chip")
+
+    # sub-newton numerical dust is not a shove
+    env.data.xfrc_applied[3] = 0.0
+    env.data.xfrc_applied[3, 0] = 0.4
+    assert V._push_payload(d) is None
+
+    # a body with no trunk (a kinematic idle) must not raise in the 50 Hz loop
+    assert V._push_payload(types.SimpleNamespace(env=None)) is None
+    assert V._push_payload(types.SimpleNamespace()) is None
+
+
+def test_a_restored_duck_keeps_the_shove_its_LABEL_claims(tmp_path, monkeypatch):
+    """The label outlived the force, which is a demo that lies.
+
+    A shoved showcase saved its label ("… — shoved 1.6bw") but not the shove,
+    so after a lab restart `restore_ducks` rebuilt the env from the recipe
+    and the chip claimed a force nothing was applying — the same fault as
+    previewing an assisted get-up as unaided.
+    """
+    applied: dict = {}
+    monkeypatch.setattr(V, "showcase_env_kwargs", lambda p: {"getup_label": "supine"})
+    monkeypatch.setattr(V, "handoff_for", lambda p: None)
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: V._zero_infer)
+    monkeypatch.setattr(V, "load_policy_infer", lambda pid: V._zero_infer)
+
+    def fake_duck(did, label, infer, **kw):
+        applied.update(kw.get("env_kwargs") or {})
+        return types.SimpleNamespace(id=did, label=label, showcase=False,
+                                     shove=0.0, created_at=None,
+                                     handoff_infer=None, handoff_label=None,
+                                     handoff_fn=None, handoff_recenter=None)
+    monkeypatch.setattr(V, "Duck", fake_duck)
+
+    state = tmp_path / "lab-state.json"
+    state.write_text(json.dumps({"version": 1, "ducks": [
+        {"id": "d0", "label": "getup ✨ — shoved 1.6bw", "policy": None,
+         "onnxPath": str(tmp_path / "policy.onnx"), "robot": "asimov1",
+         "showcase": True, "shove": 1.6}]}))
+
+    restored = V.restore_ducks(state)
+    assert [d.id for d in restored] == ["d0"]
+    assert applied["push_bw"] == 1.6, "the label says shoved; so must the env"
+    assert applied["fell_cut"] is False, (
+        "without this the lab RESETS on the fall and the viewer sees a "
+        "respawn that looks like a recovery")
+    assert applied["max_episode_s"] >= 30.0
+    assert applied["push_every"] == V.PUSH_EVERY_DEMO_S, (
+        "a watched demo waits between shoves — the training cadence counts "
+        "WALL time and hits the robot the instant a 3.4 s rise finishes")

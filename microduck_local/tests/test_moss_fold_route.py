@@ -3,10 +3,9 @@ release pose through one planned waypoint, 2.0 rad of the slowest joint
 instead of the learned fold's 6.1 (7.8 s a fold in the yard)."""
 import mujoco
 import numpy as np
+import pytest
 
 from microduck_local.robots import moss
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),

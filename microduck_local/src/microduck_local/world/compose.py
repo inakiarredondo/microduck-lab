@@ -18,8 +18,10 @@ sensors (`sensors.ray.DEFAULT_GROUPS`) see it.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import mujoco
 import numpy as np
@@ -116,6 +118,142 @@ def paint_team(model: mujoco.MjModel, duck_id: str, colorway: str) -> int:
                 model.mat_rgba[mid] = [*rgb, 1.0]
                 n += 1
     return n
+
+
+def _collider_rgba(pr) -> list[float]:
+    """A prop wearing a `look` hides its own collider rather than drawing both.
+
+    Invisible, not absent: it still collides, still has the mass, and is still
+    what every detector measures — `Prop.look` is a picture and nothing else.
+    """
+    return [0.0, 0.0, 0.0, 0.0] if pr.look else list(pr.rgba)
+
+
+@functools.lru_cache(maxsize=1)
+def _duck_figurine():
+    """The MICRODUCK'S OWN visual meshes, baked at its home pose.
+
+    A figurine is the real robot's CAD, not a duck drawn from primitives —
+    the point of putting one in a room is that it is recognisably THIS robot.
+    It is baked because a figurine is one rigid body: the duck's 70 visual
+    mesh geoms are posed once at keyframe 0 and their transforms frozen, so
+    the thing MOSS picks up has no joints and costs the solver nothing.
+
+    Each part is placed from its DECLARED geom transform composed with its
+    body's world transform, NOT from `geom_xpos`. The two differ, and the
+    difference is the whole bug this comment exists to prevent: when a geom
+    references a mesh, the compiler shifts its pos by that mesh's centroid
+    offset. `geom_xpos` already carries that shift, so re-declaring it put the
+    offset in TWICE and the figurine came out 123 mm instead of 93 with its
+    parts flung apart. Declared transforms are what the compiler has not
+    touched, and it applies the same shift to the figurine's copy — scaled
+    with everything else — so it cancels.
+
+    Returned normalised to a figurine of height 1.0 standing on z = 0 and
+    centred on its own bbox in x and y, so one bake draws it at any size:
+    `(parts, H)` with H the posed duck's real height in metres.
+    """
+    spec = mujoco.MjSpec.from_file(str(ROBOT_XML["walk"]))
+    base = Path(spec.modelfiledir) / spec.meshdir
+    # Keyed by the FILE STEM as well as the declared name: MuJoCo derives a
+    # mesh's name from its filename when the MJCF leaves it blank, so the
+    # compiled model knows names the spec never spelled.
+    files = {}
+    for mesh in spec.meshes:
+        entry = (str(base / mesh.file), tuple(float(v) for v in mesh.scale))
+        files[Path(mesh.file).stem] = entry
+        if mesh.name:
+            files[mesh.name] = entry
+    m = spec.compile()
+    d = mujoco.MjData(m)
+    mujoco.mj_resetDataKeyframe(m, d, 0)
+    mujoco.mj_forward(m, d)
+    # The bbox of the POSED duck, from real vertices rather than geom radii —
+    # the feet go on the floor and the body stands on the collider's axis, and
+    # a radius-based box would put both in the wrong place. This one IS read
+    # off the compiled model, because it is a measurement of where the duck
+    # actually is rather than a transform handed back to the compiler.
+    lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+    for i in range(m.ngeom):
+        if (m.geom_type[i] != mujoco.mjtGeom.mjGEOM_MESH
+                or m.geom_group[i] not in (2, MOUTH_GROUP)):
+            continue
+        mid = int(m.geom_dataid[i])
+        va, vn = int(m.mesh_vertadr[mid]), int(m.mesh_vertnum[mid])
+        w = m.mesh_vert[va:va + vn] @ d.geom_xmat[i].reshape(3, 3).T + d.geom_xpos[i]
+        lo, hi = np.minimum(lo, w.min(0)), np.maximum(hi, w.max(0))
+    H = float(hi[2] - lo[2])
+    origin = np.array([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, lo[2]])
+
+    # COLOUR comes from the compiled model's MATERIALS, not from the spec
+    # geom's `rgba`: the duck's shells are painted with materials and every
+    # one of those geoms carries the default grey rgba, which is what a first
+    # bake drew — a grey duck. Keyed by (body, mesh), as `lab/robots.py
+    # extract_scene` resolves the same thing for the lab's own ducks.
+    paint: dict[tuple[str, str], tuple[float, ...]] = {}
+    for i in range(m.ngeom):
+        if (m.geom_type[i] != mujoco.mjtGeom.mjGEOM_MESH
+                or m.geom_group[i] not in (2, MOUTH_GROUP)):
+            continue
+        matid = int(m.geom_matid[i])
+        rgba = m.mat_rgba[matid] if matid >= 0 else m.geom_rgba[i]
+        key = (m.body(int(m.geom_bodyid[i])).name, m.mesh(int(m.geom_dataid[i])).name)
+        paint.setdefault(key, tuple(float(v) for v in rgba))
+
+    parts = []
+    for body in spec.bodies:
+        if body.name not in {m.body(b).name for b in range(m.nbody)}:
+            continue
+        bid = m.body(body.name).id
+        bpos, bmat = d.xpos[bid], d.xmat[bid].reshape(3, 3)
+        bquat = np.zeros(4)
+        mujoco.mju_mat2Quat(bquat, d.xmat[bid])
+        for g in body.geoms:
+            if not g.meshname or g.group not in (2, MOUTH_GROUP):
+                continue
+            gpos, gquat = np.asarray(g.pos, float), np.asarray(g.quat, float)
+            wpos = bpos + bmat @ gpos
+            wquat = np.zeros(4)
+            mujoco.mju_mulQuat(wquat, bquat, gquat)
+            rgba = paint.get((body.name, g.meshname),
+                             tuple(float(v) for v in g.rgba))
+            parts.append((g.meshname, files[g.meshname][0], files[g.meshname][1],
+                          tuple((wpos - origin) / H), tuple(wquat), rgba))
+    return tuple(parts), H
+
+
+def _add_look(spec, parent, pr) -> None:
+    """Draw `pr.look` over this prop: visual-only geoms, no contact, no mass.
+
+    The COLLIDER is what the physics and every sensor use and it is not
+    touched — this only changes the picture, which is the whole contract of
+    `scenario.Prop.look`. The caller hides the collider so the two are not
+    drawn on top of each other.
+    """
+    if pr.look != "duck":
+        return
+    h = (2 * float(pr.size[0]) if pr.shape == "sphere" else float(pr.size[2]))
+    parts, H = _duck_figurine()
+    k = h / H                       # 93 mm of figurine out of a 279 mm duck
+    # Several figurines of the same size share one set of mesh assets; MjSpec
+    # takes no attributes of ours, so the spec's own mesh list is the record.
+    added = {mesh.name for mesh in spec.meshes}
+    for i, (name, file, mscale, rel, quat, rgba) in enumerate(parts):
+        asset = f"ducklook_{name}_{round(k, 6)}"
+        if asset not in added:
+            mesh = spec.add_mesh()
+            mesh.name, mesh.file = asset, file
+            mesh.scale = [v * k for v in mscale]
+            added.add(asset)
+        parent.add_geom(
+            name=f"{pr.id}_look{i}", type=mujoco.mjtGeom.mjGEOM_MESH,
+            meshname=asset,
+            # the body's origin is the collider's CENTRE, and the bake stands
+            # the figurine on z = 0, so everything drops by half the height
+            pos=[rel[0] * h, rel[1] * h, rel[2] * h - h / 2], quat=list(quat),
+            # visual only: no contact, no mass, and OUT of the ranging groups
+            # so no sensor can see a shape the physics does not have.
+            contype=0, conaffinity=0, mass=0.0, group=2, rgba=list(rgba))
 
 
 def _yaw_quat(yaw: float) -> list[float]:
@@ -485,10 +623,15 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
     # did and `tests/test_arena.py`'s step-for-step lock against the walk env
     # is untouched; a MARS room that has to GRASP says 0.002 and gets it.
     spec.option.timestep = scenario.physics_dt
-    # The G1 XML wants implicitfast / 10 / 20; attach keeps the PARENT, so
-    # set it here before the robot is attached. Capsule-only worlds stay on
-    # the spec default — test_arena's duck lock does not load a G1.
-    if any(p.kind == "g1" for p in scenario.persons):
+    # A walking person's XML wants implicitfast / 10 / 20; attach keeps the
+    # PARENT, so set it here before the robot is attached. Capsule-only worlds
+    # stay on the spec default — test_arena's duck lock loads no robot person.
+    # MEASURED for Asimov 1 (2026-10-03): its shipped file asks for an
+    # elliptic cone at impratio 10 and gets this room's pyramidal cone at 1
+    # instead, and its policy walks the same — 4.32 m against 4.40 m at a 0.5
+    # command over 10 s, no falls. So it declares no `SOLVER_OPTIONS` and
+    # takes the room's, which is the generic hook below.
+    if any(p.kind != "capsule" for p in scenario.persons):
         spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         spec.option.iterations = 10
         spec.option.ls_iterations = 20
@@ -614,7 +757,7 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
             body = w.add_body(name=pr.id, pos=[pr.pos[0], pr.pos[1], z], quat=_yaw_quat(pr.yaw))
             body.add_freejoint(name=f"{pr.id}_free")
             body.add_geom(name=f"{pr.id}_geom", type=gtype, size=gsize, mass=pr.mass,
-                          group=0, rgba=list(pr.rgba),
+                          group=0, rgba=_collider_rgba(pr),
                           # ANYTHING THAT ROLLS NEEDS condim 6, not just
                           # spheres. A CYLINDER on its side is a roller with a
                           # line contact, and MOSS's cans are cylinders: they
@@ -627,10 +770,18 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
                           # rolling over all the time, and that's when it gets
                           # stuck in the treads."
                           **_prop_contact(pr))
+            _add_look(spec, body, pr)
         else:
-            w.add_geom(name=f"{pr.id}_geom", type=gtype, size=gsize,
-                       pos=[pr.pos[0], pr.pos[1], z], quat=_yaw_quat(pr.yaw),
-                       group=0, rgba=list(pr.rgba))
+            sb = w.add_body(name=pr.id, pos=[pr.pos[0], pr.pos[1], z],
+                            quat=_yaw_quat(pr.yaw)) if pr.look else w
+            if pr.look:
+                sb.add_geom(name=f"{pr.id}_geom", type=gtype, size=gsize,
+                            group=0, rgba=_collider_rgba(pr))
+                _add_look(spec, sb, pr)
+            else:
+                w.add_geom(name=f"{pr.id}_geom", type=gtype, size=gsize,
+                           pos=[pr.pos[0], pr.pos[1], z], quat=_yaw_quat(pr.yaw),
+                           group=0, rgba=list(pr.rgba))
     if scenario.basket is not None:
         b = scenario.basket
         bx, by = b.pos
@@ -649,12 +800,19 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
         mk.add_geom(name="basket_marker_geom", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[0.02, 0, 0],
                     contype=0, conaffinity=0, group=1, rgba=[0.2, 0.9, 0.5, 1.0])
     for i, person in enumerate(scenario.persons):
-        if person.kind == "g1":
-            from ..robots.g1 import g1_spec
-            robot = g1_spec()
+        if person.kind != "capsule":
+            # ASKED of the body, not tabled here: `Body.attach` is the same
+            # call this made by name for the G1 (`g1.G1Body.attach` is
+            # `spec.attach(g1_spec(), ...)`), and it is what lets a second
+            # walking body be a person with no edit to this file. A body that
+            # carries its own floor strips it there — Asimov's MJCF does, and
+            # a room with two floors is the failure that would otherwise be
+            # silent until something fell through one.
+            from ..robots import registry
             frame = w.add_frame(pos=[person.pos[0], person.pos[1], 0.0],
                                 quat=_yaw_quat(person.yaw))
-            spec.attach(robot, prefix=duck_prefix(person.id), frame=frame)
+            registry.get(person.kind).attach(
+                spec, duck_prefix(person.id), frame)
             continue
         # A mocap body: the world moves it kinematically (data.mocap_pos /
         # mocap_quat); ducks collide with it like a wall that walks. A capsule

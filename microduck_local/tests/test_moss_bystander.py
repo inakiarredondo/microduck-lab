@@ -10,10 +10,10 @@ has been shown to fail against a planted regression.
 import dataclasses
 import math
 
+import pytest
+
 from microduck_local.brain.runtime import Senses
 from microduck_local.robots import moss
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),
@@ -96,8 +96,10 @@ def test_a_cluster_steers_like_its_worst_member_not_like_a_crowd():
     """
     worst = (0.20, 0.00)                   # nearest, and dead centre
     others = [(0.38, 0.17), (0.40, -0.17)]
-    one = _brain(); _remember(one, worst)
-    many = _brain(); _remember(many, worst, *others)
+    one = _brain()
+    _remember(one, worst)
+    many = _brain()
+    _remember(many, worst, *others)
     assert len(many._mem.items) == 3, "the memory merged them: nothing tested"
     w1 = one._dodge((0.30, 0.0, 0.0), "a")[0][2]
     wn = many._dodge((0.30, 0.0, 0.0), "a")[0][2]

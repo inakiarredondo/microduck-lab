@@ -2123,3 +2123,40 @@ def test_getup_shepherds_pay_progress_not_state():
     # pays only what the pose actually moved.
     assert sum(sums[k] for k in shepherds) < 8.0
     env.close()
+
+
+def test_every_asimov_getup_behavior_DECLARES_the_handoff():
+    """The get-up is only finished when it hands off and stops moving.
+
+    `handoff_fn` + `handoff_policy` were declared on exactly ONE of the
+    seventeen Asimov get-up behaviors (`asimov_getup_turn`). Every working
+    get-up in this repo trained under `asimov_getup` or
+    `asimov_getup_whole`, which had neither, and `viz_server.handoff_for`
+    returns None unless the behavior declares it — so the lab drove the raw
+    get-up policy forever and Jonathan watched the finished robot SHAKE at a
+    measured 252 deg/s on the hip yaws, while this repo's acceptance scripts
+    reported 2.3 because THEY wired the handoff by hand.
+
+    A deliverable attached per-behavior depends on which of seventeen
+    near-identical entries a run happens to name. This asserts the whole
+    family, so adding an eighteenth cannot quietly omit it.
+    """
+    from microduck_local.behaviors.core import BEHAVIORS
+
+    getups = {
+        bid: b for bid, b in BEHAVIORS.items()
+        if getattr(b, "robot", "") == "asimov1"
+        and str(getattr(b, "task", "")) in ("getup", "getup_ref", "getup_clip")
+    }
+    # A green result must not be able to mean "swept nothing".
+    assert len(getups) >= 15, f"only found {len(getups)} asimov get-ups"
+    missing = sorted(bid for bid, b in getups.items()
+                     if getattr(b, "handoff_fn", None) is None)
+    assert not missing, (
+        f"{len(missing)} asimov get-up behaviors declare no handoff: "
+        f"{missing}. The lab will drive the raw get-up policy forever for "
+        "any run trained under them."
+    )
+    no_policy = sorted(bid for bid, b in getups.items()
+                       if not getattr(b, "handoff_policy", None))
+    assert not no_policy, f"handoff_fn but no handoff_policy: {no_policy}"
