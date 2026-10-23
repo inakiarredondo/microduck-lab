@@ -59,6 +59,41 @@ def test_record_world_writes_video_sheet_and_events(tmp_path, monkeypatch, scena
         assert "d0=tidy" in events.splitlines()[0]
 
 
+def test_a_follow_shot_is_framed_on_WHAT_IT_FOLLOWS():
+    """`FOLLOW_DISTANCE` is a 0.277 m duck's 1.1 m, and at it a 1.296 m Asimov
+    fills six tiles with its shins — every non-duck body this recorder has
+    ever followed was filmed that way, and this is the tool the `record-world`
+    skill says to read when a robot "does something weird".
+
+    Measured off the SUBJECT, so the duck's shot is unchanged to the float and
+    a body that cannot be measured still gets it.
+    """
+    from microduck_local.record_world import follow_scale
+    from microduck_local.world_server import resolve_scenario
+
+    duck = resolve_scenario("living-room")                  # d0 is a duck
+    assert follow_scale(duck, "d0") == 1.0
+
+    walkabout = resolve_scenario("asimov-walkabout")        # p0 is an Asimov
+    assert follow_scale(walkabout, "p0") == pytest.approx(1.296 / 0.2772, abs=0.02)
+    assert record_world.FOLLOW_DISTANCE * follow_scale(walkabout, "p0") > 1.296, (
+        "the camera is closer to the robot than the robot is tall")
+
+    mars = resolve_scenario("mars-follow")                  # d0 is a MARS
+    assert 1.4 < follow_scale(mars, "d0") < 1.8
+
+    # A mocap capsule has no model to measure; the scenario declares its size.
+    capsule = next((sc for sc in (resolve_scenario(n) for n in ("follow-me",))
+                    for p in sc.persons if p.kind == "capsule"), None)
+    if capsule is not None:
+        p = next(p for p in capsule.persons if p.kind == "capsule")
+        assert follow_scale(capsule, p.id) == pytest.approx(p.height / 0.2772, abs=0.02)
+
+    # Nothing to follow by that name: the shot it always had, not a crash —
+    # `make_camera` is what refuses an unknown id, with the list of real ones.
+    assert follow_scale(duck, "nobody") == 1.0
+
+
 def test_record_world_rejects_unknown_duck_and_camera(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["record-world", "living-room", "--seconds", "0.2",
                                       "--out", str(tmp_path), "--brain", "d9=wander"])

@@ -122,10 +122,72 @@ def collect(teacher: str, episodes: int, cmd_lo: float, cmd_hi: float,
             np.concatenate(ret_buf) if ret_buf else np.zeros(0, np.float32))
 
 
+#: Variance at or under which a slot never moved in the training data. The
+#: same threshold `export_onnx` and `train` use, and it has to be the SAME
+#: number: a slot that is dead here is one whose normalizer carries var 1e-8,
+#: and dividing a live deployment value by sqrt(1e-8) multiplies it by 10000.
+DEAD_OBS_VAR = 1e-8
+
+
+def dead_slots(obs: np.ndarray, robot: str,
+               allow: tuple[str, ...] = ()) -> list[str]:
+    """Raise if the teacher's data never moved a slot the contract declares.
+
+    THE BUG THIS EXISTS FOR. `scripts/distill_getup.py` stepped the physics by
+    hand and never wrote `env.last_action`, so all 23 of `obs[55:78]` were
+    exactly 0.0 in every one of 104 000 samples. Nothing complained: the fit
+    converged to 0.000228 rad^2, an 11.6x improvement, and the student stood
+    23/24 when it was driven with those slots still zeroed. Fed the real
+    previous action at deployment — which is what the contract says is there —
+    it stood 0/24. A clone cannot learn a slot it was never shown varying, and
+    a dead slot is INVISIBLE in the loss, because the loss is computed on the
+    same dead data.
+
+    `twist_cmd` is legitimately zero for a get-up (nothing is commanded), so
+    the caller declares which slots it MEANS to leave flat. Everything else is
+    a harness bug, and this is where it gets caught instead of two runs later.
+
+    The test is whole-slot (`.all()`), so ONE frozen joint inside an otherwise
+    live slot still passes. That is deliberate — a body may legitimately freeze
+    a joint (the G1's hands) — and it is the known limit of this guard, not an
+    oversight. Measured on the duck's own distillation path, every one of its
+    eight slots is live, so this costs nothing there.
+    """
+    from .robots import spec as S
+
+    var = np.asarray(obs).var(axis=0)
+    contract = S.get(robot).contract()
+    if len(var) != contract.obs_dim:
+        # The caller did not name the robot whose data this is (`distil_kick`
+        # passes none, so `robot` defaults to the duck while the data is the
+        # G1's 99). Slot boundaries from the wrong contract name the wrong
+        # floats, and a guard that reports the wrong slot is worse than no
+        # guard, so say nothing rather than something false.
+        return []
+    bad = []
+    for slot in contract.slots:
+        name, lo, hi = slot.name, slot.start, slot.stop
+        if name in allow:
+            continue
+        if hi <= len(var) and bool((var[lo:hi] <= DEAD_OBS_VAR).all()):
+            bad.append(f"{name} (obs[{lo}:{hi}], {hi - lo} slots)")
+    if bad:
+        raise ValueError(
+            "the teacher's observations never moved: " + ", ".join(bad)
+            + ".\nA clone trained on a dead slot meets a LIVE one at "
+            "deployment and fails in a way the loss cannot see. Either drive "
+            "the env so the slot varies, or pass allow_dead=(...) to say you "
+            "mean it.")
+    return bad
+
+
 def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
         batch: int = 4096, lr: float = 1e-3, seed: int = 0,
         returns: np.ndarray | None = None, robot: str = "microduck",
-        task: str = "walk") -> float:
+        task: str = "walk", allow_dead: tuple[str, ...] = (),
+        env_kwargs: dict | None = None,
+        joint_weights: np.ndarray | None = None,
+        sample_weights: np.ndarray | None = None) -> float:
     """Fit a fresh SB3 policy to the teacher's actions; save a warm-start run.
 
     With `returns`, the CRITIC is fitted too, on the teacher's own discounted
@@ -139,7 +201,24 @@ def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
     perfectly good gait before the critic catches up. An initialised critic
     is the targeted fix.
 
-    Returns the final ACTION MSE, in radians² of joint target.
+    `joint_weights` (one per action dim) and `sample_weights` (one per row)
+    multiply the squared error before it is averaged. Both default to None,
+    which is bit-identical to the unweighted loss — the arms that do not use
+    them must not move.
+
+    Why they exist. `mse_loss` averages 23 joints equally, so the optimiser
+    may trade accuracy on the joint that decides the motion for accuracy on
+    one that was already right: measured on the Asimov get-up, the clone's
+    trajectory error is **0.464 rad RMS at the elbow** and **0.078 at the
+    ankle roll**, and the arm is what visibly fails to push. `sample_weights`
+    is the DAgger counterpart — by iteration 3 the aggregate is 36 k pairs
+    dominated by hard student states, so the clean demonstrations that carry
+    the actual skill are diluted to a fraction of the loss.
+
+    Returns the final **UNWEIGHTED** action MSE, in radians² of joint target,
+    whatever the weights are. Reporting the weighted number would make any
+    reweighting look like an improvement by construction, which is the
+    measurement this function exists to provide.
     """
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -148,7 +227,16 @@ def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
     from .train_behavior import LR_END, LR_START, linear_decay
 
     cls = env_class(robot, task)
-    venv = DummyVecEnv([lambda: cls(seed=seed)])
+    dead_slots(obs, robot, allow_dead)
+    # ENV KWARGS, because the student's INPUT WIDTH comes from this env and
+    # not from `obs`. Built bare, it is always the task's default — so a
+    # teacher dataset of 78*N-wide observations was fitted to a 78-wide
+    # policy and the shapes only disagreed deep inside the first matmul.
+    # Asimov's get-up needs this: `history=5` is 390 inputs, and the 5-frame
+    # ring is LOAD-BEARING (their policy dies 24/24 -> 0/24 without it), so a
+    # one-frame student cannot represent the teacher at all.
+    ekw = dict(env_kwargs or {})
+    venv = DummyVecEnv([lambda: cls(seed=seed, **ekw)])
     venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=100.0)
     # Statistics from the teacher's own state distribution — this is the view
     # the student is trained on, and export_onnx bakes it back in later.
@@ -165,10 +253,28 @@ def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
         device="cpu", seed=seed, verbose=0, symmetry_coef=0.0, desired_kl=None,
     )
 
+    want = int(venv.observation_space.shape[0])
+    if obs.shape[1] != want:
+        raise ValueError(
+            f"the teacher dataset is {obs.shape[1]} wide and the student's env "
+            f"gives {want}. A clone fitted across a width mismatch is a "
+            f"different controller — pass env_kwargs (e.g. history=N) so the "
+            f"student reads what the data was recorded on.")
     norm = ((obs - venv.obs_rms.mean) / np.sqrt(venv.obs_rms.var)).astype(np.float32)
     norm = np.clip(norm, -venv.clip_obs, venv.clip_obs)
     x = torch.as_tensor(norm)
     y = torch.as_tensor(act)
+    jw = None if joint_weights is None else torch.as_tensor(
+        np.asarray(joint_weights, np.float32).reshape(1, -1))
+    if jw is not None and jw.shape[1] != y.shape[1]:
+        raise ValueError(
+            f"joint_weights has {jw.shape[1]} entries for {y.shape[1]} "
+            "actions — a silent broadcast here would weight the wrong joints")
+    sw = None if sample_weights is None else torch.as_tensor(
+        np.asarray(sample_weights, np.float32).reshape(-1))
+    if sw is not None and len(sw) != len(y):
+        raise ValueError(
+            f"sample_weights has {len(sw)} entries for {len(y)} rows")
     v = None if returns is None else torch.as_tensor(returns.astype(np.float32))
     opt = torch.optim.Adam(model.policy.parameters(), lr=lr)
     n = len(x)
@@ -186,8 +292,14 @@ def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
                 pi_feats = vf_feats = feats
             latent = model.policy.mlp_extractor.forward_actor(pi_feats)
             pred = model.policy.action_net(latent)
-            loss = torch.nn.functional.mse_loss(pred, yb)
-            a_loss = float(loss)
+            se = (pred - yb) ** 2
+            # REPORTED unweighted, OPTIMISED weighted — see the docstring.
+            a_loss = float(se.mean())
+            if jw is not None:
+                se = se * jw
+            if sw is not None:
+                se = se * sw[idx].unsqueeze(1)
+            loss = se.mean()
             if v is not None:
                 # Same optimizer, one backward: the critic head is fitted on
                 # the teacher's discounted returns over the SAME states, so
@@ -233,11 +345,30 @@ def fit(obs: np.ndarray, act: np.ndarray, out: Path, epochs: int = 40,
         except ValueError:
             prev = {}
     prev.update({"run_name": out.name, "robot": robot, "task": task,
+                 # WHAT THE STUDENT'S ENV WAS, recorded for the same reason
+                 # every trainer here records it: a clone whose run says
+                 # nothing cannot be rebuilt, and the two knobs that matter
+                 # most are invisible by inspection. `history` decides the
+                 # OBSERVATION WIDTH — a 390-input clone rebuilt at the
+                 # default 78 dies in the normalizer, which is the lucky case;
+                 # and `actuator_force` decides which robot it learned on.
+                 # Written as `env_kwargs` so `run_record.replay_kwargs` and
+                 # every scorer pick it up with no special case.
+                 "env_kwargs": {**ekw},
                  # The same contract record `train.py` writes
                  # (robots/policy_contract.py): a clone is a policy like any
                  # other and leaves here through the same exporter, so it has
                  # to say what it speaks. `robot` stays for the old readers.
-                 "contract": registry.get(robot).contract().as_dict(),
+                 # THE BODY's contract, which is only this student's when it
+                 # reads ONE frame. A stacked student speaks
+                 # `<robot>-<obs*N>-hist<N>-control` and recording the 78-float
+                 # id for it is a run.json that LIES: `policy_refusal` reads
+                 # the ONNX's own metadata first, so nothing broke, but a
+                 # reader comparing run.json to the graph would be misled.
+                 # Omitted rather than guessed when stacked — `export_onnx`
+                 # mints the authoritative one into the file.
+                 **({} if int(ekw.get("history", 1) or 1) > 1 else
+                    {"contract": registry.get(robot).contract().as_dict()}),
                  "distilled_from": True,
                  # an idle ignores the drive command; the lab must stop
                  # sending one (viz_server.is_trick_duck)

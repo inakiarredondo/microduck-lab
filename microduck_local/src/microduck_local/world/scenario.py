@@ -273,6 +273,20 @@ class Person:
     kind: str = "capsule"
 
 
+#: What a `persons[i].kind` may be: a mocap capsule, or the id of any
+#: registered body that can DRIVE itself (`Body.driver`). Resolved at
+#: validation rather than written out, so a body added to the registry — or
+#: shipped as a plugin — is a person kind with no edit here. `registry.ids()`
+#: compiles no model, so this stays cheap.
+def person_kinds() -> tuple[str, ...]:
+    from ..robots import registry
+
+    return ("capsule",) + tuple(registry.ids())
+
+
+#: The historical constant, kept because tests and error text read it. It is
+#: the two kinds that existed before `person_kinds()`; validation uses the
+#: function, so a new body does not have to appear here.
 PERSON_KINDS = ("capsule", "g1")
 
 
@@ -298,6 +312,11 @@ class Pickable:
 # of a given radius whatever it is drawn as, so a mesh would buy fidelity the
 # sensing never reads. A mesh prop is a separate change with its own reason.
 PROP_SHAPES = ("box", "sphere", "cylinder")
+
+# What the viewer may draw OVER a prop's collider (`Prop.look`). Closed,
+# because an unknown value would render as the bare collider and look like a
+# scenario that simply did not take.
+PROP_LOOKS: tuple[str, ...] = ("", "duck")
 
 
 @dataclass
@@ -347,6 +366,32 @@ class Prop:
     #: SOFTNESS 0..1 (`physics_contact`): a cigarette butt is a filter.
     friction: float | None = None
     soft: float = 0.0
+    #: What is DRAWN over this prop, when a primitive is the honest collider
+    #: but the wrong picture. "" draws the collider itself, which is what
+    #: every prop did and still does by default.
+    #:
+    #: "duck" makes it a MICRODUCK FIGURINE: the real robot's own CAD, posed
+    #: once at its rest keyframe, frozen and scaled to the prop's height — a
+    #: desk toy of the lab's other body, which is the point, since a duck
+    #: drawn from primitives would not be recognisably THIS robot. Both
+    #: renderers draw it and they are seated alike: `world/compose.py
+    #: _duck_figurine` bakes it into the model (so `record-world` and any
+    #: MuJoCo view get it), and the /sim page builds its own from `GET
+    #: /scene`'s `home` and `bbox` (`components/SimStage.tsx DuckFigurine`).
+    #:
+    #: The COLLIDER under it stays a plain primitive and is hidden rather than
+    #: removed. For the figurine that is a measured cylinder — see
+    #: `robots/moss_env.GRASP_PROPS["duckling"]`, which also records why the
+    #: full-size robot fits neither MOSS's jaw nor his bin, and why a box
+    #: collider jams those jaws open.
+    #:
+    #: It changes NOTHING about the physics or the sensing: the parts are
+    #: massless, out of every ranging group, and the detector still reports
+    #: `radius()` off the collider. `rgba` paints the collider, not the
+    #: figurine — a figurine wears the robot's own livery. A `look` nobody
+    #: knows would be a silently bare collider, so the set is closed and
+    #: validated.
+    look: str = ""
 
     def radius(self) -> float:
         """The sphere radius the DETECTOR models this prop as."""
@@ -623,9 +668,13 @@ def validate_scenario(raw: dict) -> Scenario:
         path = [_vec(w, 2, f"persons[{i}].path[{k}]", -bound, bound)
                 for k, w in enumerate(q.get("path", []) or [])]
         kind = q.get("kind", "capsule") or "capsule"
-        if kind not in PERSON_KINDS:
-            raise ScenarioError(f"persons[{i}].kind must be one of {PERSON_KINDS}")
-        g1 = kind == "g1"
+        kinds = person_kinds()
+        if kind not in kinds:
+            raise ScenarioError(f"persons[{i}].kind must be one of {kinds}")
+        # Any non-capsule kind is a WALKING ROBOT, and the three defaults
+        # below are the ones measured for a ~1.3 m humanoid. A body of another
+        # size says so in the scenario; nothing here is per-robot.
+        g1 = kind != "capsule"
         persons.append(Person(
             pid, _vec(q.get("pos", [0.0, 0.0]), 2, f"persons[{i}].pos", -bound, bound),
             _num(q.get("yaw", 0.0), f"persons[{i}].yaw", -2 * math.pi, 2 * math.pi),
@@ -666,6 +715,12 @@ def validate_scenario(raw: dict) -> Scenario:
         cls = q.get("cls", "toy")
         if cls not in DETECT_CLASSES:
             raise ScenarioError(f"props[{i}].cls must be one of {sorted(DETECT_CLASSES)}")
+        look = q.get("look", "") or ""
+        if look not in PROP_LOOKS:
+            raise ScenarioError(
+                f"props[{i}].look must be one of {list(PROP_LOOKS)} — the "
+                "viewer draws nothing it does not know, so an unrecognised "
+                "look is a prop that silently stays a bare collider")
         props.append(Prop(
             pid,
             _vec(q.get("pos"), 3, f"props[{i}].pos", -bound, bound),
@@ -679,6 +734,7 @@ def validate_scenario(raw: dict) -> Scenario:
             (None if q.get("friction") is None else
              _num(q.get("friction"), f"props[{i}].friction", 0.05, 3.0)),
             _num(q.get("soft", 0.0), f"props[{i}].soft", 0.0, 1.0),
+            look,
         ))
     if len(props) > 40:
         raise ScenarioError("more than 40 props")

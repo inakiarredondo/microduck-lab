@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 
 import { applyFloorClick, makePitch, makeRoom } from "@/components/SimEditor";
-import { detLabel, goalDefenders, groupLearned, LEARNED_GROUPS, PITCH_TEAMS, RUG_LONG_MAX,
+import { detLabel, goalDefenders, groupLearned, LEARNED_GROUPS, personDraw, PITCH_TEAMS, RUG_LONG_MAX,
   RUG_SHORT_MAX, rugSize, SIM_SPEEDS, SIM_SPEED_DEFAULT, simRate, SimClient, speedLabel,
   speedShortfall, stepSpeed, type LearnedInfo, type Scenario } from "./sim";
 import { scaleSceneToMetres } from "./sim";
@@ -315,5 +315,37 @@ describe("what the camera inset writes on a detection box", () => {
   it("still calls an unmatched detection a ghost", () => {
     // `Detection.name` is "" for a ghost — a box with no real object behind it.
     expect(detLabel({ name: "", range: 0.94 })).toBe("ghost 0.94 m");
+  });
+});
+
+describe("what a room draws for a robot person, while its meshes are coming", () => {
+  // The three states this map has, and the reason it is `Scene | null` and
+  // not `Scene`: a truthiness test cannot tell "still fetching" from
+  // "there are no meshes", and the capsule is right for exactly one of them.
+  const scene = { meshes: [], bodies: [], geoms: [] } as unknown as Parameters<typeof personDraw>[1][string];
+
+  it("draws the capsule for a mocap person, whatever the map holds", () => {
+    expect(personDraw("capsule", {})).toBe("capsule");
+    expect(personDraw("capsule", { capsule: scene })).toBe("capsule");
+  });
+
+  it("draws the meshes once they have arrived", () => {
+    expect(personDraw("asimov1", { asimov1: scene })).toBe("meshes");
+  });
+
+  it("draws NOTHING while the fetch is still in flight", () => {
+    // The regression: `personScenes` starts {} and the fetch is async, so
+    // this is the state every robot scenario opens in. It used to take the
+    // capsule branch, and a four-foot blue capsule popped into a robot a
+    // moment later.
+    expect(personDraw("asimov1", {})).toBe("pending");
+    expect(personDraw("asimov1", { g1: scene })).toBe("pending");
+  });
+
+  it("still falls back to the capsule when the fetch FAILED", () => {
+    // The case that must not be lost to the fix above: a body whose meshes
+    // 404 has to stay visible, which is why failures are recorded as null
+    // rather than left out (lib/sim.fetchPersonScenes).
+    expect(personDraw("asimov1", { asimov1: null })).toBe("capsule");
   });
 });

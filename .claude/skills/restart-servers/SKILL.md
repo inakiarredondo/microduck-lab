@@ -7,17 +7,58 @@ Restart both microduck servers, in this order:
 
 1. **WARNING — training dies with the farm.** A farm restart kills any live
    teach job. Its checkpoint survives; resume after with
-   `POST /teach {"text": ..., "initFrom": "<run>"}`. The script refuses on
-   its own when a trainer is up — a `train_behavior` (duck) or a
-   `microduck_local.train` (G1 task) python process, or the lab's own
-   `GET /teach/status` saying `"running": true` — but check first anyway,
-   **as a separate command**, never combined with the restart:
+   `POST /teach {"text": ..., "initFrom": "<run>"}`. The script refuses on its
+   own when there is something to protect. Check first anyway, **as a separate
+   command**, never combined with the restart — and ask the guard itself rather
+   than reading the lab and deciding for it:
 
    ```
-   curl -s -m 2 http://127.0.0.1:8788/teach/status
+   bash .claude/skills/restart-servers/restart.sh --check
    ```
 
-   Only `MICRODUCK_RESTART_FORCE=1` overrides the refusal.
+   `--check` runs only the guard and exits 0 ("a restart would PROCEED") or 1,
+   printing the same reasons the restart would. It touches nothing.
+
+   **What it refuses for.** It sorts every running trainer — `train_behavior`
+   (duck) and `microduck_local.train` (G1 / MARS / MOSS task) — into three
+   buckets, and refuses unless all of them are clear:
+
+   | bucket | how it is decided | verdict |
+   |---|---|---|
+   | the lab's own teach jobs | their pids, from `GET /teach/status` (each job's `pids`: trainer + vec-env workers) | **refuse**, named |
+   | positively a test | `PYTEST_CURRENT_TEST` in the trainer's own environment, or `MICRODUCK_RUNS_DIR` inside a `pytest-of-…` dir, or a pytest ancestor | proceed, listed with the evidence |
+   | anything else | — | **refuse** |
+
+   Plus one independent reading: the lab's `GET /teach/status` saying
+   `"running": true` refuses on its own, whatever the process table says.
+
+   **What it now proceeds through.** This repo's TESTS spawn real short
+   training runs (`train_behavior run` / `imitate` with tiny `--steps` — see
+   `tests/test_net_arch.py`, `test_select_run.py`, `test_distill.py`,
+   `test_train_resume.py`), so a `pytest tests/` in another window used to trip
+   the guard at random moments; on 2026-10-03 that cost a confused restart
+   loop, and a FORCE there would have killed the test suite rather than a teach
+   job. A test trainer is also the one trainer a restart provably cannot
+   touch — only the pid LISTENING on :8788 is stopped, and a pytest subprocess
+   is not that lab's child. So the guard now identifies them and goes ahead,
+   printing what it skipped. **A trainer it cannot identify still refuses**:
+   that is the safety property, and a hand-started CLI run looks exactly like
+   it.
+
+   **To tell them apart by hand**, ask the process, not the lab — its
+   environment names the test that spawned it:
+
+   ```
+   ps -Ewww -o command= -p <pid> | tr ' ' '\n' | grep -E '^(PYTEST_CURRENT_TEST|MICRODUCK_RUNS_DIR)='
+   ```
+
+   A `PYTEST_CURRENT_TEST=tests/test_x.py::test_y` is a test, full stop, even
+   when its pytest is long gone — which happens, so do not reach for the parent
+   chain first. Nothing there means nothing is claiming it; treat it as work.
+
+   Only `MICRODUCK_RESTART_FORCE=1` overrides the refusal, and it should now be
+   needed only for a real job you mean to kill. `tests/test_restart_guard.py`
+   locks all of this against planted process trees.
 
 2. Run the script (stops the lab, restarts it cwd-proof and
    entry-point-rename-proof, verifies :8788 health, then bounces the viewer):

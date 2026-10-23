@@ -21,8 +21,12 @@ penalty that it can absorb will change it.
 Also checks each new knob's REACHABLE SET — a penalty on something that never
 happens is a no-op, which this repo has shipped before.
 """
-import sys, math
-import numpy as np, onnxruntime as ort
+import math
+import sys
+
+import numpy as np
+import onnxruntime as ort
+
 from microduck_local.robots import moss
 from microduck_local.robots import moss_env as me
 from microduck_local.robots.moss_env import MossPickEnv
@@ -32,6 +36,7 @@ path = sys.argv[1]
 # base-locked policy turning its chassis 26.7 degrees, which it physically
 # could not do. Same mistake as `pick_report.py` had, found the same day.
 from microduck_local.robots.moss_env import eval_env_kwargs
+
 KW = dict(pick_rung=2, wrist_start_rand=math.pi/2, jaw_align=6.0,
           wrist_free=True, can_topple=15.0, **eval_env_kwargs(path))
 sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])

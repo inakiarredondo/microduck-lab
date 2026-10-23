@@ -12,7 +12,7 @@
 import { useMemo } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import * as THREE from "three";
-import { heldMotions, takeReset, takeTruckImpulse } from "@/lib/camera";
+import { dollyStep, effectiveClamp, heldMotions, takeReset, takeTruckImpulse } from "@/lib/camera";
 
 export type Vec3Tuple = [number, number, number];
 
@@ -21,6 +21,11 @@ export type Vec3Tuple = [number, number, number];
 export interface ControlsLike {
   enabled: boolean;
   target: THREE.Vector3;
+  /** OrbitControls' own dolly clamp. It re-applies this inside `update()` at
+   *  the end of every frame, so it — not the prop below — is what the camera
+   *  actually obeys. Read, never written: the controls stay the owner. */
+  minDistance?: number;
+  maxDistance?: number;
   addEventListener: (type: "end", cb: () => void) => void;
   removeEventListener: (type: "end", cb: () => void) => void;
   update?: () => void;
@@ -50,6 +55,7 @@ export default function CameraKeys({ home, minDist = 0.25, maxDist = 8, paused }
   const sph = useMemo(() => new THREE.Spherical(), []);
   const offset = useMemo(() => new THREE.Vector3(), []);
   const right = useMemo(() => new THREE.Vector3(), []);
+  const fwd = useMemo(() => new THREE.Vector3(), []);
   useFrame((_, dtRaw) => {
     // Drain the swipe impulse EVERY frame (even when unused/discarded) so a
     // burst can never pool up and teleport the view later — idle stays idle.
@@ -109,10 +115,39 @@ export default function CameraKeys({ home, minDist = 0.25, maxDist = 8, paused }
     if (held.has("orbitRight")) sph.theta -= 1.7 * dt;
     if (held.has("dollyIn")) sph.radius *= Math.exp(-1.5 * dt);
     if (held.has("dollyOut")) sph.radius *= Math.exp(1.5 * dt);
-    sph.radius = Math.min(maxDist, Math.max(minDist, sph.radius));
+    // A dolly the near clamp REFUSES becomes a forward fly (lib/camera
+    // `dollyStep`). Without this, W only winds the camera in toward a FIXED
+    // orbit target — the middle of the room — so anything standing off-centre
+    // could not be approached at all: the camera stopped dead at `minDist`
+    // with the thing you were flying at still off to one side, and nothing on
+    // screen said why. It reads as hitting an invisible wall.
+    // The props are a FLOOR under the clamp, not the clamp: OrbitControls
+    // re-applies its own `minDistance`/`maxDistance` in the `update()` below,
+    // so the fly has to trigger at whichever bound actually bites. See
+    // `effectiveClamp` — a prop looser than the controls is how W stopped
+    // dead at 0.3 on the lab page with nothing on screen to explain it.
+    const clamp = effectiveClamp(minDist, maxDist, controls.minDistance, controls.maxDistance);
+    const step = dollyStep(sph.radius, clamp.min, clamp.max);
+    sph.radius = step.radius;
     sph.phi = Math.min(1.53, Math.max(0.1, sph.phi));
     offset.setFromSpherical(sph);
     camera.position.copy(controls.target).add(offset);
+    if (step.fly > 0) {
+      // `offset` runs target -> camera, so forward is its negation. Move the
+      // camera AND the target, which is what keeps the rig's shape: you orbit
+      // around whatever you just flew to, not around where you started.
+      fwd.copy(offset).normalize().multiplyScalar(-step.fly);
+      camera.position.add(fwd);
+      controls.target.add(fwd);
+      // Flying while pitched down would otherwise drive the target under the
+      // floor and take the camera with it on the next orbit. Lift BOTH by the
+      // shortfall so the offset — and therefore the framing — is preserved.
+      const sink = 0.02 - controls.target.y;
+      if (sink > 0) {
+        controls.target.y += sink;
+        camera.position.y += sink;
+      }
+    }
 
     camera.lookAt(controls.target);
     controls.update?.();

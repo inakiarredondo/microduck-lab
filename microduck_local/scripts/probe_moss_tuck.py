@@ -10,8 +10,8 @@ HOME it jams on the hull and the track (5 contacts, `hull/palm`,
 OUTSIDE the shell while the robot drives -- the opposite of what the tuck is
 for. This searches with the servo in the loop, so reachability is the test.
 """
-import numpy as np
 import mujoco
+import numpy as np
 
 from microduck_local.robots import moss
 from microduck_local.robots.moss_drive import MossDriver

@@ -4,7 +4,10 @@ There is no GET for the roster — it exists only in the streamed frames, so a
 curl cannot answer this and `/state` is a 404 whose body parses to "no ducks"
 if you are careless. Usage: python stage_check.py [host:port]
 """
-import asyncio, json, sys
+import asyncio
+import json
+import sys
+
 import websockets
 
 addr = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1:8788"

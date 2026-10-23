@@ -52,6 +52,7 @@ from microduck_local.robots import registry as R
 from microduck_local.robots.body import LAB_PITCH_RATIO, conforms
 from microduck_local.robots.mjcf_body import (
     GENERATED_KEY,
+    VERT_SCALE_LADDER_M,
     MjcfBody,
     compile_robot,
     load_robot_spec,
@@ -524,8 +525,196 @@ def test_a_model_whose_visuals_are_group_one_is_detected_as_group_one(tmp_path):
     assert visual_geom_group(compile_robot(_write(tmp_path, "boxes.xml", boxes))) == 2
 
 
-def _write_tri_stl(path: Path) -> None:
-    """A tetrahedron as BINARY STL — the smallest mesh MuJoCo will take.
+# ------------------------------------ 5b. the vertex lattice, and the normals
+
+def test_a_coarse_model_keeps_the_cheap_millimetre_lattice(tmp_path):
+    """A tetrahedron of 0.1 m edges needs no digits, and must not buy any.
+
+    The rule has to be able to answer "1 mm is fine" or it is not a rule, it
+    is a constant with extra steps. 0.1 m edges put a tenth of the p10 edge at
+    1 cm, far coarser than the ladder's top rung, so the coarsest wins.
+    """
+    stl = tmp_path / "tri.stl"
+    _write_tri_stl(stl)
+    body = _mesh_body(tmp_path, "coarse", stl)
+    assert body.vert_scale == VERT_SCALE_LADDER_M[0] == 1e-3
+    assert body.visual_scene()["vertScale"] == 1e-3
+
+
+def test_a_finely_tessellated_model_buys_a_finer_lattice(tmp_path):
+    """The planted regression for the detection: the SAME shape, 500x smaller.
+
+    Its triangles are then 0.2 mm, which is the Go2's p10 edge — and a 1 mm
+    lattice on those is a vertex moved most of the way to its neighbour. A
+    reader that returned the default would pass the case above and dump this
+    one as rubble, which is exactly what happened to the Go2.
+    """
+    stl = tmp_path / "tiny.stl"
+    _write_tri_stl(stl, scale=1 / 500)
+    body = _mesh_body(tmp_path, "fine", stl)
+    assert body.vert_scale < 1e-3
+    assert body.visual_scene()["vertScale"] == body.vert_scale
+
+
+def test_the_lattice_is_read_off_the_SMALL_triangles_and_not_the_median(tmp_path):
+    """A mesh that is mostly coarse with a fine MINORITY — the Go2's shape.
+
+    The Go2's median edge is 1.825 mm and its p10 edge 0.199 mm, a 9x spread,
+    and a first version of this rule aimed at the median: it picked 0.1 mm,
+    the dump halved its merged-vertex count, and the robot came back from the
+    browser still mottled. The reason is that shading is NORMALS and a normal
+    comes off ONE triangle — at 0.1 mm, 14.2 % of the Go2's faces still had
+    their normal tilted more than 15 deg by the rounding, against 1.6 % at the
+    0.01 mm the small end asks for.
+
+    Five coarse tetrahedra and one 500x smaller: the fine triangles are a
+    sixth of the edges, so they own the 10th percentile and not the median. A
+    rule reading the median answers the coarsest rung here; this is the only
+    case in the file that can tell the two apart.
+    """
+    stl = tmp_path / "mixed.stl"
+    _write_tri_stl(stl, scales=(1.0, 1.0, 1.0, 1.0, 1.0, 1 / 500))
+    body = _mesh_body(tmp_path, "mixed", stl)
+    assert body.vert_scale <= 1e-4, (
+        f"a fine minority was averaged away: picked {body.vert_scale}")
+
+
+def test_the_lattice_never_leaves_the_ladder(tmp_path):
+    """Whatever the model, the answer is a rung — so two models of the same
+    tessellation get the same dump and a re-fetch cannot nudge a body's
+    bytes."""
+    stl = tmp_path / "tri.stl"
+    for i, scale in enumerate((1.0, 1 / 7, 1 / 50, 1 / 500, 1 / 5000)):
+        _write_tri_stl(stl, scale=scale)
+        body = _mesh_body(tmp_path, f"rung{i}", stl)
+        assert body.vert_scale in VERT_SCALE_LADDER_M
+
+
+def test_a_manifest_may_override_the_lattice(tmp_path):
+    """Like `visual_group`: read it, unless a catalogue says otherwise."""
+    stl = tmp_path / "tri.stl"
+    _write_tri_stl(stl, scale=1 / 500)
+    body = _mesh_body(tmp_path, "pinned", stl, manifest={"vert_scale": 1e-3})
+    assert body.vert_scale == 1e-3
+    # and it does not leak into `extra`, where it would be read as a finding
+    assert "vert_scale" not in body.extra
+
+
+def test_the_dump_ships_the_models_own_normals(tmp_path):
+    """A level-0 body hands the viewer the normals MuJoCo draws with.
+
+    One per vertex, as `normalScale` ints. The browser used to weld by
+    position and average the faces instead, which is off by more than 15 deg
+    on 13.9 % of the Go2's face corners and 55.0 % of the SO-ARM100's — the
+    melted look, and not a resolution problem.
+    """
+    stl = tmp_path / "tri.stl"
+    _write_tri_stl(stl)
+    scene = _mesh_body(tmp_path, "normals", stl).visual_scene()
+    assert scene["normalScale"] == g1.NORMAL_SCALE
+    for mesh in scene["meshes"]:
+        assert len(mesh["n"]) == len(mesh["v"])
+        n = np.asarray(mesh["n"], float).reshape(-1, 3) * scene["normalScale"]
+        assert np.allclose(np.linalg.norm(n, axis=1), 1.0, atol=2e-3)
+
+
+def test_a_normal_on_the_wrong_side_of_its_surface_is_turned_round(tmp_path):
+    """Real CAD exports ship inverted normals, and three.js renders them BLACK.
+
+    MEASURED on MOSS: 5.29 % of his 145,489 visual vertices carry an authored
+    normal pointing into the solid, scattered across 77 meshes with none
+    wholly inverted. MuJoCo lights both sides and never shows it; the browser
+    does, and the first dump that shipped them raw put dark patches on his arm
+    and deck that are not on the robot.
+
+    The plant here is the whole mesh inverted, which is the same defect with
+    no ambiguity about which side is out: every shipped normal must come back
+    agreeing with the surface the faces describe.
+
+    A CUBE and not the tetrahedron the rest of this file uses, MEASURED: on a
+    4-vertex mesh MuJoCo hands every vertex the SAME smoothed normal, which
+    is orthogonal to three of the four vertices' own surface — so the
+    property cannot even be stated there, and the first version of this case
+    failed on a dot product of exactly zero.
+    """
+    stl = tmp_path / "cube.stl"
+    _write_cube_stl(stl)
+    model = compile_robot(_mesh_xml(tmp_path, "flip", stl))
+    mid = 0
+    va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+    fa, fn = int(model.mesh_faceadr[mid]), int(model.mesh_facenum[mid])
+    model.mesh_normal[int(model.mesh_normaladr[mid]):
+                      int(model.mesh_normaladr[mid]) + vn] *= -1
+    n = np.asarray(g1._authored_normals(model, mid), float).reshape(-1, 3)
+    v = np.asarray(model.mesh_vert[va:va + vn], float)
+    f = np.asarray(model.mesh_face[fa:fa + fn])
+    acc = np.zeros_like(n)
+    cross = np.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]])
+    for corner in range(3):
+        np.add.at(acc, f[:, corner], cross)
+    assert (np.einsum("ij,ij->i", acc, n) > 0).all(), "a normal still faces inward"
+
+
+def test_the_tuned_looks_are_not_handed_normals_behind_their_backs(tmp_path):
+    """`extract_visual_scene` ships normals only when ASKED.
+
+    The G1's and MARS's looks were tuned against the normals the viewer welds
+    for itself (`G1Look.weldAndSmooth`, `MarsLook`), and a dump that started
+    carrying real ones would change both without anyone measuring them. This
+    is the case that keeps the new behaviour on the bodies nobody has looked
+    at.
+    """
+    stl = tmp_path / "tri.stl"
+    _write_tri_stl(stl)
+    model = compile_robot(_mesh_xml(tmp_path, "quiet", stl))
+    quiet = g1.extract_visual_scene(model, group=2)
+    assert "normalScale" not in quiet
+    assert all("n" not in m for m in quiet["meshes"])
+    loud = g1.extract_visual_scene(model, group=2, normals=True)
+    assert all("n" in m for m in loud["meshes"])
+
+
+def _mesh_xml(tmp_path: Path, name: str, stl: Path) -> Path:
+    xml = f"""<mujoco model="{name}">
+      <asset><mesh name="tri" file="{stl.name}"/></asset>
+      <worldbody><body name="b" pos="0 0 0.5">
+        <joint name="j" type="hinge" axis="0 1 0"/>
+        <geom type="mesh" mesh="tri" group="2" contype="0" conaffinity="0"/>
+        <geom type="box" size="0.1 0.1 0.1" group="3"/>
+      </body></worldbody></mujoco>"""
+    return _write(tmp_path, f"{name}.xml", xml)
+
+
+def _mesh_body(tmp_path: Path, name: str, stl: Path, **kw) -> MjcfBody:
+    return MjcfBody.from_mjcf(_mesh_xml(tmp_path, name, stl),
+                              id=f"mjcf:{name}", cache_dir=tmp_path, **kw)
+
+
+def _write_cube_stl(path: Path, half: float = 0.05) -> None:
+    """A cube as BINARY STL: 8 vertices, 12 outward-wound triangles.
+
+    Unlike the tetrahedron, every vertex's smooth normal is its own body
+    diagonal, so "the normal is on the right side of the surface" is a
+    statement with a wide margin (MEASURED: the dot is 20, not 1e-9).
+    """
+    import struct
+
+    p = [(x * half, y * half, z * half)
+         for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+    idx = [(0, 1, 3), (0, 3, 2), (4, 6, 7), (4, 7, 5), (0, 4, 5), (0, 5, 1),
+           (2, 3, 7), (2, 7, 6), (0, 2, 6), (0, 6, 4), (1, 5, 7), (1, 7, 3)]
+    tris = [(p[a], p[b], p[c]) for a, b, c in idx]
+    body = b"".join(
+        struct.pack("<12fH", 0.0, 0.0, 0.0, *a, *b, *c, 0) for a, b, c in tris)
+    path.write_bytes(b"microduck test stl".ljust(80, b"\0")
+                     + struct.pack("<I", len(tris)) + body)
+
+
+def _write_tri_stl(path: Path, scale: float = 1.0,
+                   scales: tuple[float, ...] = ()) -> None:
+    """One tetrahedron per scale, as BINARY STL — the smallest mesh MuJoCo
+    will take. `scales` puts SEVERAL in one mesh, spaced apart, which is how a
+    model gets an edge distribution with a long tail instead of one length.
 
     Two MEASURED constraints, both found the hard way: the decoder reads the
     four bytes after an 80-byte header as a face count and refuses an ASCII
@@ -535,13 +724,17 @@ def _write_tri_stl(path: Path) -> None:
     """
     import struct
 
-    v = [(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.0, 0.1, 0.0), (0.0, 0.0, 0.1)]
     faces = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+    tris = []
+    for i, sc in enumerate(scales or (scale,)):
+        x0 = i * 0.5                       # spaced so the hull is not degenerate
+        v = [(x0, 0.0, 0.0), (x0 + 0.1 * sc, 0.0, 0.0),
+             (x0, 0.1 * sc, 0.0), (x0, 0.0, 0.1 * sc)]
+        tris += [(v[a], v[b], v[c]) for a, b, c in faces]
     body = b"".join(
-        struct.pack("<12fH", 0.0, 0.0, 0.0, *v[a], *v[b], *v[c], 0)
-        for a, b, c in faces)
+        struct.pack("<12fH", 0.0, 0.0, 0.0, *a, *b, *c, 0) for a, b, c in tris)
     path.write_bytes(b"microduck test stl".ljust(80, b"\0")
-                     + struct.pack("<I", len(faces)) + body)
+                     + struct.pack("<I", len(tris)) + body)
 
 
 # ------------------------------------------------------- 6. two in a model
@@ -808,3 +1001,59 @@ def test_scalar_joint_names_keeps_tree_order_and_drops_the_free_root(tmp_path):
                               cache_dir=tmp_path)
     assert body.joint_names == ("zulu", "alpha")
     assert set(body.extra["skipped_joints"]) == {"root", "ball"}
+
+
+# ------------------------------------------------------- a bundled ground
+#
+# Level 0's promise is "an MJCF and an id", and until this case it held only
+# for files shaped like Menagerie's, which splits the robot from the scene.
+# Menlo's `asimov-1/sim-model/xmls/asimov_1.xml` is a robot AND a scene in one
+# file — a `floor` plane and three lights — and the generated scene used to
+# add a second geom called `floor`, which does not compile. Both cases below
+# FAIL on the code before `world_floor_geom` (checked: the first with
+# `repeated name 'floor' in geom`, the second with two planes in the scene).
+
+def _own_ground(name: str = "floor") -> str:
+    """The worldbody lines a model that bundles its own scene carries."""
+    return (f'<geom name="{name}" type="plane" size="0 0 0.05"/>'
+            '<light pos="0 0 3" dir="0 0 -1"/>')
+
+
+@pytest.mark.parametrize("floor_name", ["floor", "ground_plane"])
+def test_a_robot_that_brings_its_own_floor_is_still_a_body(tmp_path,
+                                                          floor_name):
+    """Whatever the plane is called — the clash is only loud when it is
+    `floor`, and a second ground is wrong either way."""
+    robot = _write(tmp_path, f"own_{floor_name}.xml",
+                   _two_joint_xml(extra_body=_own_ground(floor_name)))
+    body = MjcfBody.from_mjcf(robot, id=f"mjcf:{floor_name}",
+                              cache_dir=tmp_path)
+    assert body.joint_names == ("ja", "jb")
+    assert body.extra["own_floor"] == floor_name
+
+
+def test_the_generated_scene_reuses_that_floor_instead_of_adding_a_second(
+        tmp_path):
+    """One plane and one light in the scene, not two — counted on the
+    COMPILED scene, because that is what a room is built from."""
+    robot = _write(tmp_path, "own_floor2.xml",
+                   _two_joint_xml(extra_body=_own_ground()))
+    body = MjcfBody.from_mjcf(robot, id="mjcf:own-floor2", cache_dir=tmp_path)
+    scene = mujoco.MjModel.from_xml_path(str(body.scene_fn()))
+    planes = [scene.geom(i).name for i in range(scene.ngeom)
+              if scene.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
+    assert planes == ["floor"], planes
+    assert scene.nlight == 1, scene.nlight
+
+
+def test_a_model_with_no_ground_of_its_own_still_gets_one(tmp_path):
+    """The complement — the case every Menagerie model is, which must not
+    change: no plane in the robot, exactly one in the scene."""
+    robot = _write(tmp_path, "bare_ground.xml", _two_joint_xml())
+    body = MjcfBody.from_mjcf(robot, id="mjcf:bare-ground", cache_dir=tmp_path)
+    assert body.extra["own_floor"] is None
+    scene = mujoco.MjModel.from_xml_path(str(body.scene_fn()))
+    planes = [scene.geom(i).name for i in range(scene.ngeom)
+              if scene.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE]
+    assert planes == ["floor"], planes
+    assert scene.nlight == 1, scene.nlight

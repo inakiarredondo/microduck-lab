@@ -25,12 +25,11 @@ import dataclasses
 import math
 
 import numpy as np
+import pytest
 
 from microduck_local.brain.runtime import Senses
 from microduck_local.brain.tidy_moss import TidyMoss
 from microduck_local.robots import moss
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),

@@ -14,7 +14,9 @@ import {
   duckRowKeys,
   LabClient,
   fetchScene,
+  LAB_HTTP,
   robotsInFrame,
+  SceneLoads,
   type DuckFrame,
   type RobotId,
   type Scene,
@@ -24,6 +26,14 @@ import {
   cameraKeyDown,
   cameraKeyUp,
   cameraKeysClear,
+  DUCK_HOME,
+  DUCK_SUBJECT_M,
+  homeView,
+  recordShot,
+  requestViewReset,
+  stageMaxDist,
+  subjectSizeM,
+  type Shot,
 } from "@/lib/camera";
 import { loadJSON, saveJSON } from "@/lib/persist";
 import { getCapture } from "@/lib/record";
@@ -41,6 +51,7 @@ import { AnimPanel } from "./AnimPanel";
 import { RecordPanel } from "./RecordPanel";
 import { CaptureCanvas, Snapshotter } from "./Capture";
 import { PoseDuck } from "./PoseDuck";
+import StageFog from "./StageFog";
 
 /** FALLBACK layout only — one duck-sized pitch for the whole roster. The
  *  server sends each slot its own offset now (DuckFrame.offset), because the
@@ -207,7 +218,33 @@ function loadSavedCamera(): SavedCamera | null {
   return raw && isVec3(raw.p) && isVec3(raw.t) ? { p: raw.p, t: raw.t } : null;
 }
 
-const HOME_CAM = { p: [1.2, 0.7, 1.4] as const, t: [0, 0.12, 0] as const };
+// The home view and the dolly ceiling are the DUCK's (lib/camera.DUCK_HOME,
+// `stageMaxDist`'s 7 m) and both are scaled by the biggest body on the stage —
+// `stageSize` below. A fixed 1.93 m reset put a 1.296 m Asimov's head out of
+// frame, which is the same duck-sized-metres bug the fog band had.
+//
+// ONE dolly clamp for the stage, read by both the mouse (OrbitControls) and
+// the keyboard (CameraKeys) — /sim already shares its pair this way. They were
+// two separate literals here and had drifted apart (0.3/7 against 0.25/8),
+// which is what made W stop dead: see `effectiveClamp` in lib/camera.
+//
+// The NEAR end does not scale: 0.3 m is how close you may get to inspect a
+// duck's beak, and it is how close you may get to inspect an Asimov's hand.
+const CAM_MIN_DIST = 0.3;
+
+/** How big the biggest body on the stage is, metres — what the home view and
+ *  the dolly ceiling are sized by. The largest, not the selected one, because
+ *  a reset has to frame the whole roster and a roster can be mixed. A robot
+ *  whose mesh set has not arrived answers the duck's size, which is what the
+ *  stage was framed for before any of this. */
+function stageSize(
+  robots: readonly RobotId[],
+  scenes: Partial<Record<RobotId, Scene>>,
+): number {
+  let big = DUCK_SUBJECT_M;
+  for (const r of robots) big = Math.max(big, subjectSizeM(scenes[r]?.size));
+  return big;
+}
 
 /** Inside-the-Canvas helper: persist the camera pose after every orbit/pan/zoom
  *  gesture (OrbitControls "end"). Restore happens via the Canvas/OrbitControls
@@ -228,10 +265,11 @@ function CameraPersistence() {
   return null;
 }
 
-// 🎥 follow-cam shot parameters: ¾ front view (±az off the duck's heading),
-// distance/height sized so a 25 cm duck fills about half the frame at the
-// stage's 40° fov, plus a very slow azimuth drift so long takes stay alive.
-const SHOT = { az: 0.61, dist: 0.78, height: 0.34, drift: 0.05 };
+// 🎥 follow-cam shot parameters live in lib/camera (DUCK_SHOT): a ¾ front
+// view (±az off the subject's heading), distance/height sized so the subject
+// fills about half the frame at the stage's 40° fov, plus a very slow azimuth
+// drift so long takes stay alive. `recordShot` scales all of it by how big
+// the robot BEING FILMED is — the duck's 0.78 m lens is inside an Asimov.
 
 const wrapAngle = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 
@@ -242,10 +280,30 @@ const wrapAngle = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
  *  OrbitControls is paused for the duration (CameraKeys takes a `paused`
  *  callback and drops held motions while it is true), and
  *  the camera simply stays where the take ended. The azimuth is chosen ONCE
- *  per take — the duck's heading rotated ±SHOT.az toward whichever side the
+ *  per take — the duck's heading rotated ±shot.az toward whichever side the
  *  camera already sits — not tracked per frame: a backflipping duck's heading
- *  whips 180° mid-roll and would slingshot the camera around it. */
-function RecordCamera({ client }: { client: LabClient }) {
+ *  whips 180° mid-roll and would slingshot the camera around it.
+ *
+ *  So is the DISTANCE, and for the same reason it is chosen at all: the shot
+ *  is scaled by the size of the body in the slot (`Scene.size`, measured
+ *  lab-side), because one set of metres tuned on a 25 cm duck put the lens
+ *  inside a 1.3 m Asimov. Picking it per take rather than per frame means a
+ *  mesh set that arrives mid-take cannot re-frame a rolling shot. */
+function RecordCamera({
+  client,
+  scenes,
+  maxRadius,
+}: {
+  client: LabClient;
+  /** Mesh sets by robot id — `size` is read off whichever one the filmed
+   *  slot is, and its absence frames at the duck's size (what every take did
+   *  before this). */
+  scenes: Partial<Record<RobotId, Scene>>;
+  /** The stage's live dolly ceiling (`stageMaxDist`), which OrbitControls
+   *  re-clamps to inside the `controls.update()` below whether or not the
+   *  controls are enabled. */
+  maxRadius: number;
+}) {
   const controls = useThree((s) => s.controls) as unknown as ControlsLike | null;
   const camera = useThree((s) => s.camera);
   // Never leave the user without controls (unmount mid-take).
@@ -255,7 +313,9 @@ function RecordCamera({ client }: { client: LabClient }) {
     };
   }, [controls]);
 
-  const shot = useRef<{ epoch: number; az: number; t0: number } | null>(null);
+  const shot = useRef<{ epoch: number; az: number; t0: number; cam: Shot } | null>(
+    null
+  );
   const paused = useRef(false);
   const aim = useMemo(() => new THREE.Vector3(), []);
   const desired = useMemo(() => new THREE.Vector3(), []);
@@ -277,7 +337,8 @@ function RecordCamera({ client }: { client: LabClient }) {
     }
     const f = client.frame;
     const idx = f ? f.ducks.findIndex((d) => d.id === cap.duckId) : -1;
-    const trunk = idx >= 0 ? f!.ducks[idx].bodies[1] : undefined;
+    const row = idx >= 0 ? f!.ducks[idx] : undefined;
+    const trunk = row?.bodies[1];
     if (!f || !trunk) return; // duck vanished mid-take — hold the last shot
     const off = frameOffsets(f.ducks)[idx];
     // MuJoCo (x, y, z) → three world (x, z, -y), plus the duck's grid offset.
@@ -293,23 +354,31 @@ function RecordCamera({ client }: { client: LabClient }) {
         camera.position.x - aim.x,
         camera.position.z - aim.z
       );
+      // How big this slot's robot is — the duck's own size when the roster
+      // row names no body, or its mesh set has not arrived.
+      const size = scenes[row!.robot ?? "microduck"]?.size;
+      // The ceiling is passed because OrbitControls re-clamps to it inside
+      // the `controls.update()` below, enabled or not (lib/camera.recordShot).
+      const cam = recordShot(subjectSizeM(size), maxRadius);
       // ¾ view on whichever side needs the shorter glide.
       const side =
-        Math.abs(wrapAngle(headingAz + SHOT.az - camAz)) <=
-        Math.abs(wrapAngle(headingAz - SHOT.az - camAz))
+        Math.abs(wrapAngle(headingAz + cam.az - camAz)) <=
+        Math.abs(wrapAngle(headingAz - cam.az - camAz))
           ? 1
           : -1;
       shot.current = {
         epoch: cap.epoch,
-        az: wrapAngle(headingAz + side * SHOT.az),
+        az: wrapAngle(headingAz + side * cam.az),
         t0: now,
+        cam,
       };
     }
-    const az = shot.current.az + SHOT.drift * (now - shot.current.t0);
+    const { cam } = shot.current;
+    const az = shot.current.az + cam.drift * (now - shot.current.t0);
     desired.set(
-      aim.x + Math.sin(az) * SHOT.dist,
-      aim.y + SHOT.height,
-      aim.z + Math.cos(az) * SHOT.dist
+      aim.x + Math.sin(az) * cam.dist,
+      aim.y + cam.height,
+      aim.z + Math.cos(az) * cam.dist
     );
 
     const dt = Math.min(dtRaw, 0.1); // tab-stall guard, like CameraKeys
@@ -381,35 +450,76 @@ export default function Viewer() {
   // every arriving scene tore the effect down and re-ran it — and a G1 fetch
   // in flight at that moment (21 MB, ~2.5 s) resolved into a dead closure and
   // was thrown away. The stage then drew a G1 with the duck's meshes.
-  const loadedScenes = useRef(new Set<string>());
-  const pendingScenes = useRef(new Set<string>());
-  const sceneFailures = useRef(new Map<string, number>());
+  // One object, so the "already loaded" gate and the stored scene can never
+  // disagree again — see SceneLoads in lib/lab.
+  const sceneLoads = useRef(new SceneLoads());
+  // When a robot first appeared in a frame, so a stage that never draws it
+  // can SAY SO. See the warning in the tick below.
+  const robotSeenAt = useRef(new Map<string, number>());
+  const warnedMissing = useRef(new Set<string>());
+  // Which bodies are on the stage right now, as STATE — the home view and the
+  // dolly ceiling are sized by the biggest of them, and both are props. Set
+  // from the same 1 Hz tick that loads their meshes, and only when the set
+  // actually changes, so the roster cannot re-render the stage at frame rate.
+  const [stageRobots, setStageRobots] = useState<RobotId[]>([]);
   useEffect(() => {
     let stopped = false;
     const tick = () => {
       const f = clientRef.current?.frame;
       if (!f) return;
+      const onStage = robotsInFrame(f.ducks);
+      setStageRobots((prev) =>
+        prev.length === onStage.length && prev.every((r, i) => r === onStage[i])
+          ? prev
+          : onStage
+      );
       for (const robot of robotsInFrame(f.ducks)) {
-        // A server without that robot's assets answers 404 every time; retry
-        // a few times (a lab restart mid-session is the case worth covering)
-        // and then stop, rather than polling a 404 once a second forever.
-        if (
-          loadedScenes.current.has(robot) ||
-          pendingScenes.current.has(robot) ||
-          (sceneFailures.current.get(robot) ?? 0) >= 5
-        ) {
-          continue;
-        }
-        pendingScenes.current.add(robot);
+        // The retry budget for a lab without that robot's assets lives in
+        // SceneLoads; so does the rule that only a STORED scene closes the
+        // gate. Marking it loaded here and dropping the scene below left the
+        // robot with no mesh set for the life of the page.
+        if (!sceneLoads.current.wants(robot)) continue;
+        sceneLoads.current.begin(robot);
         fetchScene(robot)
           .then((s) => {
-            loadedScenes.current.add(robot);
-            if (!stopped) setScenes((prev) => ({ ...prev, [robot]: s }));
+            if (stopped) {
+              // Torn down mid-flight (Strict Mode's double-mount, a hot
+              // reload). Drop the scene, but leave the robot FETCHABLE so
+              // the next mount's tick picks it straight back up.
+              sceneLoads.current.dropped(robot);
+              return;
+            }
+            sceneLoads.current.stored(robot);
+            setScenes((prev) => ({ ...prev, [robot]: s }));
           })
-          .catch(() => {
-            sceneFailures.current.set(robot, (sceneFailures.current.get(robot) ?? 0) + 1);
-            pendingScenes.current.delete(robot);   // retry on the next tick
-          });
+          .catch(() => sceneLoads.current.failed(robot));
+      }
+      // A stage with bodies on the roster and none on screen is SILENT: no
+      // error, no failed request, a green "live" badge and a HUD listing
+      // every policy with moving counters. Say which robot has no mesh set
+      // and which state it is stuck in, once, after it has had long enough.
+      const now = Date.now();
+      for (const robot of robotsInFrame(f.ducks)) {
+        if (!robotSeenAt.current.has(robot)) robotSeenAt.current.set(robot, now);
+        const waited = now - (robotSeenAt.current.get(robot) ?? now);
+        const { state, failures } = sceneLoads.current.describe(robot);
+        if (state === "ready" || waited < 8000 || warnedMissing.current.has(robot)) {
+          continue;
+        }
+        warnedMissing.current.add(robot);
+        console.warn(
+          `[viewer] "${robot}" has been on the stage for ${Math.round(waited / 1000)}s ` +
+            `with NO mesh set (scene ${state}${failures ? `, ${failures} failed fetch(es)` : ""}). ` +
+            `Its bodies cannot draw. ` +
+            // Failures first: a retry can be in flight at the moment of the
+            // check, which reports "fetching" over the top of four 404s and
+            // sends the reader looking at download size instead of the lab.
+            (failures > 0
+              ? `GET ${LAB_HTTP}/scene?robot=${robot} is failing — does this lab have that robot's assets?`
+              : state === "fetching"
+                ? `The fetch has not come back; the scene is several MB, but 8s is long.`
+                : `Nothing has requested it — that is a bug in this loader, not the lab.`),
+        );
       }
     };
     const id = setInterval(tick, 1000);
@@ -559,6 +669,29 @@ export default function Viewer() {
     rootRef.current?.focus({ preventScroll: true });
   };
 
+  // The stage's own scale, and the two things sized by it. Both are passed to
+  // OrbitControls AND to CameraKeys, which is why they are one value here: the
+  // controls re-clamp to their own `maxDistance` inside `update()`, so a
+  // ceiling the keys believe in and the controls do not is a dolly that stops
+  // dead with nothing on screen to explain it (lib/camera.effectiveClamp).
+  const subjectM = stageSize(stageRobots, scenes);
+  const camMaxDist = stageMaxDist(subjectM);
+  const home = useMemo(
+    () => homeView(DUCK_HOME, subjectM, DUCK_SUBJECT_M, camMaxDist),
+    [subjectM, camMaxDist]
+  );
+
+  // First visit with nothing saved: the Canvas mounted at the DUCK's home
+  // because no frame had arrived yet to say what is on the stage. Fly to the
+  // right one as soon as that is known — once, and never over a saved camera
+  // or a view the person has since moved.
+  const homedOnce = useRef(false);
+  useEffect(() => {
+    if (savedCam || homedOnce.current || !stageRobots.length) return;
+    homedOnce.current = true;
+    requestViewReset();
+  }, [savedCam, stageRobots]);
+
   // Click a duck to select it (nearest projected duck within the same screen
   // radius the assign flow uses); click empty floor to deselect. Orbit drags
   // and armed-assign clicks don't count.
@@ -582,14 +715,17 @@ export default function Viewer() {
         dpr={[1, 1.5]}
         gl={{ antialias: true, powerPreference: "high-performance" }}
         camera={{
-          position: savedCam?.p ?? [1.2, 0.7, 1.4],
+          position: savedCam?.p ?? DUCK_HOME.p,
           fov: 40,
           near: 0.01,
           far: 50,
         }}
       >
         <color attach="background" args={["#101216"]} />
-        <fog attach="fog" args={["#101216", 4, 10]} />
+        {/* Fog is the floor-edge fade, and it travels with the view: a 1.2 m
+            body framed from 5 m used to sit inside a band tuned for a 25 cm
+            duck at 1.9 m (components/StageFog.tsx, lib/camera.fogRange). */}
+        <StageFog color="#101216" near={4} far={10} farMax={18} />
         <hemisphereLight intensity={0.65} groundColor="#2a2c33" color="#dfe6f0" />
         <directionalLight position={[2.5, 4, 2]} intensity={1.9} />
         <directionalLight position={[-2, 2.5, -1.5]} intensity={0.4} color="#8fa3c7" />
@@ -610,23 +746,29 @@ export default function Viewer() {
           {scene && <PoseDuck scene={scene} />}
         </group>
         {clientRef.current && <AssignTargets client={clientRef.current} />}
-        {clientRef.current && <RecordCamera client={clientRef.current} />}
+        {clientRef.current && (
+          <RecordCamera
+            client={clientRef.current}
+            scenes={scenes}
+            maxRadius={camMaxDist}
+          />
+        )}
 
         <OrbitControls
           makeDefault
-          target={savedCam?.t ?? [0, 0.12, 0]}
+          target={savedCam?.t ?? DUCK_HOME.t}
           maxPolarAngle={Math.PI / 2 - 0.02}
-          minDistance={0.3}
-          maxDistance={7}
+          minDistance={CAM_MIN_DIST}
+          maxDistance={camMaxDist}
           // Trackpad two-finger vertical (and wheel) zoom at the default 1.0
           // crossed half the zoom range in one small swipe — tame it.
           zoomSpeed={0.4}
         />
         <CameraPersistence />
         <CameraKeys
-          home={HOME_CAM}
-          minDist={0.25}
-          maxDist={8}
+          home={home}
+          minDist={CAM_MIN_DIST}
+          maxDist={camMaxDist}
           paused={() => {
             const ph = getCapture().phase;
             return ph === "framing" || ph === "recording";

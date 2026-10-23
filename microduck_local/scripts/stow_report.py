@@ -37,8 +37,12 @@ import numpy as np
 import onnxruntime as ort
 
 from microduck_local.robots import moss
-from microduck_local.robots.moss_env import (MossStowEnv, RETRACT_JOINTS,
-                                             RETRACT_TOL_RAD, eval_env_kwargs)
+from microduck_local.robots.moss_env import (
+    RETRACT_JOINTS,
+    RETRACT_TOL_RAD,
+    MossStowEnv,
+    eval_env_kwargs,
+)
 
 #: reward knobs a run predating `run.json`'s env_kwargs was scored with; they
 #: change what the env PAYS, and the retract ones also keep the episode

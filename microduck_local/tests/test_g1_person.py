@@ -56,7 +56,7 @@ def test_g1_yield_does_not_erase_the_patrol():
     p.waiting = 3.0
     # Pretend a duck is in the way for many ticks.
     for _ in range(int(4.0 / C.CTRL_DT)):
-        p._step_g1(w.data, C.CTRL_DT, blockers=[(p.x + 0.2, p.y)])
+        p._step_driven(w.data, C.CTRL_DT, blockers=[(p.x + 0.2, p.y)])
     assert len(p.route) == n0 >= 2
 
 

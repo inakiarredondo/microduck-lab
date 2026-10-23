@@ -743,6 +743,106 @@ caveats there because the lab pins `domain_rand=False` and steps its ducks
 serially in one frame loop; a lab launched with `MICRODUCK_ACTUATOR=bam` falls
 back to private models.
 
+## Bringing in somebody else's robot (Menlo's Asimov 1)
+
+The G1 below was added by us, from assets we chose. **Asimov 1** is the other
+case: an open-source 1.2 m, 32 kg, 23-joint humanoid whose owners
+([Menlo Research](https://github.com/menloresearch/asimov-1)) also publish the
+training config their shipped policy runs under. It is a level-1 body here —
+it has a `RobotSpec`, a walking env and a policy contract, and it appears in
+the lab.
+
+```bash
+uv run fetch-robot asimov1                                   # model, 43 MB
+uv run python -m microduck_local.robots.asimov_walk --fetch  # their policy
+uv run python scripts/probe_asimov_walk.py                   # does it walk?
+uv run duck-lab .cache/asimov_1/policy/policy.onnx            # watch it
+```
+
+**Nothing is vendored**: the model is GPL-2.0 / CERN-OHL-S-2.0 and the policy
+BSD-3-Clause, both fetched at a pinned sha with their licence files, which
+`fetch-robot` prints. The MJCF ships `nu = 0` — no actuators at all, because
+their trainer injects them in Python — so `robots/asimov_walk.walk_spec()`
+builds the 23 Synapticon servos from their published gains.
+
+The number that says the integration is faithful is not a test: **their own
+policy walks in this repo's MuJoCo** — 0.44 m/s at a 0.5 command, 0.68 at 0.8,
+±0.5 rad/s turns, no falls in 10 s on six commands, deterministically. Their
+78-float observation puts the twist command at `obs[6:9]` and permutes the
+joints into three CAN-bus slots; that layout is mirrored from their `env.yaml`
+and cross-checked against their viewer's index lists, never inferred.
+
+Two honest limits. The reward windows in `AsimovWalkEnv` are the G1's and are
+**not measured for this body**, so the env is sound for playback and the lab
+but nothing trained in it means anything until they are. And nothing here has
+run on an Asimov — the sim2real evidence is Menlo's, measured on their stack,
+which is what the contract's `deploy` sentence says so it travels with any
+ONNX exported from here.
+
+It also walks a `/sim` level. `scenarios/asimov-walkabout.json` puts it on a
+12.8 m patrol with three ducks following it:
+
+```bash
+uv run record-world scenarios/asimov-walkabout.json --camera follow:p0 \
+    --seconds 45 --out /tmp/rw-asimov
+```
+
+A walking robot enters a room as a **person** (`world/arena.WorldPerson`),
+which is how the G1 has always done it — `kind` is a registry id now rather
+than a table, so any body declaring `Body.driver()` can walk a room with no
+edit to the world. Keep its `speed` near 0.25 m/s if you want the ducks to
+keep up: at 0.5 it outruns them.
+
+### ...and it gets up off the floor
+
+Trained here, from scratch — no distillation, no imitation loss, no weights
+from any other get-up. From face down, under Menlo's published speed-torque
+envelope, handing to their own walk policy once it is up:
+
+| start | rises | still standing at 8 s |
+|---|---|---|
+| prone | **24/24** | **24/24** |
+| supine | 15/24 | 15/24 |
+
+Published as
+[JonathanHawkins/asimov1-getup-handoff](https://huggingface.co/JonathanHawkins/asimov1-getup-handoff)
+with the spec, a self-contained MuJoCo runner and a rendered episode.
+
+```bash
+uv run python scripts/getup_acceptance.py <run> --episodes=24 --pose=prone --handoff
+uv run python scripts/score_bands.py <run> --episodes 8 --floor
+uv run render-rollout --policy runs/<run>/policy.onnx \
+    --handoff .cache/asimov_1/policy/policy.onnx \
+    --env MICRODUCK_ASIMOV_GETUP_POSE=prone --camera three-quarter --out /tmp/rr
+```
+
+**The handoff is half the deliverable, not a flourish.** Left in control after
+standing, the get-up policy keeps acting and its worst joint runs **252 deg/s**;
+handing to the walker drops that to **2.3 deg/s** with no rises lost. Nine
+reward terms aimed at the same problem were nulls — the plant does not buzz
+(zero action standing reads **0.000 rad/s**), so the twitch was the controller,
+not the physics. The switch reads only projected gravity and two encoder
+channels, so it could run on hardware. It costs **one episode in 24**, not
+nothing: 23/24 still standing against the privileged test's 24/24, and an
+independent re-scorer reading raw physics says 22/24, so the honest figure is
+**22-24 of 24**. The "costs nothing" this file used to carry came from a
+scorer that indexed the slot-ordered observation block with the action-order
+joint list, so its "elbow" clause read a wrist and its "ankle" clause read a
+knee. It never looked at an ankle, fired anyway, and scored 24/24.
+
+**Four honest limits.** It reads **390 floats** (5 stacked frames of their 78),
+so it will not hot-swap or load in Menlo's viewer and needs an on-device ring
+buffer. That history is load-bearing *to these weights* — **0/48** frozen to
+one frame against 48/48 — which is covariate shift and says nothing about what
+78 observations can learn: one-frame runs in this same repo rise from the floor
+20/36 and 17/36 against a zero-action floor of 0/36. It **requires** the `dc`
+envelope: under a flat clamp the same weights fall to 14/24 rises and 6/24
+stays. The stance is wide, median peak foot span
+**0.888 m** against a natural 0.215. And **nothing here has run on an Asimov**.
+
+Adding your own robot: `.claude/skills/add-a-robot/SKILL.md` is the route, the
+settling number for each step and the traps hit doing this one.
+
 ## Training another robot (the Unitree G1)
 
 The harness was one body deep: `walk_env.py` resolved `trunk_base`, `floor`,

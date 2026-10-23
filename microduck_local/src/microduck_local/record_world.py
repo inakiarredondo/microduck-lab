@@ -28,7 +28,9 @@ Outputs, under `--out`:
 
 Cameras: `top` (the whole floor, the pitch's view), `follow:<duck>` (a
 three-quarter camera that tracks that duck — read a fall or a grasp),
-`side` / `front` / `three-quarter` (fixed at the room centre).
+`side` / `front` / `three-quarter` (fixed at the room centre). A follow is
+framed on the SUBJECT's own size (`follow_scale`), so the same shot works on a
+0.28 m duck and a 1.3 m Asimov; the fixed ones are framed on the room.
 
 Headless on the Mac's CGL backend with no MUJOCO_GL set (render_rollout.py
 explains); set MUJOCO_GL=egl only on Linux.
@@ -46,6 +48,47 @@ from .world.scenario import Scenario, load_scenario
 
 TOP_ELEVATION = -70.0     # near-plan, a little depth left (scripts/render_pitch.py's angle)
 FOLLOW_DISTANCE = 1.1     # m — a duck fills ~30% of the tile, the toy or ball it works stays in frame
+
+
+def subject_size_m(robot: str) -> float | None:
+    """How big body `robot` is, metres — the larger of its standing height and
+    its widest horizontal extent (`lab/robots.measured_size`), or `None`.
+
+    One definition for the whole repo: the same number the lab sends the
+    viewer as `Scene.size`, so a shot framed here and a shot framed in the
+    browser are framed on the same measurement rather than two.
+    """
+    from .lab.robots import measured_size
+
+    size = measured_size(robot)
+    return max(size["height"], size["width"]) if size else None
+
+
+def follow_scale(sc: Scenario, follow: str) -> float:
+    """`FOLLOW_DISTANCE` and `LOOKAT_Z` are a 0.277 m DUCK's: 1.1 m out fills
+    about 30 % of the tile and 0.14 m is its mid-body. This is how many of
+    those the followed subject is, so the same two numbers frame any of them.
+
+    Measured on whatever is actually being followed — the duck's own body, a
+    person's robot, or a mocap capsule's declared `height` (there is no model
+    to measure for one of those). 1.0 whenever the subject cannot be
+    measured, which is the framing every one of these shots had before.
+    """
+    duck = subject_size_m("microduck")
+    subject: float | None = None
+    for d in sc.ducks:
+        if d.id == follow:
+            subject = subject_size_m(d.robot)
+            break
+    else:
+        for p in sc.persons:
+            if p.id == follow:
+                subject = (float(p.height) if p.kind == "capsule"
+                           else subject_size_m(p.kind))
+                break
+    if not duck or not subject or subject <= 0:
+        return 1.0
+    return subject / duck
 
 
 def parse_brains(pairs: list[str]) -> dict[str, str]:
@@ -78,11 +121,20 @@ def make_camera(spec: str, sc: Scenario):
         cam.distance = max(sc.floor) * 1.05
     elif spec.startswith("follow:"):
         follow = spec.split(":", 1)[1]
-        if follow not in {d.id for d in sc.ducks}:
-            raise SystemExit(f"--camera follow:{follow}: no such duck in {sc.name} "
-                             f"({', '.join(d.id for d in sc.ducks)})")
+        # A PERSON is followable too, not only a duck. A walking robot in a
+        # room is a person (`world/arena.WorldPerson`), and "point the camera
+        # at the robot" was the first thing wanted of the first non-duck one.
+        subjects = {d.id for d in sc.ducks} | {p.id for p in sc.persons}
+        if follow not in subjects:
+            raise SystemExit(
+                f"--camera follow:{follow}: no such duck or person in "
+                f"{sc.name} ({', '.join(sorted(subjects))})")
         cam.azimuth, cam.elevation = CAMERAS["three-quarter"]
-        cam.distance = FOLLOW_DISTANCE
+        # Sized to what is being followed: at the duck's 1.1 m a 1.3 m Asimov
+        # is cropped to its chest, and a 1.0 m person's legs leave the tile.
+        k = follow_scale(sc, follow)
+        cam.distance = FOLLOW_DISTANCE * k
+        cam.lookat[2] = LOOKAT_Z * k
     elif spec in CAMERAS:
         cam.azimuth, cam.elevation = CAMERAS[spec]
         cam.distance = max(sc.floor) * 0.9
@@ -143,9 +195,10 @@ def main() -> None:
     ap.add_argument("--skip", type=float, default=0.0, help="sim seconds to run BEFORE recording starts (see late play)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default="/tmp/rw")
-    ap.add_argument("--camera", default="top", help="top | follow:<duck> | side | front | three-quarter")
+    ap.add_argument("--camera", default="top", help="top | follow:<duck or person> | side | front | three-quarter")
     ap.add_argument("--distance", type=float, default=None,
-                    help="camera distance in m (default: framed per camera; a follow shot with a 1.3 m G1 person in it wants ~3)")
+                    help="camera distance in m (default: framed per camera — the fixed ones on the room, "
+                         "a follow on the SUBJECT's own size, so a 1.3 m robot is filmed from 5.1 m and a duck from 1.1)")
     ap.add_argument("--elevation", type=float, default=None, help="camera elevation in degrees (default: the camera's own)")
     ap.add_argument("--azimuth", type=float, default=None,
                     help="camera azimuth in degrees (default: the camera's own; 90 lays a pitch's length across a landscape frame)")
@@ -247,8 +300,12 @@ def main() -> None:
             continue
         # -- a frame -----------------------------------------------------------
         if follow is not None:
-            p = w.ducks[follow].trunk_pos(w.data)
-            cam.lookat[:] = (p[0], p[1], LOOKAT_Z)
+            p = (w.ducks[follow].trunk_pos(w.data) if follow in w.ducks
+                 else w.data.xpos[w.persons[follow].body])
+            # x/y track the subject; the HEIGHT is the one `make_camera` sized
+            # for this body (and `--elevation`/`--distance` may have changed
+            # the rest of the shot, which this must not undo).
+            cam.lookat[:] = (p[0], p[1], cam.lookat[2])
         renderer.update_scene(w.data, cam, opt)
         frames.append(renderer.render().copy())
         s = score_line(w, st)

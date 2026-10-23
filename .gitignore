@@ -40,6 +40,8 @@ microduck_local/brains/follow-v5/*
 !microduck_local/brains/follow-v5/brain.json
 microduck_local/recordings/
 microduck_local/lab-state.json
+# ...and the timestamped copies restart.sh and hand-moves leave behind.
+microduck_local/lab-state.json.bak*
 microduck_local/teach-weights.json
 # 🤗 BYOK Hugging Face token (the viewer's ⚙ settings) — never commit
 microduck_local/hf-token.json

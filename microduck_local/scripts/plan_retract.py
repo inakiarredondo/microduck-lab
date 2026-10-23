@@ -15,11 +15,10 @@ joint space, and take the cheapest. That is a one-waypoint PRM, and it checks
 collisions with kinematics only (mj_forward), so it costs microseconds per
 sample rather than a physics rollout.
 """
-import numpy as np
 import mujoco
+import numpy as np
 
 from microduck_local.robots import moss
-from microduck_local.robots.moss_env import MossStowEnv
 
 ARM = moss.ARM_JOINTS[:5]
 

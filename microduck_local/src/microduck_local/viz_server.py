@@ -124,6 +124,15 @@ accepts:
   {"remove_duck": {"duck": "d3"}}   remove ANY duck (declutter the roster);
                            the trainee is only removable when no run is active
   {"spawn_duck": {"policy": "pollen:alpha_stand"}}   add a fresh duck running
+                           optional "shove": <bodyweights> — shove the robot
+                           once it is up and keep the episode running when it
+                           goes down, so the recovery loop is watchable
+                           (labelled "— shoved Nbw"); 1.6 floors it 9 of 12,
+                           <=0.8 it survives 12 of 12
+                           optional "handoff": false — stage this body with
+                           the hand-over OFF while keeping the same env, so a
+                           handoff can be A/B'd without also changing the
+                           world it runs in (labelled "— no handoff")
                            that palette policy (cap 20 ducks); accepts the
                            same optional "showcase" flag as assign
   {"spawn_robot": {"robot": "mars"}}   add a slot for a BODY with no policy —
@@ -149,6 +158,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import math
 import os
@@ -156,6 +166,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -269,7 +280,32 @@ def load_hf_token() -> dict | None:
 # Helpers stay as extra VIEWERS of live.onnx; they do not resize the trainer.
 # ENVS_PER_HELPER is kept at 0 so TrainingJob.scale() / payload arithmetic
 # cannot quietly grow --envs if a helper spawn ever calls it again.
-BASE_ENVS = 32          # train_behavior's own --envs default
+#: `train_behavior`'s own --envs default. 32 STAYS, and the attempt to tune it
+#: down is worth recording because the micro-benchmark said the opposite of the
+#: truth.
+#:
+#: Timed in a fresh process, best of three 256-step bursts, the Asimov get-up
+#: env peaked at 24 envs (12,747 steps/s) against 32 (10,642) — a clean-looking
+#: 20 % win. Run as actual training, 24 envs is ~20 % SLOWER:
+#:
+#: | phase | 32 envs | 24 envs |
+#: |---|---|---|
+#: | first 10 iterations | 9,092 | 10,383 |
+#: | iterations 10-30 | 7,775 | 6,163 |
+#: | iterations 30-80 | 7,302 | 5,859 |
+#: | iterations 80-200 | 5,599 | 4,439 |
+#: | steady state | 4,195 | 3,845 |
+#:
+#: A short burst measures the COLD, boosted machine — which is the only regime
+#: where 24 wins (1.14x in the first ten iterations). Both configurations then
+#: decay from ~9,000 to ~4,200 steps/s as sustained load heats the machine, and
+#: in that regime 32 is ahead at every phase. **Benchmark throughput over
+#: hundreds of iterations of a real run, never over a burst**, and compare the
+#: same phase of two runs — comparing one run's first iterations against
+#: another's steady state produced a confident, wrong 1.79x.
+#:
+#: `MICRODUCK_BASE_ENVS` overrides it for a machine with a different core count.
+BASE_ENVS = int(os.environ.get("MICRODUCK_BASE_ENVS") or 32)
 #: How many envs may be training across ALL jobs at once. Derived from the
 #: measurement rather than typed: a 32-env job draws ~4.6 of this machine's
 #: usable cores, so ~7 envs ride on a core. Budgeting to two thirds of the
@@ -388,7 +424,21 @@ class Duck:
         # env (it would load, run, and produce nonsense).
         self.robot = robot or "microduck"
         self.infer = infer  # (obs[obs_dim]) -> action[num_joints]
-        self.env_kwargs = dict(env_kwargs or {})
+        # A caller that passes none gets the RUN'S OWN recorded kwargs, not
+        # an empty dict. Only the RESTORE path resolved these, so a duck added
+        # from the CLI or the palette built the body's DEFAULT env: for
+        # `asimov-getup-h5pd2` (history 5) that is a 78-wide observation for a
+        # 390-input policy, and both ducks were removed from the stage on their
+        # first tick with "Got: 78 Expected: 390". The lab came up EMPTY.
+        #
+        # The mirror image of the bug `_restore_run_path` documents — there a
+        # fresh spawn was right and the restore wrong, so it needed a restart
+        # to appear; here the restore is right and the fresh spawn wrong, so it
+        # appears instantly and only for runs whose env differs from the
+        # default. `history` and `actuator_force` are exactly those knobs.
+        self.env_kwargs = dict(
+            env_kwargs if env_kwargs is not None
+            else (env_kwargs_for_policy_path(onnx_path) if onnx_path else {}))
         # Brain provenance, for lab-state.json: a palette id, an .onnx path,
         # or neither (a zero-infer trainee before its first snapshot).
         self.policy_id = policy_id
@@ -408,6 +458,8 @@ class Duck:
         # trick policy alone managed none.
         self.handoff_infer = None
         self.handoff_label = None
+        self.handoff_fn = None
+        self.handoff_recenter = None
         self.handed = False
         # Kept: rebuild_env re-seeds the env RNG, and every duck must keep
         # drawing its own spawn stream (helpers exist to be independent).
@@ -478,7 +530,15 @@ class Duck:
         # lets the watched trainee run the trainer's real settings instead of
         # a sanitised copy of them: the shared model was the reason the
         # preview pinned `domain_rand=False`, and a private one removes it.
-        writes_model = bool(kw.get("domain_rand"))
+        # ...and so does "dc": `robots/asimov_motor.DcMotorClip` rewrites
+        # `model.actuator_forcerange` from THIS env's qvel before every
+        # physics substep, which is the same hazard BAM has with
+        # `dof_frictionloss`. Two dc bodies on one shared mjModel would clamp
+        # each other's torques, and `walk_env` refuses a shared model for it —
+        # but it can only SEE the sharing when the model arrives through the
+        # scope, because an explicitly passed model sets `_model_shared =
+        # False` by definition. So the decision has to be right HERE.
+        writes_model = bool(kw.get("domain_rand")) or actuator == "dc"
         scope = (nullcontext() if (actuator == "bam" or writes_model)
                  else shared_model_scope(exclusive=False))
         with scope:
@@ -494,7 +554,37 @@ class Duck:
                 # question MARS can be asked, and `env_class("walk")` rightly
                 # raises rather than handing an arm a walker's env.
                 kw.pop("actuator", None)
-                kw["actuator_force"] = "xml"
+                # "xml" UNLESS the caller named a model this body publishes.
+                # This used to assign "xml" unconditionally, which silently
+                # overrode the palette entry that asked for "dc" — so
+                # openhorizon's get-up ran on the stage inside the FLAT
+                # clamp while the roster row and the entry both said it was
+                # inside the speed-torque envelope. A stage that disagrees
+                # with its own label is the fault this file keeps hitting
+                # ("the stage must show the physics the trainer is
+                # running"). "bam" is still forced away: it is the duck's
+                # XL330 model and no other body speaks it.
+                if actuator == "dc":
+                    kw["actuator_force"] = "dc"
+                else:
+                    kw["actuator_force"] = "xml"
+                # THE SILENT DISCARD, made loud. `behavior_id` and
+                # `standing_spawns` are DUCK knobs and were popped above; for
+                # another body they simply vanished, and what was left could
+                # be `{}` — which `slot_env` honours by falling back to the
+                # body's `default_task`. That is how a finished Asimov get-up
+                # came back as a WALK: nothing was wrong, nothing was logged,
+                # and the only symptom was a robot standing still. A caller
+                # that names a behavior and not a task is a bug in the
+                # caller, so say so where the lab log will show it, and keep
+                # going — a raise here runs inside the 50 Hz loop and costs
+                # the WHOLE roster, not one body.
+                if behavior_id and not kw.get("task"):
+                    MISROUTED_PREVIEWS.append((self.robot, behavior_id))
+                    print(f"[lab] {self.id} ({self.robot}) was handed the "
+                          f"DUCK's preview kwargs for {behavior_id!r} and no "
+                          f"task — falling back to this body's default task. "
+                          f"See env_kwargs_for_behavior.", flush=True)
                 return lab_robots.slot_env(self.robot, seed,
                                            {**common, **kw})
             # MERGED, not double-splatted: `kw` may now carry keys `common`
@@ -606,6 +696,27 @@ class Duck:
         # instead of the trick it was rebuilt to perform.
         self.speed_hist.clear()
         self.handed = False
+        self._reset_policy_state()
+
+    def _reset_policy_state(self) -> None:
+        """Clear any episode state the POLICY itself keeps.
+
+        Almost every brain here is a pure function of the observation, but a
+        history-stacking adapter is not: openhorizon's get-up answers 5 frames
+        at a time, and a ring carried across a reset feeds the new episode
+        frames from the one that just ended — their own runner calls
+        `pol.reset()` once per episode for exactly this reason. Duck-typed
+        rather than isinstance'd so a second adapter needs nothing here, and
+        guarded because a raise inside the 50 Hz loop costs the whole roster.
+        """
+        for fn in (getattr(self.infer, "reset", None),
+                   getattr(self.handoff_infer, "reset", None)):
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as exc:
+                    print(f"[lab] {self.id}: policy reset failed: "
+                          f"{type(exc).__name__}: {exc}")
 
     def swap_policy(self, label: str, infer, policy_id: str | None = None,
                     onnx_path: str | None = None) -> None:
@@ -624,7 +735,10 @@ class Duck:
         self.handed = False
         self.handoff_infer = None
         self.handoff_label = None
+        self.handoff_fn = None
+        self.handoff_recenter = None
         self._settle = 0
+        self._reset_policy_state()
 
     def _handoff_due(self) -> bool:
         """The trick is finished and the duck is on both feet.
@@ -636,7 +750,20 @@ class Duck:
         implementation instead of two copies kept in step by comment.
         """
         env = self.env
-        fn = getattr(getattr(env, "behavior", None), "handoff_fn", None)
+        # THE DUCK'S OWN PREDICATE FIRST. This used to read `handoff_fn` off
+        # `env.behavior` alone — an attribute only the duck's `BehaviorEnv`
+        # has. Every other body builds through `lab/robots.slot_env`, which
+        # attaches no behavior, so a non-duck recipe's handoff predicate was
+        # never consulted and this fell through to the duck-only `_bf_rot`
+        # rule, which is None on those bodies and returns False forever.
+        # Measured on the Asimov get-up: the condition fires 23 of 24
+        # episodes offline and fired 0 times in 1750 lab frames, while the
+        # roster cheerfully advertised "handoff: asimov1-shipped".
+        # Same shape as `env_kwargs_for_behavior` — a duck-shaped lookup
+        # that silently no-ops for another body.
+        fn = getattr(self, "handoff_fn", None)
+        if fn is None:
+            fn = getattr(getattr(env, "behavior", None), "handoff_fn", None)
         if fn is not None:
             return bool(fn(env))
         rot = getattr(env, "_bf_rot", None)
@@ -657,6 +784,31 @@ class Duck:
     _walker_infer = None   # class-level lazy alpha_walking for recentering
     _walker_missing = False  # upstream policies/ absent: try once, then skip
 
+    #: Hand BACK below this uprightness, held this many ticks. Both are read
+    #: off the observation the robot actually has (projected gravity), never
+    #: off trunk height or the contact list, which an Asimov cannot sense —
+    #: see `getup_acceptance.obs_switch_due` for the measurements.
+    #:
+    #: The DWELL is the settle clause, not a debounce: handing the get-up a
+    #: state mid-fall is the mistake that cost 7.5M steps, where 21 of 24
+    #: start states were the robot already horizontal with downward momentum
+    #: and nothing recovered from any of them. 0.6 s is long enough that the
+    #: fall has finished.
+    DOWN_UPRIGHT = 0.40
+    DOWN_DWELL = 30
+
+    def _down_due(self) -> bool:
+        """Is the robot DOWN — by what it can sense — and settled there?"""
+        try:
+            g = self.obs[slice(*_asimov_obs_gravity(self.robot))]
+        except Exception:                        # noqa: BLE001
+            return False
+        if g is None or len(g) < 3:
+            return False
+        down = float(-g[2]) < self.DOWN_UPRIGHT
+        self._down_n = (getattr(self, "_down_n", 0) + 1) if down else 0
+        return self._down_n >= self.DOWN_DWELL
+
     def _recenter_wz(self) -> float | None:
         """After the trick settles, drive yaw back to the spawn heading.
 
@@ -672,7 +824,24 @@ class Duck:
         # Opt-out for a behavior whose heading is the point: find_ball turned
         # to face the ball, and "drive yaw back to the spawn heading" would
         # undo exactly the work it just did (and aim the kick at nothing).
-        if not getattr(getattr(self.env, "behavior", None), "handoff_recenter", True):
+        # THE DUCK'S FLAG FIRST, for the same reason `_handoff_due` reads its
+        # own: `env.behavior` exists only on the duck's `BehaviorEnv`, so a
+        # non-duck recipe's `handoff_recenter=False` was silently ignored.
+        # The cost was not a missed preference — recentring loads the DUCK'S
+        # 61-obs alpha_walking and runs it, so on a 78-obs Asimov it raised
+        # inside tick() and the lab REMOVED the body:
+        #   "Got invalid dimensions for input: obs ... Got: 78 Expected: 61"
+        # A 70 s watch showed 26 frames and an empty stage.
+        _rc = getattr(self, "handoff_recenter", None)
+        if _rc is None:
+            _rc = getattr(getattr(self.env, "behavior", None),
+                          "handoff_recenter", True)
+        # ...and NEVER for a body the duck's walker cannot drive. The width
+        # is the backstop: this path hardcodes a 61-obs policy, so it is only
+        # ever valid for the duck.
+        if self.robot != "microduck":
+            _rc = False
+        if not _rc:
             return None
         q = self.env.data.qpos[3:7]
         yaw = float(np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
@@ -702,6 +871,14 @@ class Duck:
     def tick(self) -> None:
         if self.handoff_infer is not None and not self.handed and self._handoff_due():
             self.handed = True
+        elif self.handed and self._down_due():
+            # HAND BACK. The switch used to be one way, so a robot shoved
+            # over stayed down for the rest of the episode even when it could
+            # rise — measured over 12 x 30 s episodes under 506 N shoves:
+            # one way 12 stands / 0 recoveries / 0 of 12 up at the end,
+            # two way 44 stands / 32 recoveries / 11 of 12 up at the end.
+            self.handed = False
+            self._down_n = 0
 
         # handed without a brain to hand off to is the one combination that
         # calls None(obs) and kills the loop; make it unrepresentable here
@@ -760,6 +937,7 @@ class Duck:
         cmd = self.env.twist_cmd.copy() if self.steers() else None
         self._hold_yaw = None   # new episode, new heading anchor
         self.handed = False   # each episode starts on the trick's own brain
+        self._down_n = 0      # and with no partial down-dwell carried over
         # Speed is reported PER EPISODE: carrying the last half second of a
         # run that ended in a faceplant into the fresh episode would show a
         # duck standing still at 0.3 m/s.
@@ -874,6 +1052,13 @@ def _robot_scene_to_env(model, robot: str) -> tuple[tuple[int, int], ...]:
     return tuple(out)
 
 
+#: Every time a non-duck body was built from duck-shaped preview kwargs with
+#: no task — see `Duck._make_env`. Empty is the invariant;
+#: `test_a_preview_env_NAMES_THE_TASK_for_every_body` keeps it that way, and
+#: this list is how a test sees the fallback actually fire.
+MISROUTED_PREVIEWS: list[tuple[str, str]] = []
+
+
 def _onnx_infer(path: Path):
     import onnxruntime as ort
     # One thread per session, like brain_env's walker. The lab steps its whole
@@ -887,13 +1072,36 @@ def _onnx_infer(path: Path):
     sess = ort.InferenceSession(str(path), sess_options=opts)
     in_name = sess.get_inputs()[0].name
 
-    def infer(obs: np.ndarray) -> np.ndarray:
-        return sess.run(None, {in_name: obs[None]})[0][0].astype(np.float32)
     # What this brain expects to be fed. The roster can hold two bodies now,
     # and a policy stepped in the wrong one runs happily on garbage.
     shape = sess.get_inputs()[0].shape
-    if len(shape) == 2 and isinstance(shape[1], int):
-        infer.obs_dim = int(shape[1])
+    want = int(shape[1]) if (len(shape) == 2 and isinstance(shape[1], int)) \
+        else None
+
+    def infer(obs: np.ndarray) -> np.ndarray:
+        o = obs
+        # A HANDOFF PARTNER NEED NOT READ THE SAME VECTOR. Asimov's get-up
+        # takes 390 floats (5 stacked frames of Menlo's 78, NEWEST LAST) and
+        # their shipped walker takes 78, so once a get-up behavior declares
+        # `handoff_policy="asimov1-shipped"` the lab hands the stacked vector
+        # to a single-frame policy and ORT raises `Got: 390 Expected: 78` —
+        # inside the 50 Hz loop, which is how a body gets dropped from the
+        # stage (`handoff_recenter` did exactly that with `Got: 78 Expected:
+        # 61`).
+        #
+        # The slice is deliberately NARROW: only when the incoming width is
+        # an exact MULTIPLE of what the model wants, which is what frame
+        # stacking produces (390 = 5 x 78). A duck's 61-obs policy fed an
+        # Asimov's 390 gives 390 % 61 = 24, so it still raises instead of
+        # silently running on the last 61 floats of another robot — the
+        # whole point of the `obs_dim` guard below.
+        if want is not None and o.shape[-1] != want:
+            if o.shape[-1] > want and o.shape[-1] % want == 0:
+                o = o[-want:]
+        return sess.run(None, {in_name: o[None]})[0][0].astype(np.float32)
+
+    if want is not None:
+        infer.obs_dim = want
     return infer
 
 
@@ -1059,6 +1267,79 @@ def discover_policies() -> list[dict]:
 RUN_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
 
+_EXPORTING: set[str] = set()
+_EXPORT_LOCK = threading.Lock()
+
+
+def start_export(run: Path) -> None:
+    """Export a finished run's `policy.onnx`, off the sim loop.
+
+    **A run without `policy.onnx` is INVISIBLE.** `discover_policies` lists a
+    run only `if (run / "policy.onnx").exists()`, and nothing on the teach
+    path ever wrote one: a job trained its full budget, saved `model.zip`,
+    `vecnormalize.pkl` and its terminal record, set `status = "done"` — and
+    then simply never appeared in the palette. The user had to know to run
+    `export-walk` by hand on a directory name they had no way to see. On
+    2026-10-06 that was **338 of 1085** trained runs on this machine,
+    including the from-scratch get-up chain whose entire purpose was to be
+    looked at, and it read as the lab losing the training run.
+
+    Called for EVERY stage as it finishes, not just a chain's last one: a
+    curriculum's stages are each a policy worth comparing (`--pick` names the
+    one worth using, and on the G1 kick chain that was stage 3 of 4), and
+    exporting only the tail is what left `…-s1` through `…-s4` unlistable.
+
+    Off the caller's thread because `export` loads the checkpoint and traces
+    the network, and this is reached from the 50 Hz poll.
+    """
+    with _EXPORT_LOCK:
+        if run.name in _EXPORTING:
+            return
+        _EXPORTING.add(run.name)
+
+    def work() -> None:
+        try:
+            onnx = run / "policy.onnx"
+            model = run / "model.zip"
+            if not model.exists():
+                print(f"[lab] {run.name}: nothing to export (no model.zip)",
+                      flush=True)
+                return
+            # Re-export when the CHECKPOINT is newer than the artefact. Both
+            # halves matter: "a stale artefact is not a fresh one" (AGENTS.md)
+            # cost this repo a policy scored from a 98 k-step checkpoint, and
+            # a NEWER `policy.onnx` is someone's deliberate export of a chosen
+            # checkpoint, which this must not clobber.
+            if onnx.exists() and onnx.stat().st_mtime >= model.stat().st_mtime:
+                return
+            from .export_onnx import export
+            export(run, onnx)
+            print(f"[lab] exported {run.name}/policy.onnx — it is in the "
+                  f"palette now", flush=True)
+        except Exception as exc:        # a contract refusal, a bad checkpoint
+            print(f"[lab] {run.name} export failed: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+        finally:
+            with _EXPORT_LOCK:
+                _EXPORTING.discard(run.name)
+
+    threading.Thread(target=work, name=f"export-{run.name}",
+                     daemon=True).start()
+
+
+def exporting_runs() -> list[str]:
+    """Runs whose `policy.onnx` is being written right now.
+
+    The palette refetches on the training -> done transition, which lands
+    BEFORE a background export has produced the file — so without this the
+    run the user just watched train still would not appear until they poked
+    the panel. Streamed so the panel can poll while it is non-empty, exactly
+    as it already does for a robot download (`robots.some(r => r.fetching)`).
+    """
+    with _EXPORT_LOCK:
+        return sorted(_EXPORTING)
+
+
 def run_dir(name: str) -> Path:
     """Path of a run directory inside RUNS_DIR, or ValueError.
 
@@ -1164,6 +1445,13 @@ def load_policy_infer(policy_id: str):
     entry = next((p for p in discover_policies() if p["id"] == policy_id), None)
     if entry is None:
         raise KeyError(policy_id)
+    adapter = str(entry.get("adapter") or "")
+    if adapter:
+        # NOT cached: an adapter carries the episode state its policy needs
+        # (openhorizon's get-up keeps a 5-frame observation ring), so two
+        # ducks sharing one instance would feed each other's frames. The ORT
+        # SESSION is still shared — that part is stateless.
+        return _adapter_infer(adapter)
     path = Path(entry["path"])
     if path.suffix == ".onnx":
         infer = _onnx_infer(path)
@@ -1172,6 +1460,22 @@ def load_policy_infer(policy_id: str):
         infer = _checkpoint_infer(path, path.parent / f"model_vecnormalize_{steps}_steps.pkl")
     _infer_cache[policy_id] = infer
     return infer
+
+
+def _adapter_infer(adapter: str):
+    """Build a fresh stateful policy adapter from its `<kind>:<name>` id.
+
+    The indirection exists so a palette entry can name a controller this
+    server does not know how to construct — openhorizon's get-up takes 375
+    inputs and this lab speaks 78, and the adapter is what reconciles them
+    (it stacks 5 frames of Menlo's own layout; see
+    `robots/asimov_openhorizon`).
+    """
+    kind, _, name = adapter.partition(":")
+    if kind == "openhorizon":
+        from .robots import asimov_openhorizon as _oh
+        return _oh.OpenHorizonPolicy(name or "getup")
+    raise KeyError(f"unknown policy adapter {adapter!r}")
 
 
 def _same_run_dir(p: Path) -> bool:
@@ -1214,6 +1518,27 @@ def build_ducks(args) -> list[Duck]:
 
     for spec in args.policies:
         p = Path(spec)
+        # A PALETTE ID first. A fetched policy (openhorizon's get-up, the
+        # shipped ones) has no run directory and needs its ADAPTER: their
+        # get-up reads 375 floats TERM-major where ours reads 390 FRAME-major,
+        # so `_onnx_infer` on the bare file hands the session the wrong
+        # observation and the body is dropped on its first tick. `.onnx` paths
+        # and run dirs below are unchanged; this only adds a spelling the CLI
+        # could not express at all, which is why their policy could only be
+        # compared from the browser palette.
+        if p.suffix != ".onnx" and not p.exists():
+            hit = next((e for e in discover_policies()
+                        if e["id"] == spec), None)
+            if hit is not None:
+                add(hit.get("label") or spec, load_policy_infer(spec),
+                    policy_id=spec,
+                    onnx_path=(str(hit["path"])
+                               if str(hit.get("path", "")).endswith(".onnx")
+                               else None),
+                    robot=hit.get("robot"))
+                continue
+            print(f"[lab] skipping {spec}: not a run dir, .onnx, or palette id")
+            continue
         if p.suffix == ".onnx":
             add(p.parent.name if p.name == "policy.onnx" else p.stem,
                 _onnx_infer(p), onnx_path=str(p))
@@ -1246,6 +1571,84 @@ def build_ducks(args) -> list[Duck]:
 
 
 # ------------------------------------------------------------ training jobs
+
+
+#: Every `MICRODUCK_*` knob an env class declares as a `*_ENV` constant, plus
+#: the lab's own run-scoped ones. Collected from the classes themselves so a new
+#: knob needs no second list to stay in sync.
+_LAB_OWN_ENV_KEYS = frozenset({
+    "MICRODUCK_CLIP", "MICRODUCK_RUNS_DIR", "MICRODUCK_RUN_TITLE",
+    "MICRODUCK_BASE_ENVS",
+})
+
+
+@functools.lru_cache(maxsize=1)
+def known_env_keys() -> frozenset[str]:
+    """Every `MICRODUCK_*` name the PACKAGE mentions, read off its source.
+
+    A source scan and not a registry of `*_ENV` class constants: most knobs are
+    read inline (`os.environ.get("MICRODUCK_MOSS_PICK_RUNG")`), so collecting
+    only the declared constants found 14 of them and would have REFUSED every
+    real MOSS knob. A guard that rejects working input is worse than no guard,
+    so this is deliberately a superset — it catches typos, not misuse.
+    """
+    pat = re.compile(r"MICRODUCK_[A-Z0-9_]+")
+    found: set[str] = set(_LAB_OWN_ENV_KEYS)
+    root = Path(__file__).resolve().parent
+    for f in root.rglob("*.py"):
+        try:
+            found.update(pat.findall(f.read_text()))
+        except OSError:
+            continue
+    return frozenset(found)
+
+
+def unknown_env_keys(env: dict[str, str]) -> None:
+    """Refuse a `/teach` request that names a knob nothing reads.
+
+    THE BUG THIS EXISTS FOR. Three Asimov get-up runs were launched with a
+    `track_tol` knob spelled `..._ASIMOV_GETUP_TOL`. The real name is
+    `MICRODUCK_ASIMOV_GETUP_TRACK_TOL`, so all three silently trained at the
+    recipe's default 0.25 while being described, in writing, as 0.90 runs. A
+    misspelled knob is not a smaller version of the experiment — it is a
+    different one, reported under the wrong name, and `run.json` is the only
+    place it shows (which is the same reason `train_env_kwargs` exists at all).
+
+    A typo is the common case, so the message names the nearest real knob.
+
+    `known_env_keys` reads the package SOURCE, so a wrong name written out in
+    full anywhere in it becomes "known" — this docstring named the typo it was
+    built to catch and silently whitelisted it. Spell bad examples with a
+    leading ellipsis, and keep in mind a comment can widen this set.
+    """
+    import difflib
+    import os.path
+
+    known = known_env_keys()
+    bad = sorted(k for k in env if k.startswith("MICRODUCK_") and k not in known)
+    if not bad:
+        return
+
+    def rank(k: str, cand: str) -> tuple:
+        # Shared PREFIX first, then shared SUFFIX, then similarity. A plain
+        # difflib ratio ranked `..._GETUP_LAG` above `..._GETUP_TRACK_TOL` for
+        # the typo `..._GETUP_TOL`, because the right answer is LONGER — and an
+        # inserted word is the typo this is for.
+        pre = len(os.path.commonprefix([k, cand]))
+        suf = len(os.path.commonprefix([k[::-1], cand[::-1]]))
+        return (pre, suf, difflib.SequenceMatcher(None, k, cand).ratio())
+
+    lines = []
+    for k in bad:
+        near = sorted(known, key=lambda c: rank(k, c), reverse=True)[:2]
+        near = [c for c in near if rank(k, c)[0] > len("MICRODUCK_")]
+        lines.append(f"  {k}" + (f"   did you mean {' or '.join(near)}?"
+                                 if near else "   (nothing reads this)"))
+    raise ValueError(
+        "these env knobs are not read by anything, so the run would train "
+        "under the recipe's defaults while claiming otherwise:\n"
+        + "\n".join(lines))
+
 
 class TrainingJob:
     """One logical teach job: a `train-behavior` subprocess chain + its
@@ -1299,6 +1702,7 @@ class TrainingJob:
         # CLIP an imitation run tracks, so a user can author several motions
         # in the timeline editor and train whichever one they mean.
         self.extra_env = dict(extra_env or {})
+        unknown_env_keys(self.extra_env)
         clip_slug = ""
         if (extra_env or {}).get("MICRODUCK_CLIP"):
             clip_slug = "-" + re.sub(r"[^a-zA-Z0-9]+", "_",
@@ -1379,6 +1783,10 @@ class TrainingJob:
         self.progress: dict = {"steps": 0, "total": self.total_steps}
         self._offset = 0
         self._live_mtime = 0.0
+        # Run dirs whose interrupted-snapshot temps have been cleared. A SET
+        # rather than a flag: a chain's stages share the job, so the reset
+        # would otherwise have to be remembered in _advance_stage.
+        self._swept: set[str] = set()
         self._fps_points: list[tuple[float, float]] = []  # (steps, elapsed_s)
         # Job-lifetime wall clock: elapsed_s restarts with every subprocess
         # (stage handoffs, helper warm-restarts), so the "how long has this
@@ -1464,6 +1872,10 @@ class TrainingJob:
         # live.onnx here is old news, not a fresh snapshot — don't let the
         # first poll() flag it.
         self._live_mtime = time.time()
+        # Run dirs whose interrupted-snapshot temps have been cleared. A SET
+        # rather than a flag: a chain's stages share the job, so the reset
+        # would otherwise have to be remembered in _advance_stage.
+        self._swept: set[str] = set()
         self._fps_points = []
         self._t0 = None  # adopted after the fact — its wall clock is unknown
         self._elapsed_final = None
@@ -1580,9 +1992,62 @@ class TrainingJob:
         environment (see _launch): an imitation run whose clip only rode
         extra_env gave the preview duck the recipe's DEFAULT clip, so the
         watched duck tracked a different motion than the one training."""
-        return {**self.extra_env, **self._stage_env}
+        return self._job_env()
+
+    def _job_env(self) -> dict[str, str]:
+        """The knobs this job runs under — ONE definition, so the preview env
+        and the trainer subprocess cannot disagree.
+
+        For a STAGED chain the stage wins: the stage IS the recipe, and a
+        request must not quietly redefine a rung of it.
+
+        For a single-run `initFrom` fine-tune the REQUEST wins, because there
+        is no stage the person chose — `_stage_env` there is only the final
+        stage's knobs borrowed as a default. `TeachRequest.env` documents itself
+        as the escape hatch for exactly this case ("an initFrom fine-tune has no
+        stage, so it inherits the LAB's own environment"), and with the staged
+        order applied to a single run it was silently dropped: a fine-tune of
+        the Asimov get-up launched with
+        `env={"MICRODUCK_ASIMOV_GETUP_START": "pike,quadruped"}` recorded the
+        full seven-rung set instead and trained the wrong experiment for 8192
+        steps before `run.json` gave it away (2026-10-04).
+        """
+        if self.stages:
+            return {**self.extra_env, **self._stage_env}
+        return {**self._stage_env, **self.extra_env}
+
+    def _write_behavior_record(self) -> None:
+        """Name the RECIPE on the run, whichever trainer produced it.
+
+        `train_behavior.py` writes `behavior.json`; `train.py` — the trainer
+        every NON-DUCK body uses — does not. So no Asimov, G1, MOSS or MARS
+        teach run has ever carried one, and `/teach/load` refuses a run
+        without it ("predates recipe records"). The consequence was not
+        subtle: on 2026-10-10 the best get-up this project has — 24/24 rises,
+        a 7.00 s hold — could not be put on the stage at all, so Jonathan
+        spent an afternoon watching training runs that did not stand while
+        the one that did sat in `runs/` unloadable.
+        
+        Written by the LAB rather than by either trainer, because the lab is
+        the only place that knows the recipe behind a job regardless of which
+        trainer it spawns. Non-fatal: a run that cannot write this still
+        trains, it just stays unloadable, which is the old behaviour.
+        """
+        rec = self.dir / "behavior.json"
+        if rec.exists():
+            return
+        try:
+            rec.write_text(json.dumps({
+                "behavior": self.behavior.id,
+                "steps": self.total_steps,
+                "weights": dict(self.weights or {}),
+                "env": dict(self._job_env()),
+            }, indent=2))
+        except OSError:
+            pass
 
     def _launch(self, init_from: Path | None) -> subprocess.Popen:
+        self._write_behavior_record()
         if self.behavior.trainer:
             # Another body's task: its own trainer, same artifacts. train.py
             # writes progress.jsonl + live.onnx exactly as train_behavior
@@ -1605,7 +2070,7 @@ class TrainingJob:
                 # job — "Perform “g1-front-kick”" is the name the person
                 # watching it saw, so it is the name the palette should keep.
                 env={**os.environ, "MICRODUCK_RUN_TITLE": self.display_title(),
-                     **self.extra_env, **self._stage_env})
+                     **self._job_env()})
         cmd = [sys.executable, "-m", "microduck_local.train_behavior",
                self.behavior.id, "--run-name", self.run_name,
                "--envs", str(self.envs), "--steps", str(self.total_steps)]
@@ -1624,8 +2089,49 @@ class TrainingJob:
         # environment — the trainer itself stays curriculum-agnostic.
         return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 cwd=str(Path(__file__).resolve().parents[2]),
-                                env={**os.environ, **self.extra_env,
-                                     **self._stage_env})
+                                env={**os.environ, **self._job_env()})
+
+    def _wrote_terminal_record(self) -> bool:
+        """Did this stage write the `{"done": true}` line `train.py` emits last?
+
+        That line is written after `model.save` and `venv.save`, so its
+        presence means the artefacts are complete whatever the exit code was.
+        """
+        try:
+            with open(self.dir / "progress.jsonl") as f:
+                tail = f.readlines()[-3:]
+        except (OSError, IndexError):
+            return False
+        for line in reversed(tail):
+            try:
+                if json.loads(line).get("done"):
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _log_stage_failure(self, rc: int, salvaged: bool) -> None:
+        """Say WHY a stage exited non-zero, with the last of its own output.
+
+        The trainer writes to `<run>/train.log`; nothing used to read it back,
+        so a failed stage reported `status: failed` and nothing else — no exit
+        code, no traceback, no last line. Diagnosing one meant knowing that file
+        existed and going to find it by hand.
+        """
+        tail = ""
+        try:
+            with open(self.dir / "train.log") as f:
+                lines = [ln.rstrip() for ln in f.readlines()[-40:] if ln.strip()]
+            tail = next((ln for ln in reversed(lines)
+                         if not ln.startswith("|") and "---" not in ln), "")
+        except OSError:
+            pass
+        verdict = ("the work was COMPLETE (terminal record written) — "
+                   "continuing the chain" if salvaged else "the work was NOT finished")
+        print(f"[teach] {self.run_name} exited {rc}: {verdict}", flush=True)
+        if tail:
+            print(f"[teach]   last line of {self.dir.name}/train.log: {tail}",
+                  flush=True)
 
     def _advance_stage(self) -> None:
         """Launch the next curriculum stage: a fresh run fine-tuned from the
@@ -1659,6 +2165,36 @@ class TrainingJob:
         for k in self.extra_keys:
             out[k] = self.weights.get(k, behaviors_mod.CATALOG[k].weight)
         return out
+
+    def owned_pids(self) -> list[int]:
+        """Every pid this job is RESPONSIBLE for: the trainer and its workers.
+
+        Published by `/teach/status` so something outside the lab can tell a
+        teach job apart from any other trainer on the machine. The restart
+        guard is the caller that needed it: it reads the process table, and the
+        process table alone cannot say WHOSE trainer a pid is — this repo's
+        tests spawn real (short) `train_behavior` runs, so "a trainer is
+        running" was true in two completely different situations with the same
+        evidence. A pid the lab names here is work a restart would destroy; a
+        pid it does not name is somebody else's problem to identify.
+
+        The workers come from the snapshot `poll()` keeps fresh rather than a
+        fresh `children()` call: under the `fork` backend a worker inherits the
+        trainer's argv, so it matches a `pgrep -f microduck_local.train…` too,
+        and a guard that saw the trainer but not its workers would be left with
+        a handful of pids it could not place. Dead handles are dropped, never
+        signalled — see `_snapshot_workers` on why these are psutil handles.
+        """
+        if self.proc is None or self.proc.poll() is not None:
+            return []          # adopted run, or already finished: owns nothing
+        pids = [self.proc.pid]
+        for w in self._workers:
+            try:
+                if w.is_running():
+                    pids.append(w.pid)
+            except psutil.Error:
+                continue
+        return pids
 
     def _snapshot_workers(self) -> list[psutil.Process]:
         """Remember the trainer's SubprocVecEnv workers WHILE it is alive.
@@ -1789,6 +2325,26 @@ class TrainingJob:
                 snap = True
         if self.proc is None:  # adopted run: nothing running, nothing to reap
             return changed, snap
+        # Clear a dead trainer's half-written snapshot temps — whatever the
+        # status. This CANNOT live in the branch below, which is the obvious
+        # place and the wrong one: that branch is gated on
+        # `status == "training"`, and `stop()` sets "stopped" BEFORE the
+        # process exits (deliberately — that is what keeps poll() from
+        # chaining the next stage). Since a STOP is the only thing that leaves
+        # a temp behind, a sweep down there would never once have run. Put
+        # there first and measured: a planted model.tmp + live.onnx.tmp
+        # survived a /teach/stop untouched, in a run with no model.zip, so
+        # nothing else could have taken them either.
+        #
+        # Keyed by directory, so a stage handoff re-arms it without a reset
+        # and a dead stage is swept exactly once.
+        if self.proc.poll() is not None and str(self.dir) not in self._swept:
+            self._swept.add(str(self.dir))
+            swept = run_record.sweep_snapshot_tmps(self.dir)
+            if swept:
+                print(f"[lab] {self.run_name}: cleared "
+                      f"{', '.join(swept)} from an interrupted snapshot",
+                      flush=True)
         # During scale() the old proc is dead on purpose — not a failure.
         if (self.proc.poll() is not None and self.status == "training"
                 and not self.restarting):
@@ -1800,7 +2356,29 @@ class TrainingJob:
             # no-op, and a stage handoff sweeps the finished stage's fleet
             # before _advance_stage() rebinds self.proc to the next one.
             self._sweep_workers()
-            if (self.proc.returncode == 0
+            rc = self.proc.returncode
+            # DID THE WORK FINISH? That is a different question from "did the
+            # process exit cleanly", and on 2026-10-04 the difference threw
+            # away a 2.7 M-step chain. A stage trained its full budget, saved
+            # model.zip and vecnormalize.pkl, wrote its terminal record — and
+            # then died in teardown:
+            #
+            #   libc++abi: terminating due to uncaught exception of type
+            #   std::__1::system_error: recursive_mutex lock failed
+            #
+            # …a MuJoCo/threading shutdown race on macOS, with every artefact
+            # already on disk. The chain stopped at stage 2 of 8 because of a
+            # crash that happened after the work was done. The terminal record
+            # exists precisely so "has this run finished?" has an answer in the
+            # ARTEFACT rather than in a process's exit code, so ask it.
+            done_record = self._wrote_terminal_record()
+            if rc != 0:
+                self._log_stage_failure(rc, salvaged=done_record)
+            # The stage that just finished, captured BEFORE _advance_stage()
+            # rebinds self.dir to the next one.
+            if rc == 0 or done_record:
+                start_export(self.dir)
+            if ((rc == 0 or done_record)
                     and self.stage_idx < len(self.stages) - 1):
                 # Stage complete → chain the next one. Advancing on process
                 # EXIT (not the progress "done" line) guarantees the finished
@@ -1808,7 +2386,8 @@ class TrainingJob:
                 # the next stage warm-starts from them.
                 self._advance_stage()
             else:
-                self.status = "done" if self.proc.returncode == 0 else "failed"
+                ok = rc == 0 or done_record
+                self.status = "done" if ok else "failed"
                 self.finished_clean = self.status == "done"
                 self._freeze_elapsed()
             changed = True
@@ -1899,6 +2478,11 @@ class TrainingJob:
             # see any runs in flight" repeatedly, and was right: nothing on
             # the stage said which robot was training.
             "trainee": self.trainee_id,
+            # Still writing policy.onnx for a finished stage. The palette
+            # polls while this is true: the run does not EXIST for the
+            # palette until the export lands (discover_policies lists a run
+            # only if policy.onnx is there), and "done" arrives first.
+            "exporting": exporting_runs(),
             "behavior": self._behavior_card(),
             "weights": self.effective_weights(),
             # Per-stage fields stay exactly as streamed (existing consumers);
@@ -2146,6 +2730,12 @@ def save_lab_state(ducks: list[Duck]) -> None:
          "robot": getattr(d, "robot", "microduck"),
          # getattr: tests build rosters from bare namespaces without the flag
          "showcase": bool(getattr(d, "showcase", False)),
+         # THE SHOVE, or a restart leaves a duck whose LABEL still says
+         # "— shoved 1.6bw" while nothing pushes it. A demo that claims a
+         # force it is not applying is the same fault as previewing an
+         # assisted get-up as unaided; both mislead in the viewer's favour.
+         **({"shove": float(getattr(d, "shove", 0.0))}
+            if getattr(d, "shove", 0.0) else {}),
          **({"createdAt": d.created_at}
             if getattr(d, "created_at", None) is not None else {})}
         for d in ducks
@@ -2210,15 +2800,18 @@ def restore_ducks(path: Path) -> list[Duck]:
             print(f"[lab] skipping {entry.get('id')} from {path.name}: "
                   f"{type(e).__name__}: {e}")
             continue
-        run_path = entry.get("onnxPath")
-        if not run_path and str(entry.get("policy", "")).startswith("run:"):
-            e2 = next((p for p in discover_policies()
-                       if p["id"] == entry["policy"]), None)
-            run_path = e2["path"] if e2 else None
+        run_path = _restore_run_path(entry)
         # A showcase duck comes back showcasing — falling back to the plain
         # preview env when the behavior can't be resolved any more (the flag
         # then quietly drops rather than mislabeling the env).
         skw = showcase_env_kwargs(run_path) if entry.get("showcase") else None
+        shove = float(entry.get("shove") or 0.0)
+        if shove > 0.0 and skw is not None:
+            # the same three the spawn applies — see `do_spawn_duck`
+            skw["push_bw"] = shove
+            skw["fell_cut"] = False
+            skw["push_every"] = PUSH_EVERY_DEMO_S
+            skw["max_episode_s"] = max(30.0, float(skw.get("max_episode_s") or 0.0))
         try:
             duck = Duck(str(entry["id"]), str(entry["label"]), infer, seed=i,
                         policy_id=entry.get("policy"),
@@ -2234,10 +2827,18 @@ def restore_ducks(path: Path) -> list[Duck]:
                   f"{type(e).__name__}: {e}")
             continue
         duck.showcase = skw is not None
+        duck.shove = shove
         if entry.get("createdAt") is not None:
             duck.created_at = float(entry["createdAt"])
         ho = handoff_for(run_path) if skw is not None else None
         duck.handoff_infer, duck.handoff_label = ho if ho else (None, None)
+        # `run_path`, NOT `path`: these resolve `behavior.json` beside the
+        # POLICY, and `path` here is lab-state.json — so a restored duck's
+        # predicate was looked up in the lab's own directory, found nothing,
+        # and came back None. The handoff then never fired after a restart,
+        # silently, while the frame still advertised the handoff policy.
+        duck.handoff_fn = handoff_fn_for(run_path) if ho else None
+        duck.handoff_recenter = handoff_recenter_for(run_path) if ho else None
         ducks.append(duck)
     return ducks
 
@@ -2631,8 +3232,25 @@ def remove_duck_error(st: LabState, duck_id: str) -> str | None:
     return None
 
 
-def env_kwargs_for_behavior(b) -> dict:
+def env_kwargs_for_behavior(b, stage_env: dict[str, str] | None = None) -> dict:
     """Lab-preview physics matching a behavior's training env.
+
+    ANOTHER BODY'S TASK IS AN ENV, NOT A SPAWN RECIPE, and that branch is
+    first because its absence hid every non-duck run the moment it finished.
+    The duck shape below returns `behavior_id` + `standing_spawns`, and
+    `Duck._make_env` POPS both before it reaches a non-duck body: what was
+    left was `{}`, so the rebuild fell through to `slot_env` and the body's
+    `default_task`. An Asimov get-up that had just trained to rise off the
+    floor was re-seated in the WALK env — standing, with nothing to get up
+    from — and Jonathan had to drag the policy back off the palette by hand
+    to see the thing he had just trained.
+
+    It was never one call site: measured over the registry, this returned
+    NO TASK for **28 behaviours across all four non-duck bodies** (Asimov,
+    G1, MOSS, MARS). The first fix branched at the caller, which left the
+    function wrong for every future caller — so the branch lives here, where
+    `test_a_preview_env_NAMES_THE_TASK_for_every_body` can hold it for the
+    next body somebody adds.
 
     `behavior_id` is the load-bearing key: without it `Duck._make_env` builds a
     plain MicroduckWalkEnv, and a trick policy then runs under the WALKING
@@ -2645,6 +3263,11 @@ def env_kwargs_for_behavior(b) -> dict:
     dropped mid-roll (that is what the ✨ showcase assign is for) and not lying
     on the floor (`stand`'s 50% ground-spawn family).
     """
+    if getattr(b, "robot", "microduck") != "microduck":
+        # The stage the caller knows about, else the behavior's last — the
+        # same choice `showcase_env_kwargs` makes for "the whole trick".
+        last = b.curriculum[-1].env if getattr(b, "curriculum", None) else None
+        return trainee_env_kwargs(b, stage_env or last)
     kw: dict = {"behavior_id": b.id, "standing_spawns": True}
     if getattr(b, "scene", "walk") == "all":
         kw["scene_xml"] = str(C.SCENE_ALL_XML)
@@ -2859,9 +3482,66 @@ def poll_job(st: "LabState", job: "TrainingJob",
             # Preview goes back to ordinary standing spawns once the run
             # ends — mid-trick drops mirror TRAINING; a finished trick shows
             # off from its feet.
-            t.rebuild_env(env_kwargs_for_behavior(job.behavior))
+            #
+            # ANOTHER BODY'S TASK IS NOT A TRICK, and that rule hid every
+            # Asimov run the moment it finished. `env_kwargs_for_behavior`
+            # returns the DUCK's shape — `behavior_id` + `standing_spawns` —
+            # and `Duck._make_env` pops both before reaching a non-duck body,
+            # so the rebuild fell through to `slot_env` and the body's
+            # `default_task`: a get-up run that had just spent 26 M steps
+            # learning to rise off the floor was re-seated in the WALK env,
+            # standing up, with nothing to get up from. Jonathan watched a
+            # finished get-up stand there and had to drag the policy back in
+            # off the palette by hand to see the thing he had just trained.
+            # Keep the env it TRAINED under — for a task, that is the whole
+            # of "show me what it learned".
+            t.rebuild_env(env_kwargs_for_behavior(job.behavior,
+                                                  job.stage_env()))
+            seat_finished_policy(st, job, t)
             save_lab_state(st.ducks)
         st.events.append(f"training {job.status} — saved as {job.run_name}")
+
+
+def seat_finished_policy(st: "LabState", job: "TrainingJob", duck) -> bool:
+    """Put the run's FINAL exported policy on its own preview body.
+
+    Until now a finished run left whatever `live.onnx` snapshot happened to
+    land last — which is a mid-training checkpoint, not the artefact the run
+    is judged on and not what `policy.onnx` exports (the snapshot is taken on
+    a schedule; the export is taken at the end). A stopped or failed run has
+    no final export at all, and the body simply keeps what it had.
+
+    Refusals are the same ones `apply_snapshot` applies, for the same reason:
+    a width mismatch raises inside the 50 Hz loop and takes the WHOLE roster
+    down, not one chip. Returns whether the policy was seated.
+    """
+    final = job.dir / "policy.onnx"
+    if not final.is_file():
+        return False
+    try:
+        infer = _onnx_infer(final)
+    except Exception:  # noqa: BLE001  (a half-written export must not kill the loop)
+        return False
+    why = lab_robots.policy_refusal(
+        str(final), duck.robot, getattr(infer, "obs_dim", None),
+        int(duck.env.observation_space.shape[0]))
+    if why:
+        st.events.append(f"{duck.id} kept its own brain — {why}")
+        return False
+    duck.swap_policy(duck.label, infer, policy_id=f"run:{job.run_name}",
+                     onnx_path=str(final))
+    # AND ITS HANDOFF. The deliverable for the Asimov get-up is the rise PLUS
+    # the shipped walker taking over (`Behavior.handoff_policy`), and this
+    # function seated only the rise — so the body Jonathan is pointed at when
+    # a run finishes stood up and then did nothing, which is the exact
+    # complaint the handoff was built to answer. `handoff_for` returns None
+    # for any recipe that cannot ask for one, so this is a no-op elsewhere.
+    ho = handoff_for(str(final))
+    duck.handoff_infer, duck.handoff_label = ho if ho else (None, None)
+    duck.handoff_fn = handoff_fn_for(str(final)) if ho else None
+    duck.handoff_recenter = handoff_recenter_for(str(final)) if ho else None
+    duck.handed = False
+    return True
 
 
 def snapshot_targets(st: "LabState", job: "TrainingJob") -> list:
@@ -2943,21 +3623,109 @@ def env_kwargs_for_task_run(run: Path) -> dict:
         ep = 0.0
     if ep > 0.0:
         kw["max_episode_s"] = ep
+    # THE REST OF THE RUN'S RECORDED KNOBS, so the lab previews a policy under
+    # the conditions it was TRAINED under.
+    #
+    # Only `clip_name` and `max_episode_s` used to come through, and for the
+    # Asimov get-up that meant the lab built the env at its DEFAULT start — the
+    # `pike`, where every one of these policies scores 0/12 — while the policy
+    # had been trained to stand from `fold`, where it scores 12/12 and holds
+    # 7.76 s. Jonathan loaded the stages one after another and said he could
+    # not see any of them working. They worked; the lab was starting them in a
+    # pose they were never trained for. It is `train-loop`'s first rule ("a
+    # policy is evaluated under the flags it trained with") applied to the one
+    # place a human actually LOOKS, and it had never been applied there.
+    #
+    # Forwarded by name rather than wholesale: `domain_rand` and `obs_noise`
+    # belong to training, and a preview should show the clean motion.
+    # One definition, shared with `render-rollout`: `run_record.REPLAY_KWARGS`.
+    # Two consumers each had this bug and each would have been fixed alone.
+    from .run_record import REPLAY_KWARGS
+    for key in REPLAY_KWARGS:
+        if key in ekw and key not in kw:
+            kw[key] = ekw[key]
     return kw
 
 
 def env_kwargs_for_policy_path(path: str | None) -> dict:
     """Same, derived from a run artifact's sibling behavior.json (assigned or
     restored teach-run policies) — or, for another body's walk/task run,
-    from its run.json (`env_kwargs_for_task_run`)."""
+    from its run.json (`env_kwargs_for_task_run`).
+
+    A FETCHED policy has neither file, and this returned `{}` for one, which
+    `slot_env` honours by falling back to the body's `default_task`. That is
+    how both of Asimov's vendor policies landed in the WALK env: Menlo's
+    shipped walker (correct by luck) and openhorizon's GET-UP (standing, with
+    nothing to get up from, which read as "the policy does nothing"). It is
+    the `AGENTS.md` shape — a run-shaped question asked of a policy that has
+    no run — and the branch belongs HERE rather than at a call site, because
+    there are three (`do_assign`, `do_spawn_duck`, `restore_ducks`) and the
+    next one would need it too.
+    """
     if not path:
         return {}
+    declared = _entry_env_kwargs(path)
+    if declared is not None:
+        return declared
     run = Path(path).parent
     try:
         behavior_id = json.loads((run / "behavior.json").read_text()).get("behavior")
-        return env_kwargs_for_behavior(behaviors_mod.BEHAVIORS[behavior_id])
+        # OVERLAID WITH WHAT THE RUN RECORDED. Only `showcase_env_kwargs` did
+        # this, so a PLAIN spawn or assign of a teach run was previewed purely
+        # from the recipe — and a recipe knows nothing about the knobs an
+        # individual run was launched with. That is how a 390-input narrow
+        # stand got a 78-float env and was refused from the stage outright.
+        return _as_the_run_trained(
+            env_kwargs_for_behavior(behaviors_mod.BEHAVIORS[behavior_id]),
+            path)
     except (OSError, KeyError, json.JSONDecodeError):
         return env_kwargs_for_task_run(run)
+
+
+def _restore_run_path(entry: dict) -> str | None:
+    """The policy FILE a saved roster entry refers to, or None.
+
+    Extracted from `restore_ducks` so it can be tested: inline, the only way
+    to exercise it was to restart a lab.
+
+    It resolves ANY policy id against the palette, not just a `run:` one. The
+    `run:` restriction meant a FETCHED policy (`asimov1-openhorizon-getup`,
+    `asimov1-shipped`) — which has no `onnxPath` and no run directory —
+    resolved to None, so `env_kwargs_for_policy_path(None)` returned `{}` and
+    `slot_env` fell back to the body's `default_task` with the default
+    actuator. openhorizon's get-up was spawned as `dc` and came back as
+    `xml`. A FRESH spawn was always correct, which is exactly what made it
+    invisible: the bug needed a restart to appear.
+    """
+    run_path = entry.get("onnxPath")
+    if run_path:
+        return str(run_path)
+    pid = entry.get("policy")
+    if not pid:
+        return None
+    try:
+        hit = next((p for p in discover_policies() if p["id"] == pid), None)
+    except Exception:
+        return None
+    return str(hit["path"]) if hit else None
+
+
+def _entry_env_kwargs(path: str) -> dict | None:
+    """A palette entry's own `envKwargs` for this file, or None.
+
+    A fetched policy is the only thing that can carry these — it has no run
+    to read them off — so the lookup is by PATH and an entry that declares
+    none is indistinguishable from no entry at all.
+    """
+    try:
+        entries = discover_policies()
+    except Exception:          # a palette that cannot be listed is not fatal
+        return None
+    want = str(path)
+    for e in entries:
+        if str(e.get("path") or "") == want and e.get("envKwargs"):
+            return dict(e["envKwargs"])
+    return None
 
 
 def showcase_env_kwargs(path: str | None) -> dict | None:
@@ -2985,7 +3753,7 @@ def showcase_env_kwargs(path: str | None) -> dict | None:
         kw = trainee_env_kwargs(b, {**b.curriculum[-1].env,
                                     "MICRODUCK_SPAWN_FAMILY_PROBS": "0.0,0.0"})
         kw["spotter"] = True
-        return kw
+        return _as_the_run_trained(kw, path)
     # UNSPOTTED showcase (the headstand ladder is the first such trick: a
     # curriculum with no spotter_fn). This tail used to sit — unreachable —
     # after handoff_for's return, so every unspotted chain fell through to
@@ -3009,7 +3777,118 @@ def showcase_env_kwargs(path: str | None) -> dict | None:
                     f"{p * 0.85 / total:.3f}" for p in probs)
         except ValueError:
             pass
-    return trainee_env_kwargs(b, env)
+    return _as_the_run_trained(trainee_env_kwargs(b, env), path)
+
+
+#: Knobs a PREVIEW must never inherit from the run, however the run trained.
+#:
+#: * `handoff_pay` is a TRAINING TERMINAL: non-zero, `AsimovGetupEnv.step`
+#:   ends the episode the instant `handoff_ready()`. Inherited into a
+#:   showcase it reset every episode the moment the robot stood — the exact
+#:   "it stands up and then just stops" symptom this work started from.
+#:   `getup_acceptance.build()` pops it for the same reason: a training
+#:   terminal is not a cut the deployment has.
+#: * `getup_assist` and `getup_blend` are DEMO ASSISTS — a pelvis force
+#:   carrying up to half the robot's weight, and a start blended most of the
+#:   way to standing. Eleven existing runs record assist 0.3-0.5. Inheriting
+#:   them would show an assisted get-up with no "spotter-driven" label, and
+#:   `showcase_label` exists precisely because "a viewer must never mistake
+#:   that for the policy doing it unaided".
+#: Seconds STANDING between shoves in a watched demo — long enough to see it
+#: come up, settle and take a step before the next one lands.
+PUSH_EVERY_DEMO_S = 5.0
+
+NOT_FROM_THE_RUN = frozenset({"handoff_pay", "getup_assist", "getup_blend"})
+
+
+#: Knobs a preview must take from the RUN even when the recipe never set
+#: them — because they do not tune the preview, they define the CONTRACT the
+#: policy speaks and the robot it learned on.
+#:
+#: `_as_the_run_trained` is intersection-only by design (see its docstring),
+#: and that rule is right for every reward weight and spawn knob: it cannot
+#: introduce a kwarg the body does not speak. It is WRONG for these two, and
+#: the failure is not subtle. `history` sets the observation WIDTH: a run
+#: trained at 5 frames speaks 390 floats, the recipe sets no history, so the
+#: preview built a 78-float env and `policy_refusal` turned the spawn away
+#: with "speaks asimov1-390-hist5-control, a asimov1 speaks asimov1-78-v0" —
+#: the narrow stand could not be put on the stage at all. `actuator_force`
+#: decides which ROBOT it is previewed on, and a dc-trained policy shown
+#: under the flat clamp is the stage disagreeing with its own label, which
+#: this file has now had three times.
+FROM_THE_RUN_ALWAYS = frozenset({"history", "actuator_force"})
+
+
+def _as_the_run_trained(kw: dict, path: str | None) -> dict:
+    """Overlay what the RUN recorded onto the recipe's final-stage knobs.
+
+    A showcase previews a RUN, and the knobs came from the recipe — so a run
+    that trained on something else is shown doing something else. Measured
+    2026-10-13: `teach-asimov_getup_turn-967072` trained on
+    `getup_label="supine,prone"` and the recipe's last stage says `"supine"`,
+    so the stage would have started it on its BACK every episode and the roll
+    it was trained for — the entire new capability, prone 12/48 -> 47/48 —
+    would have been invisible. Same shape as the three duck-shaped lookups
+    this file has already had: the preview answered from the wrong source.
+
+    INTERSECTION ONLY: a key is overlaid only when the stage already
+    sets it, so this can never introduce a kwarg the body does not speak
+    (`Duck._make_env` would discard it silently) nor a knob the recipe has
+    deliberately left out. And `NOT_FROM_THE_RUN` is subtracted on top — see
+    there for the two ways this went wrong before the review caught them.
+    """
+    if not path:
+        return kw
+    try:
+        from .run_record import replay_kwargs
+        rec = dict(replay_kwargs(Path(path).parent))
+    except Exception:                        # noqa: BLE001  (never break a preview)
+        return kw
+    for k, v in rec.items():
+        if k in NOT_FROM_THE_RUN:
+            continue
+        if k in FROM_THE_RUN_ALWAYS or (k in kw and kw[k] != v):
+            kw[k] = v
+    return kw
+
+
+def _push_payload(duck) -> dict | None:
+    """The external shove on this body's trunk, or None when nothing pushes.
+
+    `{at: [x, y, z], vec: [fx, fy, 0], n: newtons}` — the arrow's origin is
+    the trunk, the direction is the force, and `n` is reported so the viewer
+    can label it rather than guessing a scale from a length.
+    """
+    env = getattr(duck, "env", None)
+    tb = getattr(env, "trunk_body_id", None)
+    if env is None or tb is None:
+        return None
+    try:
+        f = env.data.xfrc_applied[tb]
+        fx, fy = float(f[0]), float(f[1])
+    except Exception:                        # noqa: BLE001  (never kill the loop)
+        return None
+    n = (fx * fx + fy * fy) ** 0.5
+    if n < 1.0:                              # below a newton is not a shove
+        return None
+    at = env.data.xpos[tb]
+    return {"at": [round(float(v), 4) for v in at],
+            "vec": [round(fx, 2), round(fy, 2), 0.0],
+            "n": round(n, 1)}
+
+
+def _asimov_obs_gravity(robot: str):
+    """The projected-gravity slice of THIS body's observation, or a miss.
+
+    Read from the body's own contract rather than hardcoded, because the
+    duck's 61-obs layout and Menlo's 78-obs layout put gravity in different
+    places — the shape of bug this file has already had four times (a
+    duck-shaped question asked of another body).
+    """
+    if robot == "asimov1":
+        from .robots import asimov_walk as _W
+        return _W.OBS_GRAVITY
+    return (0, 0)                 # no known gravity slice: `_down_due` says no
 
 
 HANDOFF_POLICY = "pollen:alpha_stand"
@@ -3043,6 +3922,35 @@ def handoff_for(path: str | None):
         return load_policy_infer(policy), policy.split(":", 1)[-1]
     except Exception:
         return None
+
+
+def handoff_recenter_for(path: str | None):
+    """The recipe's `handoff_recenter` flag, resolved off the RUN. See
+    `Duck._recenter_wz` for why reading it off `env.behavior` was wrong."""
+    if not path:
+        return None
+    try:
+        bj = Path(path).parent / "behavior.json"
+        b = behaviors_mod.BEHAVIORS[json.loads(bj.read_text()).get("behavior")]
+    except (OSError, KeyError, json.JSONDecodeError):
+        return None
+    return bool(getattr(b, "handoff_recenter", True))
+
+
+def handoff_fn_for(path: str | None):
+    """The recipe's handoff predicate for a policy, from its run.
+
+    Resolved HERE rather than off `env.behavior`, because only the duck's
+    env carries that attribute — see `Duck._handoff_due`.
+    """
+    if not path:
+        return None
+    try:
+        bj = Path(path).parent / "behavior.json"
+        b = behaviors_mod.BEHAVIORS[json.loads(bj.read_text()).get("behavior")]
+    except (OSError, KeyError, json.JSONDecodeError):
+        return None
+    return getattr(b, "handoff_fn", None)
 
 
 def showcase_label(policy_id: str, spotted: bool = False) -> str:
@@ -4116,6 +5024,15 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
 
     @app.post("/teach")
     async def teach(req: TeachReq) -> dict:
+        # A knob nothing reads, FIRST and before any state changes: the job
+        # constructor also checks, but a ValueError out of there surfaces as a
+        # bare 500 and the message — which names the knob the caller meant — is
+        # the entire point. Same refusal shape as the env-budget one below, so
+        # the panel shows it.
+        try:
+            unknown_env_keys(dict(getattr(req, "env", None) or {}))
+        except ValueError as e:
+            return {"matched": False, "message": str(e)}
         # CONCURRENCY, not a single slot. The lab used to refuse any second
         # /teach outright; what it refuses now is a job it has no envs for.
         # One 32-env job measured 463% CPU of this machine's 18 usable cores,
@@ -4425,6 +5342,11 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
                 "status": j.status,
                 "envs": j.envs,
                 "trainee": j.trainee_id,
+                # Additive, for the restart guard: the pids this job owns, so a
+                # caller reading the process table can say which trainers are
+                # the LAB's. Empty for a finished or adopted job. See
+                # TrainingJob.owned_pids.
+                "pids": j.owned_pids(),
             }
 
         live = st.training_jobs()
@@ -4660,8 +5582,13 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
                     sd = msg["spawn_duck"]
                     pid = sd.get("policy") if isinstance(sd, dict) else sd
                     sc = bool(sd.get("showcase")) if isinstance(sd, dict) else False
+                    # defaults TRUE: a spawn that says nothing about the
+                    # handoff keeps the behaviour it has always had.
+                    hd = bool(sd.get("handoff", True)) if isinstance(sd, dict) else True
+                    sh = float(sd.get("shove", 0.0) or 0.0) if isinstance(sd, dict) else 0.0
                     asyncio.create_task(do_spawn_duck(str(pid) if pid else "",
-                                                      showcase=sc))
+                                                      showcase=sc, handoff=hd,
+                                                      shove=sh))
                 if "spawn_robot" in msg:
                     sr = msg["spawn_robot"]
                     rid = sr.get("robot") if isinstance(sr, dict) else sr
@@ -4725,6 +5652,8 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
         duck.swap_policy(label, infer, policy_id=policy_id)
         ho = handoff_for(path) if skw is not None else None
         duck.handoff_infer, duck.handoff_label = ho if ho else (None, None)
+        duck.handoff_fn = handoff_fn_for(path) if ho else None
+        duck.handoff_recenter = handoff_recenter_for(path) if ho else None
         duck.handed = False
         st.events.append(f"{duck_id} now runs {label}"
                          + (f" ({run_name})" if label != run_name else ""))
@@ -4814,7 +5743,8 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
             st.job.helpers = len(helper_ducks(st.ducks))
         st.events.append(f"{duck_id} left the lab")
 
-    async def do_spawn_duck(policy_id: str, showcase: bool = False) -> None:
+    async def do_spawn_duck(policy_id: str, showcase: bool = False,
+                            handoff: bool = True, shove: float = 0.0) -> None:
         err = spawn_duck_error(st, policy_id)
         if err:
             st.events.append(f"spawn ignored: {err}")
@@ -4830,8 +5760,53 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
         # The "whole trick" chip drops on empty floor like any other chip —
         # the spawned duck showcases too (same no-op fallback as do_assign).
         skw = showcase_env_kwargs(path) if showcase else None
-        label = (showcase_label(policy_id, bool(skw.get("spotter"))) if skw is not None
-                 else policy_id.split(":", 1)[-1])
+        # THE RUN'S OWN TITLE when it has one, exactly as `do_assign` does.
+        # This used to be the bare run name, so a stage full of
+        # `teach-asimov_getup_…-<hash>` chips said nothing about which was
+        # which — and the comment directly below ("two identical-looking
+        # Asimovs is how a demo misleads") was written about a stage holding
+        # TWO. It now routinely holds three. `describe-run --title` is the
+        # repo's answer to exactly this and the spawn path was the one seat
+        # that ignored it.
+        label = (showcase_label(policy_id, bool(skw.get("spotter")))
+                 if skw is not None
+                 else ((entry or {}).get("title")
+                       or policy_id.split(":", 1)[-1]))
+        # `handoff=False` is the CONTROL body: the same env as the showcase
+        # beside it, with the hand-over switched off. Until this existed the
+        # only way to stage a no-handoff body was to drop showcase mode too,
+        # which also rebuilt the env — so the one comparison the handoff
+        # needed to justify itself changed two things at once. The label says
+        # so, because two identical-looking Asimovs is how a demo misleads.
+        if not handoff:
+            label = f"{label} — no handoff"
+        # WATCH IT RECOVER: shove the robot once it is up, and switch OFF the
+        # fall cut so the episode does not end the moment it goes down. Both
+        # are needed: without the shove there is nothing to recover from, and
+        # with the cut on, `Duck.step` resets on `terminated` so a viewer
+        # would see a fresh episode that looks exactly like a recovery.
+        if shove > 0.0 and skw is not None:
+            duck_shove = float(shove)
+            skw["push_bw"] = float(shove)
+            skw["fell_cut"] = False
+            # A SETTLE WINDOW between shoves, measured in time spent
+            # STANDING. The training cadence is 0.8-1.8 s of wall clock, and
+            # since a rise takes ~3.4 s the next shove was always overdue by
+            # the moment the robot was up — it got hit again instantly, which
+            # reads as flailing rather than recovery. The direction stays
+            # random; only the timing is made legible.
+            skw["push_every"] = PUSH_EVERY_DEMO_S
+            # A LONGER EPISODE, or the reset cycle hides the thing on show:
+            # at the training horizon of 8 s a shoved body reset about as
+            # often as it recovered (10 hand-backs against 15 resets over
+            # 110 s), and a reset looks exactly like a recovery on screen.
+            # ASSIGN, not setdefault: the recipe already sets
+            # `max_episode_s` (8 s, the training horizon), so a setdefault
+            # was a silent no-op and the demo still reset every 8 s. `max`
+            # so a recipe asking for longer is never shortened.
+            skw["max_episode_s"] = max(30.0,
+                                       float(skw.get("max_episode_s") or 0.0))
+            label = f"{label} — shoved {shove:g}bw"
         # WHICH BODY. Without this a 99-obs G1 brain landed in a 61-obs duck
         # env and the ONNX session raised inside the 50 Hz loop — which is
         # FATAL: the loop stops and the lab streams no frames at all (the
@@ -4848,8 +5823,11 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
             st.events.append(f"spawn failed: {policy_id} {why}")
             return
         duck.showcase = skw is not None
-        ho = handoff_for(path) if skw is not None else None
+        duck.shove = locals().get("duck_shove", 0.0)
+        ho = handoff_for(path) if (skw is not None and handoff) else None
         duck.handoff_infer, duck.handoff_label = ho if ho else (None, None)
+        duck.handoff_fn = handoff_fn_for(path) if ho else None
+        duck.handoff_recenter = handoff_recenter_for(path) if ho else None
         st.ducks.append(duck)
         save_lab_state(st.ducks)
         st.events.append(f"spawned d{n} running {label}")
@@ -5104,7 +6082,26 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
                                      if d.steers() and not is_trick_duck(d)
                                      else None),
                         "spawn": getattr(d.env, "last_spawn", None),
+                        # WHICH ACTUATOR this body's physics is running, so
+                        # the stage says what it is showing instead of the
+                        # roster row's label being the only claim. It is on
+                        # the frame because the one time these disagreed —
+                        # `Duck._make_env` forcing "xml" over a palette
+                        # entry's "dc" — nothing on the stage could have
+                        # revealed it. "dc" is the published speed-torque
+                        # envelope; "xml" is the flat per-group clamp.
+                        "actuator": getattr(d.env, "actuator_model", None),
                         "assist": bool(getattr(d.env, "spotter_active", False)),
+                        # THE SHOVE, so a viewer can SEE why the robot went
+                        # down instead of inferring it. Read off
+                        # `xfrc_applied` rather than kept in a parallel copy:
+                        # that array IS what MuJoCo integrates, so the arrow
+                        # cannot drift from the force, and a push applied by
+                        # any other route (a world scenario, a future knob)
+                        # draws itself for free. Horizontal row only —
+                        # `[trunk, 2]` is the demo assist's channel and
+                        # belongs to the "spotting" chip, not to this.
+                        "push": _push_payload(d),
                         "handed": bool(getattr(d, "handed", False)),
                         "handoff": getattr(d, "handoff_label", None),
                         # Task objects that live in the env, not the

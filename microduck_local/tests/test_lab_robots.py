@@ -167,11 +167,22 @@ def test_scene_endpoint_serves_the_g1_meshes(tmp_path, monkeypatch):
 
 
 @needs_g1
-def test_a_duck_trick_is_never_matched_for_a_g1_trainee(tmp_path, monkeypatch):
+def test_a_duck_trick_is_never_matched_for_a_g1_trainee(fake_popen, tmp_path, monkeypatch):  # noqa: F811 — pytest fixture, not a redefinition
     """Duck recipes name duck joints, duck feet and the 61-obs command slots.
     Asking a G1 trainee for one must not reach `train_behavior` — the registry
-    is filtered by robot, so the request lands on a G1 task or on nothing."""
-    monkeypatch.setattr(V, "RUNS_DIR", tmp_path / "runs")
+    is filtered by robot, so the request lands on a G1 task or on nothing.
+
+    **`fake_popen` is load-bearing, not tidiness.** This asked for a trick and
+    then asserted on what it MATCHED — but a match makes the lab launch the
+    trainer, and without the fake that launch was real: MEASURED 2026-10-03,
+    one run of this test alone spawned `-m microduck_local.train --robot g1
+    --task stand --envs 32 --steps 700000`, 33 processes, ~1.5 GB, 266 s to
+    completion. `monkeypatch.setattr(V, "RUNS_DIR", ...)` does NOT contain it
+    — the child computes its own path — so it wrote `model.zip` and
+    `live.onnx` into the REAL `runs/`, and left five `teach-g1_stand-*`
+    directories there in one day. The test passed in 1.66 s the whole time,
+    which is why nobody noticed; what noticed was `restart.sh`'s trainer
+    guard refusing to restart the lab at random moments."""
     monkeypatch.setenv("LAB_STATE_PATH", str(tmp_path / "lab-state.json"))
     trainee = V.Duck("trainee", "g1", lambda o: np.zeros(29, np.float32),
                      seed=0, robot="g1")
@@ -185,8 +196,11 @@ def test_a_duck_trick_is_never_matched_for_a_g1_trainee(tmp_path, monkeypatch):
         assert "one_leg" not in json.dumps(out)
 
 
-def test_teach_still_works_for_a_duck_roster(tmp_path, monkeypatch):
-    monkeypatch.setattr(V, "RUNS_DIR", tmp_path / "runs")
+def test_teach_still_works_for_a_duck_roster(fake_popen, tmp_path, monkeypatch):  # noqa: F811 — pytest fixture, not a redefinition
+    """`fake_popen` because this POSTs `/teach`: it is safe only while the
+    text matches nothing, and a recipe added later that happens to match it
+    would start a real trainer. The fixture makes that impossible rather than
+    unlikely."""
     monkeypatch.setenv("LAB_STATE_PATH", str(tmp_path / "lab-state.json"))
     app = V.make_app([])
     teach = _endpoint(app, "/teach", "POST")
@@ -993,6 +1007,72 @@ def test_scene_endpoint_serves_a_discovered_bodys_meshes(tmp_path, monkeypatch):
     assert sc["geoms"] and sc["bodies"]
 
 
+# ------------------------------------- how big a body is, for the camera
+
+def test_every_body_the_stage_can_draw_says_how_BIG_it_is():
+    """The 🎥 record camera frames off `measured_size`, so every body answers it.
+
+    Swept over the registry rather than checked on the body that failed: the
+    shot was tuned on a 25 cm duck and filmed a 1.296 m Asimov from inside its
+    chest, and one `if robot == ...` would have fixed exactly that robot.
+    A body whose assets are absent is skipped, and the sweep asserts it saw
+    more than one so a green result cannot mean it measured nothing.
+    """
+    from microduck_local.lab import robots as LR
+    from microduck_local.robots import registry as reg
+
+    seen = {}
+    for rid in reg.ids():
+        body = reg.registry().get(rid)
+        if body is None or not LR._ready(body):
+            continue
+        size = LR.measured_size(rid)
+        assert size, f"{rid} cannot say how big it is"
+        assert math.isfinite(size["height"]) and size["height"] > 0.05, size
+        assert math.isfinite(size["width"]) and size["width"] > 0.05, size
+        seen[rid] = size
+    assert len(seen) >= 2, f"nothing to sweep: {seen}"
+    # The duck is the subject every shot's metres were tuned on, and it is
+    # 0.277 m tall / 0.185 m across — the same width `lab_spacing_m`'s 0.65 m
+    # is 3.52x of, measured the same way.
+    duck = seen["microduck"]
+    assert duck["height"] == pytest.approx(0.277, abs=0.003)
+    assert duck["width"] == pytest.approx(0.1845, abs=0.002)
+
+
+def test_the_scene_a_body_serves_carries_its_size():
+    """...and the duck's `bbox` is NOT it, nor changed by its arrival.
+
+    Two numbers that both sound like "how big is the duck": `bbox` is the
+    VISUAL mesh box a /sim figurine is seated and scaled by (a published
+    number — moving it moves every figurine), `size` is the whole robot at
+    its stand keyframe, which is what a camera frames. They disagree by 5 % on
+    the duck's height and 28 % on its width, so the camera must never read the
+    one that happens to be there.
+    """
+    from microduck_local.lab.robots import extract_scene
+
+    sc = extract_scene()
+    assert sc["bbox"] == {"origin": [0.02026, 0.0, 0.01347], "height": 0.26398}
+    assert sc["size"]["height"] > sc["bbox"]["height"]
+
+
+@needs_g1
+def test_a_metre_tall_body_is_framed_as_a_metre_tall_body(tmp_path, monkeypatch):
+    """The G1's scene says 1.3 m, so the viewer's shot is 4.7x the duck's.
+
+    The end of the wire the browser reads: `GET /scene?robot=` is where the
+    size has to arrive, because the G1's own dump (`robots/g1.visual_scene`)
+    answers `{bodies, meshes, geoms}` and nothing about how big the robot is.
+    """
+    monkeypatch.setattr(V, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setenv("LAB_STATE_PATH", str(tmp_path / "lab-state.json"))
+    get_scene = _endpoint(V.make_app([]), "/scene", "GET")
+    size = get_scene(robot="g1")["size"]
+    assert size["height"] == pytest.approx(1.307, abs=0.01)
+    assert size["width"] == pytest.approx(0.534, abs=0.01)
+
+
 def test_an_unfetched_bodys_scene_404s_with_the_command_that_fixes_it(
         tmp_path, monkeypatch):
     """"unknown robot" and "you have not downloaded it yet" are different
@@ -1141,3 +1221,180 @@ def test_a_body_that_ships_nothing_can_still_be_put_on_the_stage(tmp_path,
     # brain recorded, which silently emptied the stage.
     restored = V.restore_ducks(Path(V.lab_state_path()))
     assert [d.robot for d in restored] == ["mars"]
+
+
+def test_a_finished_run_is_EXPORTED_so_the_palette_can_see_it(tmp_path, monkeypatch):
+    """A run with no policy.onnx does not exist as far as the user is concerned.
+
+    `discover_policies` lists a run only `if (run / "policy.onnx").exists()`,
+    and nothing on the teach path ever wrote one. A job trained its full
+    budget, wrote model.zip, vecnormalize.pkl and its terminal record, set
+    `status = "done"` — and never appeared in the palette, so the only way to
+    reach it was to guess a directory name and run `export-walk` by hand. On
+    2026-10-06 that hid **338 of 1085** trained runs on this machine, the
+    from-scratch Asimov get-up chain among them, and read as the lab losing
+    the run.
+    """
+    monkeypatch.setattr(V, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(V, "POLICIES_DIR", tmp_path / "policies")
+    run = _run(tmp_path, "teach-asimov_getup_floor-abc123-s2", "asimov1")
+    (run / "policy.onnx").unlink()                  # as a finished run arrives
+    (run / "model.zip").write_bytes(b"checkpoint")
+
+    assert "run:teach-asimov_getup_floor-abc123-s2" not in {
+        p["id"] for p in V.discover_policies()
+    }, "a run with no export must be invisible — that is the premise"
+
+    # The lab exports it rather than leaving that to the user. Stub the real
+    # tracer: this pins WHETHER the export is triggered and for WHICH
+    # directory, which is the bug. export_onnx has its own tests.
+    called: list = []
+
+    def fake_export(run_dir, out_path, *a, **k):
+        called.append((Path(run_dir).name, Path(out_path).name))
+        Path(out_path).write_bytes(b"onnx")
+        return Path(out_path)
+
+    import microduck_local.export_onnx as EO
+    monkeypatch.setattr(EO, "export", fake_export)
+
+    V.start_export(run)
+    for _ in range(200):                            # it runs on its own thread
+        if called:
+            break
+        time.sleep(0.01)
+    assert called == [("teach-asimov_getup_floor-abc123-s2", "policy.onnx")]
+    assert "run:teach-asimov_getup_floor-abc123-s2" in {
+        p["id"] for p in V.discover_policies()
+    }, "once exported, the run must be in the palette"
+
+
+def test_the_lab_exports_EVERY_stage_of_a_chain_not_just_the_last(tmp_path):
+    """A curriculum's stages are each a policy worth comparing.
+
+    `--pick` names the stage worth using, and on the G1 kick chain that was
+    stage 3 of 4 (8/8 seeds against the last stage's 3/8). The completion
+    handler advances the chain for every stage but the last, so an export
+    placed in the terminal branch alone would leave `-s1`…`-s(n-1)`
+    unlistable — which is exactly the state the Asimov get-up chains were
+    found in.
+    """
+    import ast
+    import inspect
+
+    src = inspect.getsource(V.TrainingJob)
+    tree = ast.parse("class _C:\n" + "\n".join(
+        "    " + ln for ln in src.splitlines()[1:]))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", "") == "start_export"]
+    assert calls, "the job must export a finished stage"
+    # It must NOT sit inside the `else` that only the terminal stage reaches.
+    advance = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Call)
+               and getattr(n.func, "attr", "") == "_advance_stage"]
+    assert advance, "the chain must still advance"
+    export_lines = {n.lineno for n in calls}
+    advance_lines = {n.lineno for n in advance}
+    assert min(export_lines) < min(advance_lines), (
+        "start_export must run BEFORE _advance_stage rebinds self.dir, or it "
+        "exports the next stage's empty directory"
+    )
+
+
+def test_the_lab_SAYS_an_export_is_in_flight_so_the_palette_can_wait(tmp_path, monkeypatch):
+    """"done" arrives before `policy.onnx` does.
+
+    The palette refetches on the training → done transition — correct, and
+    useless on its own: the export runs on a background thread, so the
+    refetch lands while the file is still being written and shows the palette
+    exactly as it was. The run the user just watched train for eight million
+    steps is still missing. So the in-flight set is streamed on the training
+    payload and the panel polls out of it, the way it already polls a robot
+    download.
+    """
+    monkeypatch.setattr(V, "RUNS_DIR", tmp_path / "runs")
+    run = _run(tmp_path, "teach-slow-export", "asimov1")
+    (run / "policy.onnx").unlink()
+    (run / "model.zip").write_bytes(b"checkpoint")
+
+    assert V.exporting_runs() == [], "nothing in flight to begin with"
+
+    import threading
+    release = threading.Event()
+    seen: list[list[str]] = []
+
+    def slow_export(run_dir, out_path, *a, **k):
+        seen.append(V.exporting_runs())     # read from INSIDE the export
+        release.wait(5)
+        Path(out_path).write_bytes(b"onnx")
+        return Path(out_path)
+
+    import microduck_local.export_onnx as EO
+    monkeypatch.setattr(EO, "export", slow_export)
+
+    V.start_export(run)
+    for _ in range(200):
+        if seen:
+            break
+        time.sleep(0.01)
+    assert seen == [["teach-slow-export"]], (
+        "while the export runs the lab must name it, or the palette has no "
+        "way to know it should wait"
+    )
+    release.set()
+    for _ in range(200):                    # ...and it must clear afterwards
+        if not V.exporting_runs():
+            break
+        time.sleep(0.01)
+    assert V.exporting_runs() == []
+
+
+def test_the_palette_waits_for_the_export_not_just_for_done():
+    """The one consumer of that field, checked at the source.
+
+    Streaming `exporting` is pointless if the panel only watches `status`,
+    and that pairing is the whole fix — see the test above.
+    """
+    src = (Path(__file__).resolve().parents[2] / "duck-viewer" / "components"
+           / "PolicyPanel.tsx").read_text()
+    # Anchor on the CODE, not on a comment that happens to say the word —
+    # the first spelling of "exporting" in this file is prose.
+    assert "exporting?.length" in src, (
+        "PolicyPanel must read the lab's in-flight export set"
+    )
+    at = src.index("exporting?.length")
+    near = src[at - 300:at + 300]
+    assert "refresh()" in near, (
+        "reading `exporting` without refetching when it clears leaves the "
+        "palette stale exactly as before"
+    )
+
+
+def test_BOTH_trainers_export_so_no_body_is_invisible_in_the_lab():
+    """The bug was an ASYMMETRY between two trainers, not a missing feature.
+
+    `train_behavior.py` (the duck tricks) has always ended with
+    `export(out, out / "policy.onnx")`. `train.py` — the path every G1,
+    MOSS, MARS and Asimov task takes — ended with
+    `print("export with: uv run export-walk …")` and no export. Since the
+    palette lists a run BY that file, one trainer's runs showed up and the
+    other's did not. Measured on 2026-10-06, runs with a checkpoint and no
+    export: **g1 52 of 91, moss 73 of 164**, plus every stage but the last
+    of the Asimov get-up chains — against **0** for the duck tricks.
+
+    A test on one trainer would not have caught it. This one compares them.
+    """
+    root = Path(__file__).resolve().parents[1] / "src" / "microduck_local"
+    for mod in ("train.py", "train_behavior.py"):
+        src = (root / mod).read_text()
+        assert 'policy.onnx"' in src and "export(" in src, (
+            f"{mod} must export policy.onnx when a run finishes — a run "
+            f"without it is invisible in the lab's palette"
+        )
+    # And the instruction that replaced the export must not be the ONLY thing
+    # train.py does about it.
+    tp = (root / "train.py").read_text()
+    assert 'export(out, out / "policy.onnx")' in tp, (
+        "train.py must actually call export, not just tell the user to"
+    )

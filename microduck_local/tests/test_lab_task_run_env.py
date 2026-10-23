@@ -225,3 +225,44 @@ def test_the_TRAINEE_PREVIEW_survives_the_same_refusal(monkeypatch):
     assert seen["knob"] == "2", "the stage's knob never reached the body"
     assert os.environ.get("MICRODUCK_STUB_RUNG") == before, (
         "the staged variable was not put back")
+
+
+def test_a_misspelled_env_knob_is_refused_not_silently_ignored():
+    """A knob nothing reads must not launch a run that CLAIMS to use it.
+
+    Three Asimov get-up runs were launched with a `track_tol` knob spelled
+    `..._ASIMOV_GETUP_TOL` (the real name has `TRACK_` in it). All three trained
+    at the recipe's default 0.25 while being described, in writing, as 0.90
+    runs. A misspelled knob is not a weaker version of the experiment, it is a
+    different experiment reported under the wrong name — and `run.json` was the
+    only place it showed.
+    """
+    from microduck_local.viz_server import known_env_keys, unknown_env_keys
+
+    known = known_env_keys()
+    # Real knobs from three different families must all pass: a guard built from
+    # the declared `*_ENV` constants alone found 14 names and would have refused
+    # every inline-read MOSS knob, which is worse than having no guard.
+    assert len([k for k in known if "MOSS" in k]) > 20, (
+        "the MOSS knobs are read inline, not as *_ENV constants — if they are "
+        "missing, this guard rejects working requests")
+    unknown_env_keys({"MICRODUCK_ASIMOV_GETUP_TRACK_TOL": "0.9",
+                      "MICRODUCK_MOSS_PICK_RUNG": "2",
+                      "MICRODUCK_CLIP": "my-motion"})
+
+    # It must name the knob that was MEANT. A plain difflib ratio ranked
+    # `..._GETUP_LAG` first for the real typo, because the right answer is
+    # LONGER — the whole typo here was a dropped word (TRACK), so shared prefix
+    # and suffix rank ahead of similarity.
+    for typo in ("MICRODUCK_ASIMOV_GETUP_TOL",          # the one that happened
+                 "MICRODUCK_ASIMOV_GETUP_TRACK_TOLL"):
+        with pytest.raises(ValueError, match="not read by anything"):
+            unknown_env_keys({typo: "0.9"})
+        with pytest.raises(ValueError,
+                           match=r"did you mean MICRODUCK_ASIMOV_GETUP_TRACK_TOL\b"):
+            unknown_env_keys({typo: "0.9"})
+    with pytest.raises(ValueError, match="MICRODUCK_MOSS_PICK_RUNG"):
+        unknown_env_keys({"MICRODUCK_MOSS_PICKRUNG": "2"})
+
+    # A non-MICRODUCK variable is the caller's business, not ours.
+    unknown_env_keys({"PYTHONHASHSEED": "0", "OMP_NUM_THREADS": "4"})

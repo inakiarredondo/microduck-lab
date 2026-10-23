@@ -22,15 +22,13 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import mujoco
 import numpy as np
 import onnxruntime as ort
 
+import microduck_local.robots.moss_env as me
 from microduck_local.distill import fit
 from microduck_local.robots import moss
-import microduck_local.robots.moss_env as me
-from microduck_local.robots.moss_env import (ARM_DELTA_RAD, MossStowEnv,
-                                             eval_env_kwargs)
+from microduck_local.robots.moss_env import ARM_DELTA_RAD, MossStowEnv, eval_env_kwargs
 
 HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location(

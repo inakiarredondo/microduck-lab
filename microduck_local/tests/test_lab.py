@@ -3043,3 +3043,519 @@ def test_the_trainee_preview_is_not_an_easier_task_than_the_trainer():
     src = inspect.getsource(V.Duck._make_env)
     assert "writes_model" in src, (
         "a preview that randomises must not share the roster's mjModel")
+
+
+# ------------------------------------------- a finished run keeps its TASK
+
+def _done_duck(duck_id):
+    """A preview body that records what it is rebuilt with, instead of
+    building a real MuJoCo env (an Asimov one costs seconds)."""
+    d = _fake_duck(duck_id)
+    d.robot = "asimov1"
+    d.rebuilt = []
+    d.rebuild_env = lambda kw: d.rebuilt.append(dict(kw))
+    d.swap_policy = lambda *a, **k: d.rebuilt.append("swapped")
+    return d
+
+
+def _finish(monkeypatch, st, job, duck):
+    """Drive ONE poll that flips the job to done, without a trainer."""
+    st.ducks[:] = [duck]
+    st.jobs[:] = [job]
+    st.job = job
+    monkeypatch.setattr(job, "poll", lambda: (job.__setattr__("status", "done")
+                                              or (None, None)))
+    monkeypatch.setattr(V, "save_lab_state", lambda *a, **k: None)
+    monkeypatch.setattr(V, "seat_finished_policy", lambda *a, **k: False)
+    V.poll_job(st, job)
+
+
+def test_a_finished_TASK_run_keeps_the_env_it_trained_under(monkeypatch,
+                                                            fake_popen):
+    """The reason Jonathan could not see a get-up he had just trained.
+
+    When a job ends the preview is rebuilt, and it was rebuilt for every body
+    with `env_kwargs_for_behavior` — the DUCK's shape: `behavior_id` plus
+    `standing_spawns`, both of which `Duck._make_env` pops before it reaches
+    a non-duck body. What was left was `{}`, so the rebuild fell through to
+    `slot_env` and the body's `default_task`, and an Asimov get-up that had
+    just spent 26 M steps learning to rise off the floor was re-seated in the
+    WALK env — standing, with nothing to get up from. He had to drag the
+    policy back off the palette by hand to see it.
+
+    A task is not a trick: the env it trained under IS the demonstration.
+    """
+    job = V.TrainingJob("asimov_getup_turn", steps=1000)
+    duck = _done_duck(job.trainee_id)
+    st = V.LabState([duck])
+    _finish(monkeypatch, st, job, duck)
+
+    assert duck.rebuilt, "a finished run never rebuilt its preview at all"
+    kw = duck.rebuilt[-1]
+    assert kw.get("task") == "getup", (
+        f"a finished get-up previews as {kw.get('task')!r}: {kw}")
+    # And NOT the duck's shape, which is what silently emptied it.
+    assert "behavior_id" not in kw and "standing_spawns" not in kw
+
+
+def test_a_finished_DUCK_trick_still_shows_off_from_its_feet(monkeypatch,
+                                                             fake_popen):
+    """The control. The duck's rule is deliberate and documented — a finished
+    trick is shown from a standing start, not dropped mid-roll — and the fix
+    above must not reach it."""
+    job = V.TrainingJob("spin", steps=1000)
+    duck = _done_duck(job.trainee_id)
+    duck.robot = "microduck"
+    st = V.LabState([duck])
+    _finish(monkeypatch, st, job, duck)
+
+    kw = duck.rebuilt[-1]
+    assert kw.get("behavior_id") == "spin"
+    assert kw.get("standing_spawns") is True
+
+
+def test_a_finished_run_is_seated_with_its_FINAL_export(monkeypatch,
+                                                        fake_popen, tmp_path):
+    """`live.onnx` is a snapshot on a schedule; `policy.onnx` is the artefact
+    the run is judged on and the one every scorer loads. A finished body kept
+    whichever snapshot happened to land last."""
+    job = V.TrainingJob("asimov_getup_turn", steps=1000)
+    duck = _done_duck(job.trainee_id)
+    st = V.LabState([duck])
+    seated = {}
+
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: types.SimpleNamespace(
+        obs_dim=78))
+    monkeypatch.setattr(V.lab_robots, "policy_refusal", lambda *a, **k: None)
+    duck.env = types.SimpleNamespace(
+        observation_space=types.SimpleNamespace(shape=(78,)))
+    duck.swap_policy = lambda label, infer, **kw: seated.update(kw)
+
+    assert V.seat_finished_policy(st, job, duck) is False  # nothing exported
+    (job.dir / "policy.onnx").write_bytes(b"not really onnx")
+    assert V.seat_finished_policy(st, job, duck) is True
+    assert seated["onnx_path"].endswith("policy.onnx")
+    assert seated["policy_id"] == f"run:{job.run_name}"
+
+
+def test_a_preview_env_NAMES_THE_TASK_for_every_body():
+    """The invariant behind the bug, held for every body including the next.
+
+    `env_kwargs_for_behavior` returned the DUCK's shape — `behavior_id` plus
+    `standing_spawns` — for every behavior, and `Duck._make_env` pops both
+    before reaching a non-duck body. What was left was `{}`, so the preview
+    fell through to `slot_env` and the body's `default_task`: a finished
+    Asimov get-up came back as a WALK, standing, with nothing to get up from.
+
+    It was never one call site. Measured over the registry when it was found,
+    this named NO TASK for **28 behaviors across all four non-duck bodies**.
+    So the assertion is over the registry, not over the one that broke: a
+    fifth body's tasks are covered the day it is registered.
+    """
+    import microduck_local.viz_server as V
+    from microduck_local.behaviors import BEHAVIORS
+
+    checked = 0
+    missing = []
+    for bid, b in sorted(BEHAVIORS.items()):
+        if getattr(b, "robot", "microduck") == "microduck":
+            continue
+        if not getattr(b, "trainer", None):
+            continue
+        checked += 1
+        kw = V.env_kwargs_for_behavior(b)
+        if not kw.get("task"):
+            missing.append(bid)
+        # And never the duck's shape, which is what emptied it.
+        assert "behavior_id" not in kw, f"{bid} previews as a DUCK behavior"
+    assert checked >= 20, (
+        f"only {checked} non-duck behaviors reached — the sweep is not "
+        "sweeping, so a green result here means nothing")
+    assert not missing, f"preview names no task for: {missing}"
+
+
+def test_duck_shaped_kwargs_reaching_another_BODY_are_not_silent(monkeypatch):
+    """The mechanism, not the instance: the fallback was correct behaviour
+    for a caller that meant it and invisible for a caller that did not.
+
+    A raise is not an option — `_make_env` runs inside the 50 Hz loop and a
+    raise there takes the whole roster down, which this repo has already paid
+    for twice. So it records, and a test can see it."""
+    import microduck_local.viz_server as V
+
+    V.MISROUTED_PREVIEWS.clear()
+    built = {}
+    monkeypatch.setattr(V.lab_robots, "slot_env",
+                        lambda robot, seed, kw: built.update(kw) or object())
+    d = V.Duck.__new__(V.Duck)
+    d.id, d.robot = "trainee1", "asimov1"
+    d.env_kwargs = {"behavior_id": "asimov_getup_turn", "standing_spawns": True}
+    d._make_env(0)
+    assert V.MISROUTED_PREVIEWS == [("asimov1", "asimov_getup_turn")]
+    assert "task" not in built          # exactly the empty fall-through
+
+    # ...and the fixed path is silent, because it names the task.
+    V.MISROUTED_PREVIEWS.clear()
+    from microduck_local.behaviors import BEHAVIORS
+    d.env_kwargs = V.env_kwargs_for_behavior(BEHAVIORS["asimov_getup_turn"])
+    d._make_env(0)
+    assert V.MISROUTED_PREVIEWS == []
+
+
+# ------------------------------------------- the handoff has to reach the body
+
+def _getup_behavior_json(d, behavior="asimov_getup_turn"):
+    """A run directory that LOOKS like a finished teach job of `behavior`."""
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "behavior.json").write_text(json.dumps({"behavior": behavior}))
+    (d / "policy.onnx").write_bytes(b"not a real onnx")
+    return d
+
+
+def test_the_handoff_predicate_is_resolved_off_the_RUN_not_the_lab_state(
+        tmp_path, monkeypatch):
+    """`restore_ducks` passed its OWN path to `handoff_fn_for`.
+
+    Both resolvers read `behavior.json` BESIDE the policy, and the argument
+    being handed over was `lab-state.json` — so after every lab restart a
+    restored duck's predicate was looked up in the lab's directory, found
+    nothing, and came back `None`. The handoff then never fired, silently,
+    while the frame still advertised the handoff policy. The mechanism is
+    pinned first, then the call site.
+    """
+    run = _getup_behavior_json(tmp_path / "runs" / "teach-getup-abc")
+    state = tmp_path / "lab-state.json"
+
+    # THE MECHANISM: the two paths do not resolve to the same thing, which is
+    # what made the mistake invisible rather than loud.
+    assert V.handoff_fn_for(str(run / "policy.onnx")) is not None
+    assert V.handoff_fn_for(str(state)) is None
+
+    # THE CALL SITE: record what restore_ducks actually hands over.
+    asked: list[str] = []
+    monkeypatch.setattr(V, "handoff_fn_for",
+                        lambda p: asked.append(str(p)) or (lambda env: False))
+    monkeypatch.setattr(V, "handoff_recenter_for", lambda p: False)
+    monkeypatch.setattr(V, "handoff_for", lambda p: (V._zero_infer, "shipped"))
+    monkeypatch.setattr(V, "showcase_env_kwargs", lambda p: {})
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: V._zero_infer)
+    state.write_text(json.dumps({"version": 1, "ducks": [
+        {"id": "d0", "label": "getup", "policy": None,
+         "onnxPath": str(run / "policy.onnx"), "robot": "microduck",
+         "showcase": True}]}))
+
+    restored = V.restore_ducks(state)
+    assert [d.id for d in restored] == ["d0"]
+    assert asked == [str(run / "policy.onnx")], (
+        "restore_ducks must resolve the handoff off the POLICY's run, not off "
+        f"lab-state.json — it asked for {asked}")
+    assert restored[0].handoff_fn is not None
+
+
+def test_a_finished_run_is_seated_WITH_its_handoff(tmp_path, monkeypatch):
+    """`seat_finished_policy` seated the policy and not the handoff.
+
+    The Asimov get-up's deliverable is the rise PLUS the shipped walker
+    taking over, and this is the function that puts a just-finished run on
+    the stage — so the body the user is pointed at stood up and then did
+    nothing, which is the exact complaint the handoff exists to answer.
+    """
+    run = _getup_behavior_json(tmp_path / "teach-getup-def")
+    job = types.SimpleNamespace(dir=run, run_name="teach-getup-def")
+    swapped: list[tuple] = []
+    duck = types.SimpleNamespace(
+        id="trainee", label="🎓 getup", robot="asimov1",
+        env=types.SimpleNamespace(observation_space=types.SimpleNamespace(
+            shape=(78,))),
+        handoff_infer="STALE", handoff_label="STALE",
+        handoff_fn="STALE", handoff_recenter="STALE", handed=True,
+        swap_policy=lambda *a, **k: swapped.append((a, k)))
+    st = types.SimpleNamespace(events=[])
+
+    sentinel = object()
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: V._zero_infer)
+    monkeypatch.setattr(V.lab_robots, "policy_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(V, "handoff_for", lambda p: (sentinel, "shipped"))
+    monkeypatch.setattr(V, "handoff_fn_for", lambda p: sentinel)
+    monkeypatch.setattr(V, "handoff_recenter_for", lambda p: False)
+
+    assert V.seat_finished_policy(st, job, duck) is True
+    assert swapped, "the policy itself must still be seated"
+    assert duck.handoff_infer is sentinel, (
+        "a finished run must arrive with its handoff wired, or the stage "
+        "shows a get-up that stands and then stops")
+    assert duck.handoff_label == "shipped"
+    assert duck.handoff_fn is sentinel
+    assert duck.handoff_recenter is False
+    # Each seating starts on the trick's own brain, never mid-handoff.
+    assert duck.handed is False
+
+
+def test_a_recipe_that_cannot_ask_for_a_handoff_is_left_alone(
+        tmp_path, monkeypatch):
+    """The control for the test above: the wiring must be a NO-OP elsewhere.
+
+    `handoff_for` returns None for any recipe that cannot ever ask (no
+    `handoff_fn`, not the flip family), and a duck that had no handoff must
+    not come back advertising one.
+    """
+    run = _getup_behavior_json(tmp_path / "teach-spin-ghi", behavior="spin")
+    job = types.SimpleNamespace(dir=run, run_name="teach-spin-ghi")
+    duck = types.SimpleNamespace(
+        id="trainee", label="🎓 spin", robot="microduck",
+        env=types.SimpleNamespace(observation_space=types.SimpleNamespace(
+            shape=(61,))),
+        handoff_infer=None, handoff_label=None, handoff_fn=None,
+        handoff_recenter=None, handed=False,
+        swap_policy=lambda *a, **k: None)
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: V._zero_infer)
+    monkeypatch.setattr(V.lab_robots, "policy_refusal", lambda *a, **k: None)
+
+    assert V.seat_finished_policy(types.SimpleNamespace(events=[]), job,
+                                  duck) is True
+    assert V.handoff_for(str(run / "policy.onnx")) is None, (
+        "`spin` declares no handoff_fn and is not the flip family")
+    assert duck.handoff_infer is None and duck.handoff_fn is None
+
+
+def test_a_control_body_keeps_the_env_and_drops_only_the_handoff(
+        tmp_path, monkeypatch):
+    """`spawn_duck {"handoff": false}` varies ONE thing.
+
+    Staging a no-handoff body used to mean dropping showcase mode, which also
+    rebuilt the env — so the only on-stage comparison the handoff had to
+    justify itself changed the world AND the controller at once. The control
+    must keep the showcase env and lose only the hand-over, and say so in its
+    label: two identical-looking Asimovs is how a demo misleads.
+    """
+    import microduck_local.viz_server as VS
+
+    made: list = []
+    monkeypatch.setattr(VS, "showcase_env_kwargs", lambda p: {"getup_label": "supine"})
+    monkeypatch.setattr(VS, "handoff_for", lambda p: (VS._zero_infer, "shipped"))
+    monkeypatch.setattr(VS, "handoff_fn_for", lambda p: (lambda env: True))
+    monkeypatch.setattr(VS, "handoff_recenter_for", lambda p: False)
+    monkeypatch.setattr(VS, "discover_policies",
+                        lambda: [{"id": "run:r", "path": str(tmp_path / "policy.onnx"),
+                                  "robot": "asimov1"}])
+    monkeypatch.setattr(VS, "load_policy_infer", lambda pid: VS._zero_infer)
+    monkeypatch.setattr(VS, "spawn_duck_error", lambda st, pid: None)
+    monkeypatch.setattr(VS.lab_robots, "policy_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(VS, "save_lab_state", lambda ducks: None)
+    monkeypatch.setattr(VS, "next_duck_slot", lambda ducks: len(ducks))
+
+    def fake_duck(did, label, infer, **kw):
+        d = types.SimpleNamespace(
+            id=did, label=label, robot=kw.get("robot"),
+            env_kwargs=kw.get("env_kwargs"), showcase=False,
+            env=types.SimpleNamespace(observation_space=types.SimpleNamespace(
+                shape=(78,))),
+            handoff_infer=None, handoff_label=None, handoff_fn=None,
+            handoff_recenter=None, handed=False)
+        made.append(d)
+        return d
+    monkeypatch.setattr(VS, "Duck", fake_duck)
+
+    app = VS.make_app([])
+    spawn = app.state.do_spawn_duck
+
+    asyncio.run(spawn("run:r", showcase=True, handoff=True))
+    asyncio.run(spawn("run:r", showcase=True, handoff=False))
+    treat, control = made
+
+    # SAME WORLD — the one thing that must not differ.
+    assert control.env_kwargs == treat.env_kwargs == {"getup_label": "supine"}
+    assert control.showcase is treat.showcase is True
+    # DIFFERENT CONTROLLER, and only that.
+    assert treat.handoff_infer is not None and treat.handoff_fn is not None
+    assert control.handoff_infer is None and control.handoff_fn is None
+    assert control.handoff_label is None
+    assert "no handoff" in control.label and "no handoff" not in treat.label
+
+
+def test_a_showcase_previews_what_the_RUN_trained_on(tmp_path, monkeypatch):
+    """The knobs came from the RECIPE; the thing on stage is a RUN.
+
+    `teach-asimov_getup_turn-967072` trained on `getup_label="supine,prone"`
+    while the recipe's last stage says `"supine"` — so the stage would have
+    started it on its back every episode and the roll it was trained for
+    (prone 12/48 -> 47/48) would have been invisible. Intersection only: a
+    key is overlaid only when the stage already sets it, so a kwarg the
+    body does not speak can never be introduced.
+    """
+    run = tmp_path / "teach-fake-run"
+    run.mkdir()
+    (run / "run.json").write_text(json.dumps({
+        "run_name": "teach-fake-run", "robot": "asimov1", "task": "getup",
+        "env_kwargs": {"getup_label": "supine,prone", "roll_pay": 100.0}}))
+
+    stage = {"getup_label": "supine", "action_clip": 4.0}
+    out = V._as_the_run_trained(dict(stage), str(run / "policy.onnx"))
+    assert out["getup_label"] == "supine,prone", (
+        "the run's own start distribution must win over the recipe's")
+    # NOT introduced: the stage never set it, so it stays out.
+    assert "roll_pay" not in out
+    # untouched where the run says nothing
+    assert out["action_clip"] == 4.0
+    # and a path with no run.json beside it must not break a preview
+    assert V._as_the_run_trained(dict(stage), str(tmp_path / "nope.onnx")) == stage
+    assert V._as_the_run_trained(dict(stage), None) == stage
+
+
+def test_a_preview_never_inherits_a_training_terminal_or_a_demo_assist(
+        tmp_path):
+    """The two ways the overlay above went wrong, both caught in review.
+
+    `handoff_pay` ENDS the episode as soon as the robot is handoff-ready, so
+    a showcase inheriting it reset the instant the robot stood — the exact
+    "it stands up and then just stops" symptom. `getup_assist` /
+    `getup_blend` carry part of the trick, and `showcase_label` exists
+    because "a viewer must never mistake that for the policy doing it
+    unaided" — inheriting them shows an assisted get-up with no label.
+    """
+    run = tmp_path / "teach-assisted-run"
+    run.mkdir()
+    (run / "run.json").write_text(json.dumps({
+        "run_name": "teach-assisted-run", "robot": "asimov1", "task": "getup",
+        "env_kwargs": {"handoff_pay": 14.0, "getup_assist": 0.5,
+                       "getup_blend": 0.8, "getup_label": "supine,prone"}}))
+    stage = {"handoff_pay": 0.0, "getup_assist": 0.0, "getup_blend": 0.0,
+             "getup_label": "supine"}
+    out = V._as_the_run_trained(dict(stage), str(run / "policy.onnx"))
+    assert out["handoff_pay"] == 0.0, (
+        "a training terminal must never reach a preview — it cuts the "
+        "episode at the handoff")
+    assert out["getup_assist"] == 0.0 and out["getup_blend"] == 0.0, (
+        "a demo assist must never reach a preview unlabelled")
+    # ...while the thing the overlay exists for still comes through
+    assert out["getup_label"] == "supine,prone"
+    assert set(V.NOT_FROM_THE_RUN) == {"handoff_pay", "getup_assist",
+                                       "getup_blend"}
+
+
+def test_the_switch_hands_BACK_when_the_robot_goes_down():
+    """It used to be one way, so a shoved robot stayed down for good.
+
+    Measured over 12 x 30 s episodes under 506 N shoves: one way 12 stands /
+    0 recoveries / 0 of 12 up at the end; two way 44 / 32 / 11 of 12. The
+    down-predicate reads PROJECTED GRAVITY — what the robot can sense — and
+    its dwell is the settle clause, because handing the get-up a state
+    mid-fall is the mistake that cost 7.5M steps.
+    """
+    from microduck_local.robots import asimov_walk as AW
+
+    d = types.SimpleNamespace(
+        robot="asimov1", obs=np.zeros(78), handed=True, _down_n=0,
+        handoff_infer=object(),
+        DOWN_UPRIGHT=V.Duck.DOWN_UPRIGHT, DOWN_DWELL=V.Duck.DOWN_DWELL)
+    gi = slice(*AW.OBS_GRAVITY)
+
+    # STANDING: gravity projects to -1 on z, so uprightness is +1.
+    d.obs[gi] = [0.0, 0.0, -1.0]
+    assert V.Duck._down_due(d) is False
+    assert d._down_n == 0
+
+    # DOWN: uprightness ~0. One tick is not enough — the dwell is a SETTLE.
+    d.obs[gi] = [-1.0, 0.0, 0.0]
+    fired = [V.Duck._down_due(d) for _ in range(V.Duck.DOWN_DWELL)]
+    assert fired[:-1] == [False] * (V.Duck.DOWN_DWELL - 1), (
+        "a single down frame must not hand back — the fall is still in "
+        "progress")
+    assert fired[-1] is True
+
+    # STANDING AGAIN clears the partial dwell, so a wobble cannot accumulate.
+    d._down_n = 0
+    d.obs[gi] = [-1.0, 0.0, 0.0]
+    V.Duck._down_due(d)
+    d.obs[gi] = [0.0, 0.0, -1.0]
+    assert V.Duck._down_due(d) is False
+    assert d._down_n == 0
+
+    # A BODY WITH NO KNOWN GRAVITY SLICE never hands back, rather than
+    # reading someone else's observation layout — four bugs of that shape
+    # already in this file.
+    duck = types.SimpleNamespace(robot="microduck", obs=np.zeros(61),
+                                 handed=True, _down_n=0)
+    assert V.Duck._down_due(duck) is False
+
+
+def test_the_shove_is_streamed_so_a_viewer_can_SEE_it():
+    """`push` is read off `xfrc_applied`, not kept in a parallel copy.
+
+    That array is what MuJoCo integrates, so the arrow cannot drift from the
+    force actually applied. The vertical row is excluded on purpose: it is
+    the demo assist's channel, which the "spotting" chip already reports.
+    """
+    import numpy as _np
+
+    env = types.SimpleNamespace(
+        trunk_body_id=3,
+        data=types.SimpleNamespace(xfrc_applied=_np.zeros((6, 6)),
+                                   xpos=_np.zeros((6, 3))))
+    env.data.xpos[3] = [1.0, 2.0, 0.6]
+    d = types.SimpleNamespace(env=env)
+
+    # nothing applied -> nothing drawn
+    assert V._push_payload(d) is None
+
+    # a lateral shove -> origin at the trunk, direction and newtons reported
+    env.data.xfrc_applied[3, 1] = 506.0
+    got = V._push_payload(d)
+    assert got["at"] == [1.0, 2.0, 0.6]
+    assert got["vec"] == [0.0, 506.0, 0.0]
+    assert got["n"] == 506.0
+
+    # the ASSIST's vertical channel must not be drawn as a shove
+    env.data.xfrc_applied[3] = 0.0
+    env.data.xfrc_applied[3, 2] = 300.0
+    assert V._push_payload(d) is None, (
+        "the vertical row is the demo assist, reported by the spotting chip")
+
+    # sub-newton numerical dust is not a shove
+    env.data.xfrc_applied[3] = 0.0
+    env.data.xfrc_applied[3, 0] = 0.4
+    assert V._push_payload(d) is None
+
+    # a body with no trunk (a kinematic idle) must not raise in the 50 Hz loop
+    assert V._push_payload(types.SimpleNamespace(env=None)) is None
+    assert V._push_payload(types.SimpleNamespace()) is None
+
+
+def test_a_restored_duck_keeps_the_shove_its_LABEL_claims(tmp_path, monkeypatch):
+    """The label outlived the force, which is a demo that lies.
+
+    A shoved showcase saved its label ("… — shoved 1.6bw") but not the shove,
+    so after a lab restart `restore_ducks` rebuilt the env from the recipe
+    and the chip claimed a force nothing was applying — the same fault as
+    previewing an assisted get-up as unaided.
+    """
+    applied: dict = {}
+    monkeypatch.setattr(V, "showcase_env_kwargs", lambda p: {"getup_label": "supine"})
+    monkeypatch.setattr(V, "handoff_for", lambda p: None)
+    monkeypatch.setattr(V, "_onnx_infer", lambda p: V._zero_infer)
+    monkeypatch.setattr(V, "load_policy_infer", lambda pid: V._zero_infer)
+
+    def fake_duck(did, label, infer, **kw):
+        applied.update(kw.get("env_kwargs") or {})
+        return types.SimpleNamespace(id=did, label=label, showcase=False,
+                                     shove=0.0, created_at=None,
+                                     handoff_infer=None, handoff_label=None,
+                                     handoff_fn=None, handoff_recenter=None)
+    monkeypatch.setattr(V, "Duck", fake_duck)
+
+    state = tmp_path / "lab-state.json"
+    state.write_text(json.dumps({"version": 1, "ducks": [
+        {"id": "d0", "label": "getup ✨ — shoved 1.6bw", "policy": None,
+         "onnxPath": str(tmp_path / "policy.onnx"), "robot": "asimov1",
+         "showcase": True, "shove": 1.6}]}))
+
+    restored = V.restore_ducks(state)
+    assert [d.id for d in restored] == ["d0"]
+    assert applied["push_bw"] == 1.6, "the label says shoved; so must the env"
+    assert applied["fell_cut"] is False, (
+        "without this the lab RESETS on the fall and the viewer sees a "
+        "respawn that looks like a recovery")
+    assert applied["max_episode_s"] >= 30.0
+    assert applied["push_every"] == V.PUSH_EVERY_DEMO_S, (
+        "a watched demo waits between shoves — the training cadence counts "
+        "WALL time and hits the robot the instant a 3.4 s rise finishes")

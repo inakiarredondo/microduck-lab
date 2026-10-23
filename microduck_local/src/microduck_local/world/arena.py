@@ -715,21 +715,36 @@ class WorldRobot:
 
 
 class WorldPerson:
-    """A person the ducks can follow: a mocap capsule, or a Unitree G1.
+    """A person the ducks can follow: a mocap capsule, or a WALKING ROBOT.
 
-    Capsule: infinite-mass mocap, slid along waypoints. G1: the Lucky Robots
-    MJCF attached under this id's prefix, driven by walker.onnx with the same
-    waypoint twist as a command. Detector class stays "person" either way.
+    Capsule: infinite-mass mocap, slid along waypoints. A robot: that body's
+    MJCF attached under this id's prefix and stepped by its own
+    `Body.driver()`, given the same waypoint twist as a command. Detector
+    class stays "person" either way.
+
+    **`kind` is a registry id, not a table.** It was `== "g1"` with the walker
+    constructed by name here, which is the `if robot ==` pattern
+    `docs/mars-roadmap.md` §6.5 exists to delete: a second walking body could
+    not become a person without editing this file. Now any body that declares
+    `driver()` can, and the G1 reaches exactly the same `G1Walker` through
+    `g1.G1Body.driver` — `tests/test_g1_person.py` is the control for that.
+
+    What a driver owes this class: `cmd`, `spawn`, `pose`, `fallen`,
+    `control` and `base_body_id`. That is `G1Walker`'s surface, named.
     """
 
     def __init__(self, model: mujoco.MjModel, spec: Person):
         self.spec = spec
         self.id = spec.id
         self.robot = None
-        if spec.kind == "g1":
-            from ..robots.g1 import G1Walker
-            self.robot = G1Walker(model, spec.id)
-            self.body = self.robot.pelvis
+        if spec.kind != "capsule":
+            from ..robots import registry
+            from .compose import duck_prefix
+            body = registry.get(spec.kind)
+            self.robot = body.driver(model, duck_prefix(spec.id))
+            #: The slowest forward command this body walks at — see `_forward`.
+            self.min_forward = float(getattr(body, "min_forward_cmd", 0.0) or 0.0)
+            self.body = int(self.robot.base_body_id)
             self.mocap = -1
         else:
             self.body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, spec.id)
@@ -764,7 +779,8 @@ class WorldPerson:
         data.mocap_quat[self.mocap] = [np.cos(self.yaw / 2), 0.0, 0.0, np.sin(self.yaw / 2)]
 
     def sync(self, data: mujoco.MjData) -> None:
-        """Read the G1 pelvis out of physics after mj_step. Capsules no-op."""
+        """Read the robot's base body out of physics after mj_step.
+        Capsules no-op."""
         if self.robot is None:
             return
         self.x, self.y, self.yaw = self.robot.pose(data)
@@ -787,7 +803,7 @@ class WorldPerson:
 
     def step(self, data: mujoco.MjData, dt: float, blockers=()) -> None:
         if self.robot is not None:
-            self._step_g1(data, dt, blockers)
+            self._step_driven(data, dt, blockers)
             return
         if self.possessed and self.cmd is not None:
             vx, vy, wz = (float(v) for v in self.cmd)
@@ -833,8 +849,33 @@ class WorldPerson:
                 self.y += step * np.sin(self.yaw)
         self.write(data)
 
-    def _step_g1(self, data: mujoco.MjData, dt: float, blockers) -> None:
-        """Waypoint / possess twist → G1 walk policy. Pose comes from physics."""
+    def _forward(self, vx: float) -> float:
+        """A forward command this BODY can actually walk at — or nothing.
+
+        A learned gait does not scale down smoothly; it has a floor, and below
+        it the robot stands still while the command says otherwise.
+        `RobotSpec.min_forward_cmd` is where a body declares its own.
+
+        MEASURED on Asimov 1, which is why this exists: its shipped policy
+        tracks a 0.20 command at 75 % and a 0.25 at 87 %, but a 0.125 at **3
+        %** — a cliff. The yield rule above halves the tour speed when a duck
+        is in the way, and on a 0.25 m/s tour that half is 0.125, so the robot
+        stopped dead. It then never unblocked, because the ducks it had
+        stopped for were FOLLOWING it and stopped too. A 40 s deadlock on a
+        45 s lap, from a command that was never walkable.
+
+        Raising it to the floor is the only way to honour what that branch is
+        for ("walk anyway rather than freeze the scene"): a body that cannot
+        crawl can only stand or walk. A body that declares no floor (level 0,
+        or a mocap capsule) is untouched.
+        """
+        floor = float(getattr(self, "min_forward", 0.0) or 0.0)
+        return max(vx, floor) if vx > 0.0 and floor > 0.0 else vx
+
+    def _step_driven(self, data: mujoco.MjData, dt: float, blockers) -> None:
+        """Waypoint / possess twist -> the body's own walk policy. Pose comes
+        from physics, so a robot that falls behind its waypoints is visible
+        rather than teleported."""
         vx = vy = wz = 0.0
         if self.possessed and self.cmd is not None:
             vx, vy, wz = (float(v) for v in self.cmd)
@@ -860,11 +901,11 @@ class WorldPerson:
                 else:
                     self.waiting = 0.0
                 if not turning and not blocked:
-                    vx = float(self.spec.speed)
+                    vx = self._forward(float(self.spec.speed))
                 elif blocked and self.waiting > self.WAIT_S:
                     # Duck has been in the way long enough — walk anyway at
                     # half speed rather than freeze the scene.
-                    vx = float(self.spec.speed) * 0.5
+                    vx = self._forward(float(self.spec.speed) * 0.5)
         assert self.robot is not None
         self.robot.cmd[:] = (vx, vy, wz)
         self.robot.control(data)

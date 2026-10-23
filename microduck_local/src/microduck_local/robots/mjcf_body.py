@@ -83,6 +83,20 @@ _SCALAR_JOINTS = (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
 #: MuJoCo's URDF importer uses 1, which is why this is DETECTED and not fixed.
 DEFAULT_VISUAL_GROUP = 2
 
+#: Vertex lattices `visual_vert_scale` may pick, metres, coarsest first. A
+#: ladder and not a formula so two models of the same rough tessellation get
+#: the SAME dump and a re-fetch cannot nudge a body's bytes; 1 mm is the
+#: coarsest because that is what every dump used before it was measured, and
+#: 10 um the finest because below it the ints stop paying for themselves.
+VERT_SCALE_LADDER_M = (1e-3, 5e-4, 2.5e-4, 1e-4, 5e-5, 2.5e-5, 1e-5)
+
+#: How small the lattice has to be against the model's own triangles, and
+#: WHICH triangles: a tenth of the 10th-percentile edge. The small end and not
+#: the median, because shading is normals and normals come off the SMALLEST
+#: faces — see `visual_vert_scale` for the measurement that moved this.
+VERT_SCALE_EDGE_FRACTION = 0.1
+VERT_SCALE_EDGE_PERCENTILE = 10.0
+
 #: The level-0 contract's control rate. Not measured — declared, and the
 #: `deploy` sentence says as much: there is no policy at this level, so the
 #: number is the lab's own clock (`contract.CTRL_DT`) and a body that trains
@@ -109,6 +123,22 @@ def _static_scene(path: Path) -> Path:
     return path
 
 
+def world_floor_geom(spec: mujoco.MjSpec) -> str | None:
+    """The name of the ground PLANE the model already carries, or None.
+
+    A plane geom in the worldbody IS a floor whatever it is called, and the
+    one thing a generated scene must not do is add a second one. Read off the
+    spec rather than a compile because that is where the scene is still being
+    built; a plane whose type arrives only from a `<default>` class is the
+    case this misses, and it misses it loudly (a duplicate name) rather than
+    silently.
+    """
+    for g in spec.worldbody.geoms:
+        if g.type == mujoco.mjtGeom.mjGEOM_PLANE:
+            return g.name or ""
+    return None
+
+
 def _generated_scene(robot_xml: Path, out: Path, add_key: str) -> Path:
     """Write `out`: the robot, a floor, a light, and a keyframe. Return it.
 
@@ -120,16 +150,28 @@ def _generated_scene(robot_xml: Path, out: Path, add_key: str) -> Path:
     `add_key` is the keyframe name to write from `qpos0`, or "" when the robot
     file already carries one (which then survives into the scene, because this
     ADDS to the robot's own spec rather than attaching it into a fresh world).
+
+    **The floor and the light are added only if the robot brings neither.**
+    MEASURED on Menlo's `asimov-1/sim-model/xmls/asimov_1.xml`, which is a
+    robot and a scene in one file (a `floor` plane and three lights): adding a
+    second geom called `floor` fails the compile with `repeated name 'floor'
+    in geom`, so a stranger's MJCF that bundles its own ground was a body this
+    harness could not read AT ALL — level 0's "an MJCF and an id" held only
+    for files shaped like Menagerie's, which splits `robot.xml` from
+    `scene.xml`. The light is skipped for a weaker reason: a fourth light is
+    not an error, only a brighter room than the model's author chose.
     """
     spec = load_robot_spec(robot_xml)
     w = spec.worldbody
-    light = w.add_light()
-    light.pos = [0.0, 0.0, 3.0]
-    light.dir = [0.0, 0.0, -1.0]
-    floor = w.add_geom()
-    floor.name = "floor"
-    floor.type = mujoco.mjtGeom.mjGEOM_PLANE
-    floor.size = [10.0, 10.0, 0.05]
+    if not w.lights:
+        light = w.add_light()
+        light.pos = [0.0, 0.0, 3.0]
+        light.dir = [0.0, 0.0, -1.0]
+    if world_floor_geom(spec) is None:
+        floor = w.add_geom()
+        floor.name = "floor"
+        floor.type = mujoco.mjtGeom.mjGEOM_PLANE
+        floor.size = [10.0, 10.0, 0.05]
     if add_key:
         # Sized from a SEPARATE compile of the robot, the way
         # `mars._scene_spec` does: `MjSpec.compile()` normalises the spec it
@@ -241,6 +283,71 @@ def visual_geom_group(model: mujoco.MjModel,
     return max(counts, key=lambda g: (counts[g], -g))
 
 
+def visual_vert_scale(model: mujoco.MjModel, group: int) -> float:
+    """The vertex lattice this model's dump may be quantised to — READ.
+
+    `g1.extract_visual_scene` writes vertices as integer multiples of a
+    lattice so the JSON is a third of the floats, and its own docstring says
+    the quiet part: **the lattice is a RESOLUTION, and a 1.3 m biped and a
+    25 cm one do not want the same one.** It defaults to a millimetre, which
+    is a number taken on the G1 and then inherited by everything — the exact
+    shape of mistake `AGENTS.md` warns about, and MARS already paid for it
+    once (`robots/mars.VERT_SCALE_M`: a millimetre lattice made its head
+    arrive in the browser looking melted, with streaky normals on faces that
+    are flat in MuJoCo).
+
+    A stranger's model cannot be asked, so the lattice is read off its own
+    TESSELLATION: a tenth of its 10th-PERCENTILE triangle edge, snapped down
+    the ladder. A coarse model (a robot of boxes) still gets the cheap
+    millimetre dump rather than paying for digits nothing can see.
+
+    **The small end of the edge distribution, and not the median — MEASURED,
+    after a first version aimed at the median and the robot still arrived
+    mottled.** The quantity the eye reads is the NORMAL, and a normal comes
+    off a single triangle: the lattice moves a vertex by at most (sqrt 3)/2 of
+    a step, which is nothing next to a 0.75 m robot and everything next to its
+    0.2 mm triangles. Tilt one corner of a 0.2 mm face by 0.085 mm and that
+    face's normal swings tens of degrees, which is a shading artefact on a
+    surface that is flat in MuJoCo — exactly the "streaky normals" MARS was
+    described by. So the number that settles the lattice is the share of faces
+    whose normal the quantisation tilts by more than 15 degrees:
+
+    | body | p10 edge | picked | tilted >15 deg at 1 mm | at 0.1 mm | at picked | dump |
+    |---|---|---|---|---|---|---|
+    | `menagerie:unitree_go2` | 0.199 mm | 0.01 mm | 40.4 % | 14.2 % | 1.6 % | 6.23 → 7.36 MB |
+    | `menagerie:trs_so_arm100` | 0.388 mm | 0.025 mm | 43.7 % | 6.1 % | 1.2 % | 1.38 → 1.51 MB |
+
+    Eighteen per cent more bytes to take two fifths of a robot's faces off a
+    wrong normal — which is what the Go2's dented torso, its smeared `Go2`
+    lettering and its cloudy thighs were.
+    """
+    lens: list[np.ndarray] = []
+    for mid in sorted({int(model.geom_dataid[g]) for g in range(model.ngeom)
+                       if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
+                       and int(model.geom_group[g]) == group}):
+        va, vn = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+        fa, fn = int(model.mesh_faceadr[mid]), int(model.mesh_facenum[mid])
+        if vn == 0 or fn == 0:
+            continue
+        v, f = model.mesh_vert[va:va + vn], model.mesh_face[fa:fa + fn]
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            lens.append(np.linalg.norm(v[f[:, a]] - v[f[:, b]], axis=1))
+    if not lens:
+        # No visual mesh at all: nothing is quantised, so the coarsest lattice
+        # is as right as any and costs the least.
+        return VERT_SCALE_LADDER_M[0]
+    edges = np.concatenate(lens)
+    edges = edges[edges > 0]
+    if not edges.size:
+        return VERT_SCALE_LADDER_M[0]
+    want = (float(np.percentile(edges, VERT_SCALE_EDGE_PERCENTILE))
+            * VERT_SCALE_EDGE_FRACTION)
+    for step in VERT_SCALE_LADDER_M:
+        if step <= want:
+            return step
+    return VERT_SCALE_LADDER_M[-1]
+
+
 def pick_keyframe(model: mujoco.MjModel) -> str | None:
     """The keyframe this body should spawn from, or None if it has none.
 
@@ -340,6 +447,10 @@ class MjcfBody(BodyBase):
     #: Which geom group `visual_scene()` reads. Detected, see
     #: `visual_geom_group`.
     visual_group: int = DEFAULT_VISUAL_GROUP
+    #: The vertex lattice `visual_scene()` quantises to, metres. Detected off
+    #: the model's own tessellation, see `visual_vert_scale` — the default is
+    #: the coarsest rung, which is what every dump used before it was read.
+    vert_scale: float = VERT_SCALE_LADDER_M[0]
     #: Free-form, and the place the reading records ITSELF: `pose_source`
     #: (which keyframe the default pose came from, or `qpos0`), `scene_source`
     #: ("given" / "generated"), `measured_width_m`, `skipped_joints` (the
@@ -367,7 +478,8 @@ class MjcfBody(BodyBase):
 
         `manifest` is the small dict a catalogue can override the reading
         with, all optional: `title`, `noun`, `keyframe` (name a keyframe
-        instead of taking `pick_keyframe`'s), `visual_group`, `joint_groups`.
+        instead of taking `pick_keyframe`'s), `visual_group`, `vert_scale`,
+        `joint_groups`.
         Nothing in it is required and nothing in it is invented — an absent
         key means "read it".
         """
@@ -400,6 +512,7 @@ class MjcfBody(BodyBase):
         spacing, width = measure_lab_spacing_m(scene_model, scene.keyframe)
 
         group = int(man.get("visual_group", visual_geom_group(model)))
+        lattice = float(man.get("vert_scale", visual_vert_scale(model, group)))
         groups = man.get("joint_groups")
         n = len(joint_names)
         return cls(
@@ -422,15 +535,19 @@ class MjcfBody(BodyBase):
             default_task=None,
             robot_xml=robot_xml,
             visual_group=group,
+            vert_scale=lattice,
             extra={
                 "pose_source": scene.pose_source,
                 "scene_source": scene.source,
                 "scene_path": str(scene.path),
                 "measured_width_m": round(width, 6),
                 "skipped_joints": skipped,
+                # The ground this model brought, if it brought one: a
+                # generated scene reuses it instead of adding a second.
+                "own_floor": world_floor_geom(load_robot_spec(robot_xml)),
                 **{k: v for k, v in man.items()
                    if k not in ("title", "noun", "keyframe", "visual_group",
-                                "joint_groups")},
+                                "vert_scale", "joint_groups")},
             },
         )
 
@@ -581,14 +698,23 @@ class MjcfBody(BodyBase):
         return compile_robot(self.robot_xml)
 
     def visual_scene(self) -> dict:
-        """The viewer's mesh dump, from the detected visual group.
+        """The viewer's mesh dump, from the detected visual group and lattice.
 
         `g1.extract_visual_scene` is the body-agnostic dump (its own docstring
-        marks the move to a shared module as PHASE 1B); the only per-body
-        thing in it is the group, which this body measured.
+        marks the move to a shared module as PHASE 1B); the two per-body
+        things in it are the group and the vertex lattice, and this body
+        measured BOTH (`visual_geom_group`, `visual_vert_scale`). Taking the
+        lattice's default instead is what made the Go2 arrive dented.
+
+        `normals=True` — a level-0 body is one nobody here has looked at, so
+        it ships the model's OWN normals rather than letting the browser weld
+        and average its way to a guess. That is the half of the Go2's melted
+        shell that no lattice could have fixed; the G1's and MARS's looks were
+        tuned against the guess and keep it until somebody re-measures them.
         """
         from .g1 import extract_visual_scene
-        return extract_visual_scene(self.robot_model(), group=self.visual_group)
+        return extract_visual_scene(self.robot_model(), group=self.visual_group,
+                                    vert_scale=self.vert_scale, normals=True)
 
     def look(self) -> str:
         """One material table for every body at level 0.
@@ -713,6 +839,8 @@ def _check_nq(body_id: str, name: str, qpos: np.ndarray,
 
 
 __all__ = ["DEFAULT_RATE_HZ", "DEFAULT_VISUAL_GROUP", "GENERATED_KEY",
-           "MjcfBody", "compile_robot", "joint_subset", "load_robot_spec",
+           "MjcfBody", "VERT_SCALE_EDGE_FRACTION",
+           "VERT_SCALE_EDGE_PERCENTILE", "VERT_SCALE_LADDER_M",
+           "compile_robot", "joint_subset", "load_robot_spec",
            "pick_keyframe", "scalar_joint_names", "title_of",
-           "visual_geom_group"]
+           "visual_geom_group", "visual_vert_scale"]

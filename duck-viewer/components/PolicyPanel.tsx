@@ -626,12 +626,26 @@ export function PolicyPanel({
 
   // A finished training run drops a new "Our runs" policy on disk: watch the
   // streamed training status and refetch on the training → done transition.
+  //
+  // ...and again once the EXPORT lands. The run does not exist for the
+  // palette until `policy.onnx` is written, the lab writes it on a background
+  // thread, and `status` reaches "done" before it. Refetching on the done
+  // transition alone showed the palette exactly as it was a moment earlier —
+  // the run the user had just watched train for eight million steps was still
+  // not there. `exporting` is the lab's in-flight set; poll out of it the way
+  // a robot download already does.
   const prevStatus = useRef<string | null>(null);
+  const prevExporting = useRef(0);
   useEffect(() => {
     const id = setInterval(() => {
-      const status = clientRef.current?.frame?.training?.status ?? null;
+      const t = clientRef.current?.frame?.training;
+      const status = t?.status ?? null;
       if (prevStatus.current === "training" && status === "done") refresh();
       prevStatus.current = status;
+      // Any → none means every export finished; the files are on disk now.
+      const n = t?.exporting?.length ?? 0;
+      if (prevExporting.current > 0 && n === 0) refresh();
+      prevExporting.current = n;
     }, 1000);
     return () => clearInterval(id);
   }, [clientRef, refresh]);

@@ -1,0 +1,191 @@
+{
+  "name": "moss-duckling",
+  "seed": 0,
+  "floor": {
+    "size": [
+      2.6,
+      2.2
+    ]
+  },
+  "walls": [
+    {
+      "from": [
+        -1.1,
+        -0.9
+      ],
+      "to": [
+        1.1,
+        -0.9
+      ],
+      "height": 0.3,
+      "thickness": 0.02
+    },
+    {
+      "from": [
+        1.1,
+        -0.9
+      ],
+      "to": [
+        1.1,
+        0.9
+      ],
+      "height": 0.3,
+      "thickness": 0.02
+    },
+    {
+      "from": [
+        1.1,
+        0.9
+      ],
+      "to": [
+        -1.1,
+        0.9
+      ],
+      "height": 0.3,
+      "thickness": 0.02
+    },
+    {
+      "from": [
+        -1.1,
+        0.9
+      ],
+      "to": [
+        -1.1,
+        -0.9
+      ],
+      "height": 0.3,
+      "thickness": 0.02
+    }
+  ],
+  "boxes": [],
+  "balls": [],
+  "ducks": [
+    {
+      "id": "m0",
+      "spawn": [
+        -0.85,
+        0.0,
+        0.0
+      ],
+      "policy": null,
+      "tof": null,
+      "detector": "datasheet",
+      "brain": "tidy_moss",
+      "odom": "ideal",
+      "team": null,
+      "role": null,
+      "robot": "moss"
+    }
+  ],
+  "persons": [],
+  "pickables": [],
+  "props": [
+    {
+      "id": "duck0",
+      "pos": [
+        -0.3,
+        0.02,
+        0.0465
+      ],
+      "shape": "cylinder",
+      "size": [
+        0.025,
+        0.025,
+        0.093
+      ],
+      "mass": 0.027,
+      "yaw": 0.0,
+      "rgba": [
+        0.98,
+        0.78,
+        0.2,
+        1.0
+      ],
+      "cls": "toy",
+      "rolling": 0.002,
+      "look": "duck"
+    },
+    {
+      "id": "duck1",
+      "pos": [
+        0.1,
+        -0.34,
+        0.0465
+      ],
+      "shape": "cylinder",
+      "size": [
+        0.025,
+        0.025,
+        0.093
+      ],
+      "mass": 0.027,
+      "yaw": 0.0,
+      "rgba": [
+        0.98,
+        0.78,
+        0.2,
+        1.0
+      ],
+      "cls": "toy",
+      "rolling": 0.002,
+      "look": "duck"
+    },
+    {
+      "id": "duck2",
+      "pos": [
+        0.46,
+        0.26,
+        0.0465
+      ],
+      "shape": "cylinder",
+      "size": [
+        0.025,
+        0.025,
+        0.093
+      ],
+      "mass": 0.027,
+      "yaw": 0.0,
+      "rgba": [
+        0.98,
+        0.78,
+        0.2,
+        1.0
+      ],
+      "cls": "toy",
+      "rolling": 0.002,
+      "look": "duck"
+    },
+    {
+      "id": "duck3",
+      "pos": [
+        0.72,
+        -0.12,
+        0.0465
+      ],
+      "shape": "cylinder",
+      "size": [
+        0.025,
+        0.025,
+        0.093
+      ],
+      "mass": 0.027,
+      "yaw": 0.0,
+      "rgba": [
+        0.98,
+        0.78,
+        0.2,
+        1.0
+      ],
+      "cls": "toy",
+      "rolling": 0.002,
+      "look": "duck"
+    }
+  ],
+  "basket": null,
+  "goal_width": 0.0,
+  "attacks": {},
+  "collision": "all",
+  "cove": 0.0,
+  "physics_dt": 0.002,
+  "version": 1
+}

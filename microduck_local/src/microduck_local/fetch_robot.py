@@ -80,12 +80,27 @@ def main(argv: list[str] | None = None) -> None:
             contract_id = ""
             try:
                 body = registry.get(body_id)
-                state = "ready" if body.ready() else "not fetched"
-                contract_id = body.contract().id
+                is_ready = body.ready()
+                state = "ready" if is_ready else "not fetched"
+                # Only a FETCHED body is asked. A level-0 body reads its
+                # contract id off the compiled model (`robots/mjcf_body.py`),
+                # so asking an undownloaded one raises the very "no model
+                # here" error this listing exists to replace with a hint —
+                # and the traceback took the whole table down with it, after
+                # four rows had already printed. Found by `asimov1`, the
+                # first body added on a machine where every other one was
+                # already downloaded.
+                if is_ready:
+                    contract_id = body.contract().id
             except KeyError:
                 state = "not fetched"
             except NotImplementedError:
                 contract_id = "no contract declared"
+            except (OSError, RuntimeError, ValueError):
+                # A cache that is present but broken is an ABSENCE here, not
+                # an exception — `robots/registry.py`'s rule, applied to the
+                # one column that opens the model.
+                contract_id = "unreadable"
             # A trailing space, not only a width: a namespaced contract id is
             # 34 characters (`mjcf-menagerie:trs_so_arm100-18-v0`) and ran
             # straight into the command with none. Budgeting characters is

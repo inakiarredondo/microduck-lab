@@ -19,7 +19,7 @@ import onnxruntime as ort
 #: millimetres.
 DISTURBED_M = 0.005
 
-from microduck_local.robots.moss_env import MossApproachEnv
+from microduck_local.robots.moss_env import MossApproachEnv, eval_env_kwargs
 
 
 def main() -> None:
@@ -31,7 +31,8 @@ def main() -> None:
     arrived = touched = 0
     shifts, shells, steps = [], [], []
     for seed in range(seeds):
-        env = MossApproachEnv(seed=seed, approach_rung=rung)
+        env = MossApproachEnv(seed=seed, approach_rung=rung,
+                              **eval_env_kwargs(path))
         obs, _ = env.reset()
         start = np.array(env.data.xpos[env.can_body][:2], float)
         info, worst_shell, worst_shift = {}, 0.0, 0.0

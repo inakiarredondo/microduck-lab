@@ -20,6 +20,12 @@ import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { fetchScene, type DuckFrame, type Scene } from "@/lib/lab";
+import { readFps } from "@/lib/fps";
+
+/** Below this the stage is visibly stuttering rather than merely not pinned
+ *  to the display's refresh — the HUD turns the number amber there, the same
+ *  warning colour RTF uses when the lab is behind what was asked. */
+const FPS_LOW = 30;
 import { assignDrag, nearestDuck, type AssignTarget } from "@/lib/assign";
 import { getSelectedDuck, setSelectedDuck } from "@/lib/select";
 import { loadJSON, saveJSON } from "@/lib/persist";
@@ -31,6 +37,9 @@ import {
   cameraKeyDown,
   cameraKeyUp,
   cameraKeysClear,
+  homeView,
+  SIM_HOME,
+  SIM_HOME_ROOM_M,
 } from "@/lib/camera";
 import {
   depthColor,
@@ -44,7 +53,7 @@ import {
   saveRecording,
   SimClient,
   capturePose,
-  fetchG1Scene,
+  fetchPersonScenes,
   detectionBox,
   detectionRay,
   headCameraPose,
@@ -79,6 +88,7 @@ import { CamOverlay } from "./SimCamView";
 import { MossMapOverlay } from "./SimMossMap";
 import { isDuck, robotCount, robotLook } from "@/lib/robots";
 import CameraKeys from "./CameraKeys";
+import StageFog from "./StageFog";
 import { useTruckSwipe } from "./useTruckSwipe";
 import { CaptureCanvas, Snapshotter } from "./Capture";
 import { SimRecord } from "./SimRecord";
@@ -87,7 +97,7 @@ import { PANEL, PanelToggle } from "./Panel";
 import { StateGraphPanel } from "./SimGraph";
 import { consumeDragged, HANDLE, useDrag } from "./useDrag";
 import { applyFloorClick, emptyDraft, SimEditor, type EditorState } from "./SimEditor";
-import { Dynamics, StageEnvironment, Statics } from "./SimStage";
+import { Dynamics, FpsMeter, StageEnvironment, Statics } from "./SimStage";
 
 const BG = "#101216";
 // Panel geometry: everything overlaid on the room is inset PAD from the edge,
@@ -161,8 +171,12 @@ function twistFromKeys(h: Held): [number, number, number] {
 }
 const DRIVE_KEYS = new Set(["w", "a", "s", "d", "q", "e", "arrowup", "arrowdown", "arrowleft", "arrowright"]);
 
-// Shift+R flies back here — the Canvas's own opening pose.
-const HOME_CAM = { p: [2.2, 1.6, 2.4] as const, t: [0, 0.12, 0] as const };
+// Shift+R flies back to the Canvas's own opening pose, SCALED BY THE ROOM
+// (lib/camera.SIM_HOME): 3.58 m of orbit radius frames the 3.5 x 3.0 m
+// playroom it was tuned on, and the rooms this lab ships run from MOSS's
+// 2.6 m yard to the Asimov's 8 m hall — where that reset lands you inside the
+// walls. The subject here is the ROOM, not a robot: that is what the page is
+// for, and `record-world`'s fixed cameras already frame on `max(floor)`.
 // Must be a stable reference: this component re-renders every 250 ms on the
 // status tick, and a fresh [0, 0.12, 0] literal each time would let r3f
 // re-apply the prop and snap the target back while you are trucking.
@@ -1444,7 +1458,12 @@ function DuckVoices({ client, sound }: { client: SimClient; sound: boolean }) {
 
 export default function SimViewer() {
   const [scene, setScene] = useState<Scene | null>(null);
-  const [g1Scene, setG1Scene] = useState<Scene | null>(null);
+  // body id -> meshes, one per walking-robot person kind in the scenario.
+  // A `null` value is a fetch that FAILED; a kind with no key yet is one
+  // still in flight. SimStage needs the two apart — the capsule is the right
+  // fallback for a robot whose meshes 404 and the wrong one for a robot that
+  // is one localhost round-trip from arriving (it drew, then popped).
+  const [personScenes, setPersonScenes] = useState<Record<string, Scene | null>>({});
   // Mesh sets for the non-duck BODIES a room holds (a MARS in the playroom,
   // a Menagerie model on a floor), by robot id. Filled on demand from the
   // frame stream — the same pattern the lab page uses — and never keyed on
@@ -1524,8 +1543,9 @@ export default function SimViewer() {
   const [allBrains, setAllBrains] = useState(() => loadJSON("simBrainMenuAll", false));
   const worldRef = useRef<WorldInfo | null>(null);
   worldRef.current = world;
-  const [status, setStatus] = useState<{ rtf: number; mode: string; t: number; events: string[]; kbps: number; tidy: { total: number; inBasket: number; held: string[] } | null; perf: string; soccer: SimFrame["soccer"] }>({
+  const [status, setStatus] = useState<{ rtf: number; fps: number; mode: string; t: number; events: string[]; kbps: number; tidy: { total: number; inBasket: number; held: string[] } | null; perf: string; soccer: SimFrame["soccer"] }>({
     rtf: 0,
+    fps: 0,
     perf: "",
     soccer: null,
     mode: "auto",
@@ -1639,9 +1659,8 @@ export default function SimViewer() {
           setWorld(w);
           if (w.scenario) setPick(w.scenario.name);
           setError(null);
-          if ((w.scenario?.persons ?? []).some((p) => p.kind === "g1")) {
-            fetchG1Scene().then(setG1Scene).catch(() => setG1Scene(null));
-          }
+          fetchPersonScenes(w.scenario?.persons)
+            .then(setPersonScenes).catch(() => setPersonScenes({}));
         })
         .catch(() => {
           setError("duck-lab not reachable on :8788 — start it with `uv run duck-lab …`");
@@ -1658,6 +1677,11 @@ export default function SimViewer() {
       lastBytes.current = { bytes: client.bytes, at: now };
       setStatus((s) => ({
         rtf: f?.rtf ?? 0,
+        // The BROWSER's draw rate, sampled in r3f's loop. Beside RTF because
+        // the two failing look identical on this line and have nothing to do
+        // with each other: a stuttering page next to a healthy RTF is the
+        // renderer, not the lab.
+        fps: readFps(),
         mode: f?.mode ?? "auto",
         t: f?.t ?? 0,
         events: ev.length ? [...s.events, ...ev].slice(-4) : s.events,
@@ -1833,11 +1857,8 @@ export default function SimViewer() {
       setWorld(w);
       setPick(name);
       setSelectedDuck(null);
-      if ((w.scenario?.persons ?? []).some((p) => p.kind === "g1")) {
-        fetchG1Scene().then(setG1Scene).catch(() => setG1Scene(null));
-      } else {
-        setG1Scene(null);
-      }
+      fetchPersonScenes(w.scenario?.persons)
+        .then(setPersonScenes).catch(() => setPersonScenes({}));
     } catch (e) {
       setError(String((e as Error).message ?? e));
       setTimeout(() => setError(null), 4000);
@@ -1910,6 +1931,14 @@ export default function SimViewer() {
   // While editing, the statics on stage are the DRAFT's; the ducks and
   // objects keep streaming from the loaded world underneath.
   const shown = editor ? editor.draft : scenario;
+  // The room's longest side is what the view home is sized by. The DRAFT's
+  // while editing, so stretching a floor in the editor and pressing Shift+R
+  // frames what you just drew rather than what you loaded.
+  const roomM = shown ? Math.max(...shown.floor.size) : SIM_HOME_ROOM_M;
+  const home = useMemo(
+    () => homeView(SIM_HOME, roomM, SIM_HOME_ROOM_M, CAM_MAX_DIST),
+    [roomM]
+  );
   const inspectorTop = frameBox.barBottom + GAP;
   const inspectorDrag = useDrag("simInspectorPos", inspectorRef, inspectorTop, PAD);
   const inspectorY = inspectorDrag.pos?.y ?? inspectorTop;
@@ -1931,7 +1960,7 @@ export default function SimViewer() {
         camera={{ position: [2.2, 1.6, 2.4], fov: 40, near: 0.01, far: 50 }}
       >
         <color attach="background" args={[BG]} />
-        <fog attach="fog" args={[BG, 6, 14]} />
+        <StageFog color={BG} near={6} far={14} farMax={26} target={ORBIT_TARGET} />
         {/* The stage (SimStage.tsx) paints its own floors, walls and contact
             blobs; the lights stay simple and shadow-free — a warm key, a cool
             fill, and a procedural environment map for highlights. */}
@@ -1943,7 +1972,8 @@ export default function SimViewer() {
         <group rotation={[-Math.PI / 2, 0, 0]}>
           <Statics scenario={shown} />
           {editor && <EditorFloor state={editor} onClick={(x, y) => setEditor((st) => (st ? applyFloorClick(st, x, y) : st))} />}
-          {client && <Dynamics scenario={scenario} client={client} g1Scene={g1Scene} />}
+          {client && <Dynamics scenario={scenario} client={client} personScenes={personScenes} duckScene={scene} />}
+          <FpsMeter />
           {scene && client && (
             <SimDucks scene={scene} client={client} robotScenes={robotScenes} />
           )}
@@ -1970,7 +2000,7 @@ export default function SimViewer() {
           maxDistance={CAM_MAX_DIST}
           zoomSpeed={0.4}
         />
-        <CameraKeys home={HOME_CAM} minDist={CAM_MIN_DIST} maxDist={CAM_MAX_DIST} />
+        <CameraKeys home={home} minDist={CAM_MIN_DIST} maxDist={CAM_MAX_DIST} />
         {/* 🎥 record / 📷 shot (SimRecord in the top bar) read the canvas through these */}
         <CaptureCanvas />
         <Snapshotter />
@@ -2108,6 +2138,14 @@ export default function SimViewer() {
           <span style={{ color: behind ? "#f2b632" : undefined }} title={behind ? `${speedLabel(speed)} asked, ${status.rtf.toFixed(2)} managed` : undefined}>
             <Slot w={4}>{status.rtf.toFixed(2)}</Slot>
             {behind ? `/${speedLabel(speed)}` : ""}
+          </span>{" "}
+          {" "}· <span
+            style={{ color: status.fps > 0 && status.fps < FPS_LOW ? "#f2b632" : undefined }}
+            title={"how fast THIS BROWSER is drawing. RTF beside it is how fast the LAB is "
+              + "simulating, and they fail independently: a low fps with a healthy RTF is "
+              + "this page's renderer, not the lab. Under " + FPS_LOW + " is visible stutter."}
+          >
+            <Slot w={3}>{status.fps > 0 ? status.fps.toFixed(0) : "--"}</Slot> fps
           </span>{" "}
           · <Slot w={6} left>{status.mode}</Slot> · <Slot w={3}>{status.kbps.toFixed(0)}</Slot> kB/s
           {status.perf && (
@@ -2462,11 +2500,8 @@ export default function SimViewer() {
             if (w.scenario) setPick(w.scenario.name);
             fetchScenarios().then(setScenarios).catch(() => {});
             setSelectedDuck(null);
-            if ((w.scenario?.persons ?? []).some((p) => p.kind === "g1")) {
-              fetchG1Scene().then(setG1Scene).catch(() => setG1Scene(null));
-            } else {
-              setG1Scene(null);
-            }
+            fetchPersonScenes(w.scenario?.persons)
+              .then(setPersonScenes).catch(() => setPersonScenes({}));
           }}
         />
       )}

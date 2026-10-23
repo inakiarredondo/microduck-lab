@@ -10,12 +10,11 @@ has to keep true, and each one has been shown to fail without it.
 import dataclasses
 import math
 
+import pytest
 
 from microduck_local.brain.runtime import Senses
 from microduck_local.robots import moss
 from microduck_local.sensors.detector import Detection, DetectionFrame
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),

@@ -404,6 +404,14 @@ def main() -> None:
 
     out = RUNS_DIR / args.run_name
     out.mkdir(parents=True, exist_ok=True)
+    # A PREVIOUS run in this directory may have been killed between a
+    # snapshot's temp write and its os.replace. The lab clears those when it
+    # sees the trainer exit, but a CLI run has no lab watching it and a
+    # resumed directory would carry the stale temp forward — so start clean.
+    # (Nothing is writing here yet: this is before the callback exists.)
+    from .run_record import sweep_snapshot_tmps
+    for _stale in sweep_snapshot_tmps(out):
+        print(f"cleared stale {_stale} from a previous interrupted run")
     env_kwargs = env_kwargs_from_args(args)
     # Fork workers BEFORE importing torch. A torch-initialized parent has
     # OpenMP/Accelerate thread pools; forking them deadlocks on macOS.
@@ -435,7 +443,13 @@ def main() -> None:
         # A slot that stays dead maps 0 -> 0 either way, so no existing
         # warm-start changes.
         import numpy as np
-        dead = np.flatnonzero((venv.obs_rms.var < 1e-8)
+
+        # `<=`, not `<`: `distill` writes `obs.var(axis=0) + 1e-8`, so a slot
+        # that never moved lands at EXACTLY 1e-8 and a strict `<` matched none
+        # of them — 0 of 16 on the cloned Asimov get-up, which is every slot
+        # this guard was written for. The comment above knew the value was 1e-8.
+        from microduck_local.export_onnx import DEAD_OBS_VAR
+        dead = np.flatnonzero((venv.obs_rms.var <= DEAD_OBS_VAR)
                               & (np.abs(venv.obs_rms.mean) < 1e-6))
         if dead.size:
             venv.obs_rms.mean[dead] = 0.0
@@ -566,7 +580,14 @@ def main() -> None:
         # and loads live.onnx onto the 🎓 trainee as it improves.
         callbacks.append(_watch_callback_cls(BaseCallback)(
             out, args.steps, args.snap_steps,
-            _spec.get(args.robot).obs_dim,
+            # The ENV's width, not the spec's. They are the same for every
+            # body that publishes its contract unchanged — and deliberately
+            # are not for a CONTROL arm that stacks observation history
+            # (`AsimovGetupRefEnv(history=...)`, roadmap Track 14 phase 2),
+            # where exporting at the spec's 78 would write an ONNX whose input
+            # is a third of what the policy was trained on.
+            int(getattr(model.observation_space, "shape",
+                        (_spec.get(args.robot).obs_dim,))[0]),
             # SB3 keeps the loaded count when reset_num_timesteps is False.
             start_steps=int(model.num_timesteps) if args.init_from else 0))
     model.learn(
@@ -590,7 +611,29 @@ def main() -> None:
                                 "total": int(model.num_timesteps),
                                 "done": True}) + "\n")
     print(f"saved {out}/model.zip + vecnormalize.pkl")
-    print(f"export with: uv run export-walk {out}")
+    # EXPORT IT. `train_behavior` has always ended this way and `train.py`
+    # did not — it printed "export with: uv run export-walk" and left the run
+    # with no `policy.onnx`, which is the file the lab's palette lists a run
+    # BY (`viz_server.discover_policies`). So every task run on this path was
+    # invisible in the lab until somebody hand-exported a directory name they
+    # had no way to see. Measured 2026-10-06, runs with a checkpoint and no
+    # export: g1 52 of 91, moss 73 of 164, and every stage but the last of
+    # the Asimov get-up chains — against 0 for the duck tricks, which take
+    # the other path. The asymmetry WAS the bug.
+    #
+    # Guarded, unlike the sibling: a contract refusal here (a run whose
+    # recorded body disagrees with its checkpoint — `export_contract` exists
+    # to catch exactly that) must not throw away training that finished. Say
+    # so and leave the checkpoint, which `export-walk` can still be pointed
+    # at by hand.
+    try:
+        from microduck_local.export_onnx import export
+        export(out, out / "policy.onnx")
+        print(f"exported {out}/policy.onnx")
+    except Exception as exc:
+        print(f"NOT exported ({type(exc).__name__}: {exc})")
+        print(f"the checkpoint is saved; export by hand with: "
+              f"uv run export-walk {out}")
 
 
 if __name__ == "__main__":

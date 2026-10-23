@@ -203,3 +203,104 @@ def test_a_default_fidelity_clone_matches_the_teacher_and_does_not_fall(tmp_path
     t_speed = float(np.mean([r["speed"] for r in teach]))
     assert falls == 0.0, f"the clone fell {falls:.0%} of episodes at the default budget"
     assert speed > 0.8 * t_speed, f"clone {speed:.3f} against teacher {t_speed:.3f}"
+
+
+def test_a_teachers_dead_observation_slot_is_refused_before_training():
+    """A slot the teacher's data never moved is a bug the LOSS CANNOT SEE.
+
+    `scripts/distill_getup.py` stepped the physics by hand and never wrote
+    `env.last_action`, so all 23 of `obs[55:78]` were exactly 0.0 in all
+    104 000 samples. The fit converged to 0.000228 rad^2 — an 11.6x improvement
+    over the previous arm, and the best clone fidelity this robot has had — and
+    the student stood **23/24** when driven with those slots still zeroed. Fed
+    the real previous action, which is what the deployment contract puts there,
+    it stood **0/24**. The loss could not see it because the loss was computed
+    on the same dead data.
+
+    `twist_cmd` is legitimately flat for a get-up (nothing is commanded), so
+    the caller declares the slots it MEANS to leave dead and everything else
+    raises.
+    """
+    from microduck_local.distill import dead_slots
+
+    rng = np.random.default_rng(0)
+    obs = rng.normal(size=(400, 78))
+    obs[:, 6:9] = 0.0                                   # twist_cmd, on purpose
+    assert dead_slots(obs, "asimov1", ("twist_cmd",)) == []
+
+    obs[:, 55:78] = 0.0                                 # THE BUG
+    with pytest.raises(ValueError, match=r"last_action \(obs\[55:78\]"):
+        dead_slots(obs, "asimov1", ("twist_cmd",))
+
+    # And an undeclared flat slot is not excused by declaring a DIFFERENT one.
+    with pytest.raises(ValueError, match="twist_cmd"):
+        dead_slots(obs, "asimov1", ("last_action",))
+
+
+def _repo_runs():
+    """`runs/` of the real checkout, not a tmp_path a fixture redirected to."""
+    from pathlib import Path
+    return Path(__file__).resolve().parent.parent / "runs"
+
+
+def test_a_distilled_student_must_be_driven_through_its_normalizer():
+    """`PPO.predict(obs)` on a distilled student is WRONG, and silently so.
+
+    `distill.fit` trains the student on the VecNormalize view and leaves the
+    stats in `vecnormalize.pkl` for `export_onnx` to bake in later. Drive the
+    checkpoint directly and the net gets raw observations. Measured on
+    teach-asimov_getup_clip-0e31e5, which `verify_run` scores at 34/36 rose
+    and 26/36 still up:
+
+        PPO.predict on raw obs                     stood 0/8
+        policy.onnx (normaliser baked in)          stood 8/8
+        PPO.predict + VecNormalize stats by hand   stood 8/8
+
+    `scripts/distill_getup.py` drove its DAgger rollouts the first way, so
+    every student state it ever aggregated came from a policy that cannot
+    stand — which is the likeliest explanation for plain DAgger "hurting"
+    (aggregate MSE 0.000176 -> 0.000470, rise 24/24 -> 20/24) and means DAgger
+    had never actually been tested on this task.
+
+    This pins the property rather than the rollout: the stats are real, and a
+    student driver that applies them does not agree with one that does not.
+    """
+    import pickle
+
+    import numpy as np
+
+    run = _repo_runs() / "teach-asimov_getup_clip-0e31e5"
+    if not (run / "vecnormalize.pkl").is_file() or not (run / "model.zip").is_file():
+        pytest.skip("the reference clone run is not on this machine")
+
+    with open(run / "vecnormalize.pkl", "rb") as fh:
+        vn = pickle.load(fh)
+    mu = np.asarray(vn.obs_rms.mean, np.float64)
+    va = np.asarray(vn.obs_rms.var, np.float64)
+
+    # if the stats were identity the distinction would not matter — and a
+    # dead slot would make them identity on that slot, which `dead_slots`
+    # already raises on. Assert they are real.
+    assert np.abs(mu).max() > 1e-3, "normalizer mean is all but zero"
+    assert va.min() > 0.0 and np.ptp(va) > 1e-6, (
+        "normalizer variance is flat — nothing is actually being normalised")
+
+    from stable_baselines3 import PPO
+
+    net = PPO.load(str(run / "model"), device="cpu")
+    rng = np.random.default_rng(0)
+    # observations drawn where the policy actually lives, not N(0,1)
+    sample = (mu + np.sqrt(va) * rng.normal(0, 1, size=(16, len(mu)))
+              ).astype(np.float32)
+
+    raw = np.stack([net.predict(o, deterministic=True)[0] for o in sample])
+    nrm = np.stack([
+        net.predict(np.clip((o - mu) / np.sqrt(va + vn.epsilon),
+                            -vn.clip_obs, vn.clip_obs).astype(np.float32),
+                    deterministic=True)[0]
+        for o in sample])
+    gap = float(np.abs(raw - nrm).max())
+    assert gap > 1e-3, (
+        f"raw and normalised driving agree to {gap:.2e} — either the stats "
+        "stopped being applied or this policy no longer depends on them, and "
+        "in both cases the guard above is no longer testing anything")

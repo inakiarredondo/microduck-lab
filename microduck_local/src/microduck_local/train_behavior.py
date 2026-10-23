@@ -480,6 +480,14 @@ def main() -> None:
     run_name = args.run_name or time.strftime(f"{b.id}-%Y%m%d-%H%M%S")
     out = RUNS_DIR / run_name
     out.mkdir(parents=True, exist_ok=True)
+    # A PREVIOUS run in this directory may have been killed between a
+    # snapshot's temp write and its os.replace. The lab clears those when it
+    # sees the trainer exit, but a CLI run has no lab watching it and a
+    # resumed directory would carry the stale temp forward — so start clean.
+    # (Nothing is writing here yet: this is before the callback exists.)
+    from .run_record import sweep_snapshot_tmps
+    for _stale in sweep_snapshot_tmps(out):
+        print(f"cleared stale {_stale} from a previous interrupted run")
     # Weights go in behavior.json so a restarted/inspected run can't silently
     # train under a different scorecard than the one on record.
     # The clip too: an imitation run is about ONE authored motion, and the
@@ -507,6 +515,18 @@ def main() -> None:
             record[key] = chosen.strip()
     if args.init_from:
         record["init_from"] = str(args.init_from)
+    # The knobs a stage trains behind arrive as process ENVIRONMENT, and until
+    # 2026-10-04 none was written down: ~130 MICRODUCK_* vars reach the
+    # behaviour envs (spawn families, the actuator, a ball's FOV, every drill
+    # rung) and `behavior.json` recorded none of them, so no consumer could ask
+    # the run what it trained behind even in principle. The task path has had
+    # this since `Body.train_env_kwargs`; this is the duck path catching up.
+    # A RECORD, not a replay spec: a drill crutch must still come OFF for the
+    # honest measurement, which is why nothing reads these back automatically.
+    knobs = {k: v for k, v in sorted(os.environ.items())
+             if k.startswith("MICRODUCK_") and not k.endswith("_DIR")}
+    if knobs:
+        record["env"] = knobs
     if not record.get("title"):
         print(f"{run_name}: no --title — a run with no name but its own is a "
               "run nobody can read a day later (AGENTS.md, 'Every run is a record')")

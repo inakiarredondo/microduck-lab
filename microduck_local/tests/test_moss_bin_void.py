@@ -8,15 +8,13 @@ seeds lose a prop into it, where it rides for 123-207 s of a 300 s run and is
 never collected (`scripts/probe_moss_pin.py`).
 """
 import json
-import math
 from pathlib import Path
 
 import mujoco
 import numpy as np
+import pytest
 
 from microduck_local.robots import moss
-
-import pytest
 
 pytestmark = pytest.mark.skipif(
     not moss.moss_ready(),
