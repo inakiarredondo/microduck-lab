@@ -5,9 +5,11 @@ Train reinforcement-learning policies for the
 open-source ~25 cm bipedal robot, **on an ordinary Apple Silicon Mac with no
 CUDA GPU**. Watch every policy walk, learn, and backflip live in your browser —
 then put the ducks in a room with simulated senses and a brain, and watch them
-follow a person, tidy a playroom, or play 3v3 soccer. Two more bodies ride the
-same harness: Unitree's **G1** humanoid, and **MARS**, [Innate](https://www.innate.bot)'s
-wheeled robot with an arm.
+follow a person, tidy a playroom, or play 3v3 soccer. Four more bodies ride the
+same harness: Unitree's **G1** humanoid, **MARS**, [Innate](https://www.innate.bot)'s
+wheeled robot with an arm, **MOSS**, Show Robotics' tracked litter picker, and
+Menlo Research's 1.2 m **Asimov 1** humanoid — which learned here, from
+scratch, to **get up off the floor**.
 
 ![The duck lab viewer: nine ducks running live, mid-backflip and mid-headstand](docs/media/viewer.png)
 
@@ -23,7 +25,32 @@ wheeled robot with an arm.
 |---|---|
 | ![G1 front kick: the authored clip beside the trained policy](docs/media/g1-kick.gif) | ![Five ducks following a G1 around a room](docs/media/sim-flock.gif) |
 
-## What's new (September 2026)
+| Somebody else's robot: Menlo's Asimov 1 gets up off the floor — trained here from scratch, then handing to **their** walk policy at 1.8 s (real time) | MOSS, on tracks, clearing a yard of litter into the bin on its back (4x speed) |
+|---|---|
+| ![Asimov 1 rising from face down and then standing perfectly still](docs/media/asimov-getup.gif) | ![MOSS picking up litter and dropping it in its bin](docs/media/sim-moss-tidy.gif) |
+
+## What's new
+
+### October 2026 — somebody else's robot, and it gets up off the floor
+
+- **[A fifth body, Menlo Research's Asimov 1](#somebody-elses-robot-menlos-asimov-1)**
+  — the first one here that is *nobody's idea but theirs*: a 1.2 m, 32 kg,
+  23-joint open-source humanoid, fetched at a pinned sha, never vendored, and
+  proven by running **their own shipped walk policy in this repo's MuJoCo**
+  before anything was trained.
+- **[It gets up off the floor](#and-it-gets-up-off-the-floor)**, from face
+  down, **24/24** — trained from scratch on a Mac CPU, inside the robot's
+  published speed-torque envelope, handing control to Menlo's own walk policy
+  the moment it is standing. Published as
+  [JonathanHawkins/asimov1-getup-handoff](https://huggingface.co/JonathanHawkins/asimov1-getup-handoff).
+- **Two findings that cost more than the policy did.** A torque limit with no
+  speed term is a robot that is weak standing still and unlimited once moving,
+  and ours exceeded the vendor's ratings on **82 %** of rise frames before
+  anyone checked. And the twitch at the top of the rise was never a reward
+  problem — nine terms failed, **another controller** fixed it in an
+  afternoon.
+
+### September 2026
 
 - **[`/sim`, the world page](#sim-rooms-senses-and-brains)** is built: whole
   rooms in one MuJoCo model, the robot's simulated senses (8×8 ToF depth,
@@ -66,9 +93,10 @@ and new tricks, built on the same MJCF robot model, the same 61-obs /
 here ports straight to the official stack for the final sim2real run, and the
 ONNX you export is drop-in compatible with the official tooling.
 
-**Not affiliated with Pollen Robotics, Innate or Unitree.** Two of Pollen's
-repos are used as side-by-side checkouts (see setup); the G1 and MARS models
-are downloaded at pinned shas from their upstream repositories and are not
+**Not affiliated with Pollen Robotics, Innate, Unitree, Show Robotics or
+Menlo Research.** Two of Pollen's repos are used as side-by-side checkouts
+(see setup); the G1, MARS, MOSS and Asimov 1 models are downloaded at pinned
+shas from their upstream repositories, with their own licences, and are not
 vendored here.
 
 ## What's in the box
@@ -99,12 +127,14 @@ vendored here.
     the rejected experiments written down next to the shipped ones
   - `train-brain`: train the *brain* (the person-follower) with PPO, on top of
     a frozen walking policy
-  - `--robot g1` / `--robot mars` / `--robot moss`: the trainer, exporter,
-    renderer, lab and `/sim` are body-agnostic behind a `Body` registry
+  - `--robot g1` / `--robot mars` / `--robot moss` / `--robot asimov1`: the
+    trainer, exporter, renderer, lab and `/sim` are body-agnostic behind a
+    `Body` registry
     ([`robots/`](microduck_local/src/microduck_local/robots)) — the 29-joint
     Unitree G1 (`fetch-g1`), Innate's wheeled MARS and its arm tasks
     (`fetch-robot mars`), Show Robotics' tracked MOSS and its litter-picking
-    brain (`fetch-robot moss`), and any MuJoCo Menagerie model as a
+    brain (`fetch-robot moss`), Menlo Research's 1.2 m Asimov 1 humanoid and
+    its get-up (`fetch-robot asimov1`), and any MuJoCo Menagerie model as a
     stand-and-look body (`fetch-robot menagerie:unitree_go2`)
 - **`duck-viewer/`**: Next.js + react-three-fiber viewer, three pages
   - **`/` the lab**: many robots side by side, live over WebSocket at 25 Hz;
@@ -665,6 +695,125 @@ more for driving than for grasping, so every drive gain here is picked against
 a number that will change. The rest of the MOSS findings, including the ones
 that measured null and the floor scrape still open, are in
 [docs/roadmap.md](docs/roadmap.md).
+
+## Somebody else's robot: Menlo's Asimov 1
+
+![Asimov 1 face down on the floor, pushing up onto its elbows, standing by 2.2 s, then holding perfectly still for six seconds under Menlo's own walk policy](docs/media/asimov-getup.gif)
+
+The G1, MARS and MOSS are bodies *we* chose. **Asimov 1** is the first one
+here where the robot, the model, the observation contract and a shipped policy
+are all somebody else's, and none of it was invented to fit:
+[Menlo Research](https://github.com/menloresearch/asimov-1)'s open-source
+1.2 m, 32 kg, 23-joint humanoid, published under GPL-2.0 / CERN-OHL-S-2.0 with
+a BSD-3-Clause walk policy. Both are **fetched at a pinned sha and neither is
+vendored** — the licences travel into the cache and get printed, because a
+licence that stayed on GitHub is a licence nobody read.
+
+```bash
+uv run fetch-robot asimov1                                   # model + meshes + both licences
+uv run python -m microduck_local.robots.asimov_walk --fetch  # their policy
+uv run python scripts/probe_asimov_walk.py                   # does it walk HERE?
+uv run duck-lab .cache/asimov_1/policy/policy.onnx           # then open localhost:63317
+```
+
+**The proof the contract is theirs and not invented is that their own policy
+walks in this repo's MuJoCo** — 0.44 m/s at a 0.5 command, no falls. That
+probe is the gate everything else stands on, because a wrong observation
+permutation still produces actions and still moves the robot; it just falls
+over, and every measurement after it describes a different robot.
+
+### ...and it gets up off the floor
+
+Trained here **from scratch** — random initialisation, no distillation, no
+imitation loss, no weights from anyone else's get-up, a 38-deep warm-start
+chain whose root records `init_from: None` — on a Mac CPU. From face down,
+inside the robot's **published speed-torque envelope**, handing control to
+**Menlo's own walk policy** the moment it is standing:
+
+| from | rises | still standing at 8 s |
+|---|---|---|
+| prone (face down) | **24/24** | **24/24** |
+| supine (on its back) | 15/24 | 15/24 |
+
+24 episodes a row, seeds 0–23. Once settled it sits **1.30°** of mean joint
+error from the default pose and survives **24/24** shoves. The clip above is a
+single uncut 8-second episode at real speed, picked as the best of six on
+contacts.
+
+```bash
+uv run python scripts/getup_acceptance.py <run> --episodes=24 --pose=prone --handoff
+uv run render-rollout --policy runs/<run>/policy.onnx \
+    --handoff .cache/asimov_1/policy/policy.onnx \
+    --env MICRODUCK_ASIMOV_GETUP_POSE=prone --camera three-quarter --out /tmp/rr
+```
+
+Three things cost far more than the policy did, and they are the transferable
+part:
+
+- **A torque limit with no speed term is the strongest claim in a robot
+  file.** Asimov's envs clamped the position servos at Menlo's URDF
+  `<limit effort=>` — correct, per-group, read from the vendor — and applied
+  it *flat*. That describes a robot which is weak standing still and unlimited
+  once moving, so the cheapest route through any reward is to fling
+  everything: the get-up exceeded the published ratings on **82 % of rise
+  frames, max 5.29×**, and under the real envelope went **48/48 → 0/48**
+  (paired, same seeds, p = 0.0000). The real model is a speed-torque curve, it
+  is published, and it is ~10 lines — a MuJoCo position servo already clamps
+  `kp*(ctrl−q) − kd*qd` to `actuator_forcerange`, so rewriting that range from
+  the live `qvel` *is* the whole model ([`robots/asimov_motor`](microduck_local/src/microduck_local/robots/asimov_motor.py)).
+  A crude limit turned out to be worse than none, and the envelope was rarely
+  the obstacle: another team's policy rises 24/24 inside the same limits.
+
+- **When the deliverable is "and then it keeps going", the answer may be
+  another controller, not another reward term.** Nine reward terms and eleven
+  runs went into making it *hold* the stand it had learned to reach, and every
+  one was a null or a regression — the rise arrives at the top with 0.89 m/s
+  of trunk speed and a trained passive stance absorbs 0.22. The same was true
+  of the twitch at the top: `joint_vel=7` over 20 M steps moved the worst limb
+  from **326 to 298 °/s** while eating 65 % of the reward budget. Handing to
+  the vendor's walker instead took the worst joint from **252 °/s to 2.3**,
+  with no rises lost. The giveaway was free: under zero action the standing
+  plant jiggles **0.000 rad/s**, so the twitch was the controller, never the
+  physics. *Price the do-nothing policy's value of a property before paying a
+  term to change it.*
+
+- **A switch between two policies has to read what the robot can sense, and
+  its thresholds are chosen on a cost, not on agreement.** The obvious
+  predicate — trunk height, MuJoCo's contact list — uses quantities no Asimov
+  has, which would have defeated the point of staying inside their 78-float
+  contract. Rebuilt from the observation vector it reads projected gravity
+  plus two encoder channels (elbow and ankle: a robot propped on its forearms
+  reads upright to an IMU). IMU uprightness *alone* agrees with the privileged
+  test on **99.0 %** of 15,458 frames and still costs 11 of 48 rises, because
+  a latching switch cannot undo a false fire and that 1 % sits exactly on the
+  boundary. **Frame agreement is the wrong objective whenever the two error
+  directions cost different amounts.**
+
+**The honest limits, in full.** It reads **390 floats** — five stacked frames
+of Menlo's 78 — so it will not hot-swap onto the robot or load in their
+viewer, and needs a ~12-line on-device ring buffer. That history is
+load-bearing *to these weights* (frozen to one frame they rise 0/48), which is
+covariate shift and says nothing about what 78 observations can learn:
+one-frame runs in this same repo rise from the floor 20/36 and 17/36 against a
+zero-action floor of 0/36. It **requires** the speed-torque envelope it
+trained in — under a flat clamp the same weights fall to 14/24 rises and 6/24
+stays. The **deployable** switch costs an episode: 23/24 stays against the
+privileged test's 24/24, and an independent re-scorer reading raw physics says
+22/24, so read it as **22–24 of 24**. It gets up by **spreading**, median peak
+foot span **0.888 m** against a 0.215 m natural stance, and a narrow get-up is
+a different problem that is not solved here. Supine is much weaker than prone,
+and it trained on prone. And **nothing here has ever run on an Asimov** — this
+is simulation, and the sim2real evidence on this robot is Menlo's, measured on
+their stack.
+
+The policy, its spec, both joint orders and a self-contained MuJoCo runner
+(ring buffer, envelope, observation-only switch, walker handoff — it
+reproduces the training observation to **6e-08**) are published as
+[JonathanHawkins/asimov1-getup-handoff](https://huggingface.co/JonathanHawkins/asimov1-getup-handoff),
+Apache-2.0. Bringing in your own robot:
+[`.claude/skills/add-a-robot/SKILL.md`](.claude/skills/add-a-robot/SKILL.md)
+is the route, the number that settles each step, and the fourteen traps hit
+doing this one for real.
 
 ## `/train`: graphs for brain-training runs
 

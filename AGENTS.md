@@ -68,7 +68,7 @@ by `setup.sh`; upstream no longer vendors them).
   actually does (works as plain documentation for any agent, not just Claude).
 - `.claude/skills/add-a-robot/SKILL.md` — how to bring SOMEBODY ELSE'S robot
   in: the licence check, the pinned fetch, the ladder from "on the stage" to
-  "it trains", the number that settles each step, and the eight traps hit
+  "it trains", the number that settles each step, and the 14 traps hit
   doing it for real. Read it before adding a body or touching `robots/`.
 - `.claude/skills/record-world/SKILL.md` — how to *record* a world scenario
   (living room, playroom, soccer pitch) to video + a contact sheet + an events
@@ -96,15 +96,34 @@ by `setup.sh`; upstream no longer vendors them).
   fetched and neither is vendored. The proof the contract is theirs and not
   invented is that their own shipped policy walks in this repo's MuJoCo
   (0.44 m/s at a 0.5 command, no falls). Nothing here has run on an Asimov.
-  **It also GETS UP** — `asimov-getup-h5-dag`, 40/48 rises and 28/48 still
-  standing at the buzzer, inside Menlo's published speed-torque envelope
-  (`robots/asimov_motor`, `actuator_force="dc"`). Two caveats that belong in
-  the same breath: it reads **390 floats** (5 stacked frames of their 78), so
-  it will not hot-swap or load in their viewer and needs an on-device ring
-  buffer — the 5-frame history is LOAD-BEARING, not a convenience, and one
-  frame is 0/48 — and it **sprawls 0.944 m** on the way up, inherited from the
-  openhorizon-labs demonstration it was cloned from (which sprawls 0.955 m).
-  A narrow get-up needs a narrow demonstration, not a better clone.
+  **It also GETS UP, from scratch** — `teach-asimov_getup-19587b`, **24/24
+  rises and 24/24 still standing** at the buzzer from face down, inside
+  Menlo's published speed-torque envelope (`robots/asimov_motor`,
+  `actuator_force="dc"`), handing to Menlo's own walk policy the moment it is
+  up. Random init, no distillation, no OpenHorizon lineage: a 38-deep
+  warm-start chain whose root records `init_from None`. Published as
+  [JonathanHawkins/asimov1-getup-handoff](https://huggingface.co/JonathanHawkins/asimov1-getup-handoff).
+  The earlier `asimov-getup-h5-dag` (40/48 and 28/48, cloned from the
+  openhorizon-labs demonstration, sprawling 0.944 m) is its predecessor, not
+  the shipped one. Five caveats that belong in the same breath. It reads
+  **390 floats** (5 stacked frames of their 78), so it will not hot-swap or
+  load in their viewer and needs an on-device ring buffer — the 5-frame
+  history is load-bearing TO THIS POLICY (frozen to one frame it rises 0/48),
+  **which is covariate shift and says nothing about what 78 obs can learn**:
+  one-frame runs in this very repo rise from the floor 20/36 and 17/36
+  against a zero-action 0/36, and a matched-steps 1-frame vs 5-frame A/B came
+  back identical waypoint for waypoint. On 2026-10-23 that ablation was
+  written into a draft issue to Menlo as "the 78-obs contract probably can't
+  support a get-up", which this repo's own runs refute. An ablation that
+  removes an input a policy was TRAINED on measures the policy's dependence,
+  never the contract's capacity. It **requires** the `dc` envelope — under a
+  flat per-group clamp the same weights fall to 14/24 rises and 6/24 stays.
+  The **deployable** switch, the one built only from what the robot senses,
+  costs an episode: 23/24 stays against the privileged test's 24/24, and an
+  independent re-scorer reading raw physics says 22/24, so the honest figure
+  is **22-24 of 24**. **Supine is 15/24** and it trained on prone. And it
+  **sprawls 0.888 m** on the way up against a 0.215 m natural stance: a
+  narrow get-up needs a narrow demonstration, not a better clone.
 - **Any Mac (tuned on Apple Silicon), CPU-only:** everything in this repo —
   training (`train-walk`, `train-behavior`), eval, ONNX export, rendering,
   the lab + viewer. Linux works too (set `MUJOCO_GL=egl` for offscreen

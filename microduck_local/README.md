@@ -822,14 +822,22 @@ handing to the walker drops that to **2.3 deg/s** with no rises lost. Nine
 reward terms aimed at the same problem were nulls — the plant does not buzz
 (zero action standing reads **0.000 rad/s**), so the twitch was the controller,
 not the physics. The switch reads only projected gravity and two encoder
-channels, so it could run on hardware; it costs nothing against a privileged
-test that uses trunk height and contacts.
+channels, so it could run on hardware. It costs **one episode in 24**, not
+nothing: 23/24 still standing against the privileged test's 24/24, and an
+independent re-scorer reading raw physics says 22/24, so the honest figure is
+**22-24 of 24**. The "costs nothing" this file used to carry came from a
+scorer that indexed the slot-ordered observation block with the action-order
+joint list, so its "elbow" clause read a wrist and its "ankle" clause read a
+knee. It never looked at an ankle, fired anyway, and scored 24/24.
 
 **Four honest limits.** It reads **390 floats** (5 stacked frames of their 78),
 so it will not hot-swap or load in Menlo's viewer and needs an on-device ring
-buffer — and the history is load-bearing, **0/48** frozen to one frame against
-48/48. It **requires** the `dc` envelope: under a flat clamp the same weights
-fall to 14/24 rises and 6/24 stays. The stance is wide, median peak foot span
+buffer. That history is load-bearing *to these weights* — **0/48** frozen to
+one frame against 48/48 — which is covariate shift and says nothing about what
+78 observations can learn: one-frame runs in this same repo rise from the floor
+20/36 and 17/36 against a zero-action floor of 0/36. It **requires** the `dc`
+envelope: under a flat clamp the same weights fall to 14/24 rises and 6/24
+stays. The stance is wide, median peak foot span
 **0.888 m** against a natural 0.215. And **nothing here has run on an Asimov**.
 
 Adding your own robot: `.claude/skills/add-a-robot/SKILL.md` is the route, the
