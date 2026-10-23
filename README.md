@@ -25,7 +25,7 @@ scratch, to **get up off the floor**.
 |---|---|
 | ![G1 front kick: the authored clip beside the trained policy](docs/media/g1-kick.gif) | ![Five ducks following a G1 around a room](docs/media/sim-flock.gif) |
 
-| Somebody else's robot: Menlo's Asimov 1 gets up off the floor — trained here from scratch, then handing to **their** walk policy at 1.8 s (real time) | MOSS, on tracks, clearing a yard of litter into the bin on its back (4x speed) |
+| Somebody else's robot: Menlo's Asimov 1 gets up off the floor — trained here from scratch, then handing to **their** walk policy the moment it is up (real time) | MOSS, on tracks, clearing a yard of litter into the bin on its back (4x speed) |
 |---|---|
 | ![Asimov 1 rising from face down and then standing perfectly still](docs/media/asimov-getup.gif) | ![MOSS picking up litter and dropping it in its bin](docs/media/sim-moss-tidy.gif) |
 
@@ -736,9 +736,10 @@ inside the robot's **published speed-torque envelope**, handing control to
 | supine (on its back) | 15/24 | 15/24 |
 
 24 episodes a row, seeds 0–23. Once settled it sits **1.30°** of mean joint
-error from the default pose and survives **24/24** shoves. The clip above is a
-single uncut 8-second episode at real speed, picked as the best of six on
-contacts.
+error from the default pose and survives **24/24** shoves. The clip above is
+one uncut episode at real speed, filmed through the lab's own viewer with the
+🎥 record panel — face down at t=0, standing at 1.5 s, then held by Menlo's
+walker for the rest of the take.
 
 ```bash
 uv run python scripts/getup_acceptance.py <run> --episodes=24 --pose=prone --handoff
