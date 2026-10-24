@@ -127,14 +127,18 @@ class FloorPlan:
         return out
 
     def scenario(self, spawn_room: str | None = None, yaw: float = 0.0,
-                 policy: str = "pollen:roller", brain: str | None = None) -> Scenario:
+                 brain: str | None = None, mode: str = "roller") -> Scenario:
+        """The plan as a world with one duck: on skates (`mode="roller"`,
+        driven by `pollen:roller`) or on its feet (`"walk"`, the shipped
+        walker, the full-collision body)."""
+        from ..brain.skate import MODES
         ducks = []
         if spawn_room is not None:
             x, y = self.open_point(spawn_room)
-            ducks.append(Duck("d0", (x, y, yaw), policy=policy, brain=brain))
+            ducks.append(Duck("d0", (x, y, yaw), policy=MODES[mode]["policy"], brain=brain))
         w, h = self.size
         return Scenario(name=self.name, floor=(w, h), boxes=self.boxes(), ducks=ducks,
-                        collision="rollers")
+                        collision=MODES[mode]["collision"])
 
     # -- loading -----------------------------------------------------------
     @classmethod

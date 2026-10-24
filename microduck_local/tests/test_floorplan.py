@@ -9,7 +9,7 @@ import pytest
 
 from microduck_local.brain.brain_env import POLICIES_DIR, onnx_infer
 from microduck_local.brain.runtime import Senses, attach_world
-from microduck_local.brain.skate import OccupancyGrid, SkateParams, SkateRoute
+from microduck_local.brain.skate import MODES, OccupancyGrid, SkateParams, SkateRoute
 from microduck_local.world import World
 from microduck_local.world.compose import ROBOT_XML
 from microduck_local.world.floorplan import FLOOR, OBSTACLE, PRIVATE_DIR, STAIRS, FloorPlan
@@ -109,22 +109,26 @@ def test_the_private_directory_is_ignored_by_git():
     assert r.returncode == 0, "private/ must be git-ignored: a home's plan never enters the repo"
 
 
-@pytest.mark.skipif(not ROBOT_XML["rollers"].exists() or not (POLICIES_DIR / "roller.onnx").exists(),
+@pytest.mark.skipif(not ROBOT_XML["rollers"].exists() or not (POLICIES_DIR / "roller.onnx").exists()
+                    or not (POLICIES_DIR / "alpha_walking.onnx").exists(),
                     reason="microduck_rl checkout or upstream policies not found")
-def test_goto_reaches_the_other_room_without_touching_anything():
+@pytest.mark.parametrize("mode", ["roller", "walk"])
+def test_goto_reaches_the_other_room_without_touching_anything(mode):
     import mujoco
     fp = _plan()
-    w = World(fp.scenario(spawn_room="azul", yaw=math.pi),
-              infer_for={"d0": onnx_infer(POLICIES_DIR / "roller.onnx")}, seed=0)
+    w = World(fp.scenario(spawn_room="azul", yaw=math.pi, mode=mode),
+              infer_for={"d0": onnx_infer(POLICIES_DIR / (MODES[mode]["policy"].split(":")[1] + ".onnx"))},
+              seed=0)
+    assert w.scenario.collision == MODES[mode]["collision"]
     w.reset()
     d = w.ducks["d0"]
-    brain = attach_world(SkateRoute(plan=fp), w, "d0")
+    brain = attach_world(SkateRoute(plan=fp, mode=mode), w, "d0")
     static = {g for g in range(w.model.ngeom)
               if (mujoco.mj_id2name(w.model, mujoco.mjtObj.mjOBJ_GEOM, g) or "").startswith("box")}
     for room in ("amarillo", "azul"):
         brain.goto(room)
         touched = stairs = False
-        for _ in range(60 * 50):
+        for _ in range(120 * 50):
             d.set_cmd(w.data, brain.step(Senses(t=w.t, speed=d.heading_speed(w.data))).twist)
             w.step()
             touched |= any((w.model.geom_bodyid[c.geom1] > 0 and c.geom2 in static) or

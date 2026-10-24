@@ -43,6 +43,22 @@ from .runtime import Intent, Senses
 
 PUSH = 0.6          # the trained top of the push range
 BRAKE = -0.2        # the most negative command used; -0.5 skates backwards
+# ON FEET (`mode="walk"`, the shipped walker): the command is a real twist —
+# vx in m/s, wz a yaw RATE in rad/s — so the same planner drives it with a
+# proportional turn and a forward speed inside the walker's trained range.
+WALK_VX = 0.30      # forward, m/s (alpha_walking's trained |vx| <= 0.3)
+WALK_SLOW = 0.15    # forward when the goal is close, m/s
+WALK_TURN_GAIN = 2.0  # wz = gain * heading error, clipped to +-WALK_WZ_MAX
+# The yaw-rate bound on feet. NOT the walker's trained 1.0: measured in the
+# lab's world (6 s, flat floor), alpha_walking turning IN PLACE answers
+# wz -1.0 with -0.04 rad/s (a dead zone, right turns only) and +1.0 with
+# +0.58, while +-2.0 gives -1.52 / ~+1.5 at every vx from 0 to 0.2, 0 falls
+# — the same widening brain_env's BRAIN_WZ notes. At +-1 a duck facing away
+# from its goal span in place for minutes.
+WALK_WZ_MAX = 2.0
+#: The two drives this brain knows, and the duck each one needs.
+MODES = {"roller": {"collision": "rollers", "policy": "pollen:roller"},
+         "walk": {"collision": "all", "policy": "pollen:alpha_walking"}}
 
 
 @dataclass
@@ -55,6 +71,7 @@ class SkateParams:
     corner_turn: float = 0.6     # a path bend sharper than this (rad) ahead …
     corner_dist: float = 0.35    # … within this distance makes it coast early
     corner_speed: float = 0.12   # … down to this speed, m/s
+    walk_turn_err: float = 0.35  # on feet: turn in place while |heading error| exceeds this, rad
     goal_tol: float = 0.20       # final goal reached, m
     replan_dev: float = 0.35     # off the path by more than this: replan from here
     keepout_margin: float = 0.15 # extra berth for a keep-out zone (a stairwell has no wall to bump);
@@ -68,7 +85,10 @@ class SkateRoute:
 
     def __init__(self, goals: list[tuple[str, tuple[float, float]]] | None = None,
                  params: SkateParams | None = None, house: str | None = None,
-                 plan=None) -> None:
+                 plan=None, mode: str = "roller") -> None:
+        if mode not in MODES:
+            raise ValueError(f"mode {mode!r}; have {sorted(MODES)}")
+        self.mode = mode             # "roller" (skates) or "walk" (feet): what the command MEANS
         self.p = params or SkateParams()
         self.goals_given = goals
         self.house = house
@@ -145,16 +165,26 @@ class SkateRoute:
         bend = self._bend_ahead(self.i, self.p.corner_dist)
         to_end = float(np.linalg.norm(end - xy))
         speed = abs(senses.speed) if senses.speed is not None else 0.0
-        if abs(err) > self.p.push_err:
+        if self.mode == "walk":
+            if abs(err) > self.p.walk_turn_err:
+                vx, self.state = 0.0, "turn"
+            elif to_end < 0.5:
+                vx, self.state = WALK_SLOW, "approach"
+            else:
+                vx, self.state = WALK_VX, "walk"
+            wz = float(np.clip(WALK_TURN_GAIN * err, -WALK_WZ_MAX, WALK_WZ_MAX))
+        elif abs(err) > self.p.push_err:
             vx, self.state = 0.0, "coast_turn"        # turn first: the blades steer at zero push
+            wz = float(np.clip(err, -1.0, 1.0))
         elif (bend > self.p.corner_turn or to_end < 0.5) and speed > self.p.corner_speed:
             # a corner or the end is close and we are quick: glide down to the
             # corner speed. Only while QUICK — coasting toward a corner from a
             # standstill never reaches it.
             vx, self.state = 0.0, "glide"
+            wz = float(np.clip(err, -1.0, 1.0))
         else:
             vx, self.state = PUSH, "push"
-        wz = float(np.clip(err, -1.0, 1.0))
+            wz = float(np.clip(err, -1.0, 1.0))
         # `WorldDuck.set_cmd` treats an EXACT zero turn with forward push as
         # "hold the current heading" and substitutes its own walker-style
         # yaw-rate term; on skates wz is a heading error, so never send 0.
