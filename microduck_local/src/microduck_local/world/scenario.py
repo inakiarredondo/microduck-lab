@@ -20,7 +20,8 @@ Format v1 (JSON, saved under microduck_local/scenarios/<name>.json):
      "pickables": [{"id": "t0", "kind": "brick"|"block"|"sock", "pos": [x, y], "yaw": 0.0}],
      "basket": {"pos": [x, y], "size": [0.3, 0.3], "rim": 0.06} | null,   # the tidy target
      "physics_dt": 0.005,                               # MuJoCo timestep (see Scenario.physics_dt)
-     "collision": "all"}                                # "all" | "walk" robot MJCF ("walk": only the soles collide)
+     "collision": "all"}                                # "all" | "walk" | "rollers" robot MJCF ("walk": only the soles collide;
+                                                        #  "rollers": on skates, driven by pollen:roller)
 
 Everything is metres, radians, world frame, z up. Validation is strict on
 purpose: a scenario that compiles into a model nobody meant is worse than a
@@ -747,8 +748,8 @@ def validate_scenario(raw: dict) -> Scenario:
                         _vec(braw.get("size", [0.3, 0.3]), 2, "basket.size", 0.1, 1.0),
                         _num(braw.get("rim", 0.06), "basket.rim", 0.02, 0.18))
     collision = raw.get("collision", Scenario.collision)
-    if collision not in ("walk", "all"):
-        raise ScenarioError("collision must be 'walk' or 'all'")
+    if collision not in ("walk", "all", "rollers"):
+        raise ScenarioError("collision must be 'walk', 'all' or 'rollers'")
     goal_width = raw.get("goal_width", 0.0) or 0.0
     if not isinstance(goal_width, (int, float)) or not 0.0 <= goal_width <= 5.0:
         raise ScenarioError("goal_width must be a number in [0, 5]")

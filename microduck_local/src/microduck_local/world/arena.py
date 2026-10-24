@@ -55,6 +55,7 @@ from ..sensors.lidar import tof_from_lidar
 from ..walk_env import MicroduckWalkEnv
 from .compose import (
     DUCK_ROBOT,
+    SPAWN_Z,
     DuckAddress,
     compose,
     duck_prefix,
@@ -1340,7 +1341,7 @@ class World:
         # sensors and the tracker, in the order they were.
         x, y, yaw = d.spawn
         x, y = self._clear_of_persons(x, y)
-        spawn_duck(self.model, self.data, d.adr, x, y, yaw)
+        spawn_duck(self.model, self.data, d.adr, x, y, yaw, z=SPAWN_Z[self.scenario.collision])
         self._odom_reset(d, x, y, yaw)
         d.last_action[:] = 0.0
         d.step_count = 0

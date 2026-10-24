@@ -10,6 +10,10 @@ written back into the item. Keep the answers — a negative result that took an
 hour is worth as much as the positive one, and this file is where the next
 person finds out it was already tried.
 
+**New (2026-10-24): Track 15, the skating house tour — see the section of
+that name below.** A duck on roller skates tours a house room by room without
+touching anything: 8/8 tours, 0 contacts, 0 falls, on a PLACEHOLDER plan.
+
 **Live work (2026-10-10): Track 14, the Asimov 1 get-up — start at phase 3n.**
 It rises 200/200 and stays up 180/200 by handing off to Menlo's shipped walk
 policy, and passes 6 of the 7 clauses in `scripts/getup_acceptance.py`. The "Now:" section
@@ -22565,3 +22569,94 @@ never fire on ANY non-duck body, because `handoff_due` read the duck-only
 `env.behavior.handoff_fn` and fell through to the backflip rotation gate —
 so the flag was accepted, the render completed, and the mp4 showed the
 unhanded behaviour.
+
+---
+
+## Track 15 — the skating house tour (2026-10-24)
+
+The ask: the duck gets around a real home **on roller skates** without hitting
+anything; some exits have a sill the duck is meant to clear with a **forward
+roll**. Scope agreed: phase 1 is everywhere reachable without a sill, in
+simulation, with a PRIVILEGED brain (true pose, true map); the roll comes
+later. The home's layout is private and is not described in this file.
+
+### 15.0 What exists, measured before building anything — DONE
+
+All in upstream's CPU rehearsal (`microduck_rl/scripts/infer_policy.py`
+machinery, BAM M6 actuators, `scene_rollers.xml`) unless it says "lab".
+
+- **The shipped `roller.onnx` STEERS.** Its recipe file says heading is
+  disabled ("straight-line focus"), but the shipped weights track a heading
+  error in `cmd[2]`: closed loop to 0 / ±45 / ±90 / 180 deg at push 0, 0.3
+  and 0.6 — **15/15 runs, 0 falls, final heading within 10 deg**. It is slow
+  under BAM: **~0.13 m/s** mean at push 0.6 over 11 s.
+- **In the lab's world (XML PD actuators) it is ~2x faster**: 3.0 m in 12 s
+  against BAM's 1.4 m, same commands, 10/10 runs, 0 falls. Every tour time
+  below is on the lab's actuators and is optimistic by about that factor.
+- **`cmd[0] = -0.5` does not brake, it skates BACKWARDS** (0.32 m/s still
+  moving after 4 s). Coasting (`0`) or `-0.2` stops it completely. The brain
+  never asks for less than `-0.2`.
+- **The blades stop at ANY sill.** Pushing at 0.6 into a 0.5 / 1 / 1.5 / 2 /
+  3 cm box: stuck in front of it 5/5, upright. So the house's interior doors
+  must be threshold-free in the model, and an exit with a sill needs a skill.
+- **The shipped `roulade.onnx` does NOT work on skates.** Instrument check
+  first: on the walking model it turns exactly **1.00** pitch revolution and
+  ends upright. On the roller model, standing or skating, flat floor or a
+  0-5 cm sill, triggered 15 or 25 cm early, action scale 0.8 / 0.9 / 1.0: it
+  turns **0.54-0.80** revolutions and ends **lying down, every time**. A roll
+  on skates is a new skill to train (upstream's `-Roulade-` recipe on the
+  roller model, GPU; or this repo's behaviours once the lab has wheels — it
+  does now).
+- A skating duck into a wall at push 0.3 / 0.6 stops against it upright
+  (contact at ~0.2 m/s); into upstream `apartment.xml`'s stairwell it falls.
+
+### 15.1 Phase 1 built: rollers in the lab, a house compiler, the route brain — DONE
+
+- `Scenario.collision = "rollers"` (`world/compose.py`): upstream's
+  `robot_groundcontact_rollers.xml`, wheel-bearing frictionloss 0.003 (what
+  `infer_policy.py --roller` writes), spawn at z 0.1385. Mass properties are
+  NOT pinned to the walk file — the skates are real mass. Driven by
+  `pollen:roller`, same 61-obs / 14-action contract and `DEFAULT_POSE`.
+- `world/house.py`: a `HousePlan` of rectangular rooms, doors, gardens, exits
+  and furniture, compiled to walls with the door gaps cut (a shared wall drawn
+  once), a low fence round the gardens, and a tour's waypoints (each door
+  approached, crossed and left square-on). `casa-demo` is a **placeholder**
+  plan, not the user's house — the real measurements replace it.
+- `brain/skate.py`, kind `skate_route`: occupancy grid from the scenario's
+  walls and boxes inflated by 0.20 m, A* through the waypoints, pure pursuit;
+  push 0.6 while the heading error is under 0.3 rad, coast to turn, coast into
+  corners only while faster than 0.12 m/s (coasting toward a corner from a
+  standstill deadlocked the first version).
+- `scripts/skate_house.py` scores it: tour complete, the rooms the TRUNK was
+  in (an independent check on the brain's own goal bookkeeping, which had a
+  bug the first time), contact episodes between any duck geom and any wall or
+  box off MuJoCo's contact list, falls.
+
+**Result, `casa-demo`, 8 seeds (random spawn heading, ±15 cm offset):
+8/8 tours complete along the exact room sequence, 0 contacts, 0 falls,
+67-70 s** for a 23 m tour. The hit counter was checked on a planted crash
+(30 contact episodes against the sofa). Through the lab's own path
+(`record-world casa-demo`): complete in 67 s, 0 falls, the contact sheet
+shows the duck room by room ending in the front garden.
+
+Caveat that matters for "sin chocarse": the brain is PRIVILEGED. It reads the
+true pose and the true map, so 0 contacts is a statement about the planner
+and the skating policy's tracking, not about anything the robot could do
+alone.
+
+### 15.2 Next
+
+- [ ] **The real house.** Measurements from the user (rooms, doors and widths,
+      furniture, the route). Replace `casa-demo` in `world/house.HOUSES`;
+      re-run `scripts/skate_house.py --house <name> --seeds 8`. Settles it:
+      8/8 complete, 0 contacts.
+- [ ] **Outdoor surface.** Skates on paving work like the floor; on grass
+      or gravel the 15 mm wheels almost certainly stall. Ask before modelling.
+- [ ] **Timing under BAM.** Tour times are on XML PD; re-time with the
+      lab's BAM actuator before quoting a duration.
+- [ ] **The roll over the sill** (later phase): measure the sill,
+      then train a roller roulade. Settles it: clears the sill and ends upright
+      on its wheels, N/N.
+- [ ] **Sensed brain (option A, later):** the same tour from the head ToF +
+      odometry only, trained with `BrainEnv`; the privileged brain above is its
+      baseline.

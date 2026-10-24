@@ -44,7 +44,22 @@ ROBOT_DIR = C.MICRODUCK_RL_DIR / "src/mjlab_microduck/robot/microduck"
 ROBOT_XML = {
     "walk": ROBOT_DIR / "robot_walk.xml",
     "all": ROBOT_DIR / "robot_allcollisions.xml",
+    # ROLLER SKATES: upstream's roller model (`groundcontact` collision set
+    # plus two blades, each with two free `passive_*` wheels, interleaved
+    # after each ankle). Every address here resolves by NAME, so the wheels
+    # are just four extra DOFs. Driven by the shipped `roller.onnx` (61-obs,
+    # 14-action, same DEFAULT_POSE; cmd vx 0 coast / >0 push / <0 brake,
+    # cmd wz = heading error, clipped to +-1 rad).
+    "rollers": ROBOT_DIR / "robot_groundcontact_rollers.xml",
 }
+#: The wheel-bearing friction a roller duck runs with. The roller MJCF ships
+#: 0 because non-zero frictionloss in the XML breaks training; upstream's CPU
+#: rehearsal (`scripts/infer_policy.py --roller`) writes this after loading,
+#: and so does `compose` (DR in training ramps it 0 -> 0.0015).
+ROLLER_WHEEL_FRICTIONLOSS = 0.003
+#: Trunk spawn height per collision family: the skates lift the duck 13.5 mm
+#: (upstream `infer_policy.py`: 0.1385 on rollers, 0.125 on feet).
+SPAWN_Z = {"walk": 0.12, "all": 0.12, "rollers": 0.1385}
 
 
 
@@ -852,7 +867,9 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
             _get_body(duck.robot).attach(spec, duck_prefix(duck.id), w.add_frame())
             continue
         robot = mujoco.MjSpec.from_file(str(robot_xml))
-        if scenario.collision != "walk":
+        if scenario.collision == "all":
+            # Rollers are NOT pinned: the skates are real mass on real bodies,
+            # and the walk file has no wheels to copy from.
             _pin_mass_properties_to_walk(robot)
         split_jaw(robot)
         frame = w.add_frame(pos=[x, y, 0.0], quat=_yaw_quat(yaw))
@@ -876,6 +893,11 @@ def compose(scenario: Scenario) -> mujoco.MjModel:
             ex = spec.add_exclude(name=f"{duck.id}/mouth/{t.id}")
             ex.bodyname1, ex.bodyname2 = f"{duck_prefix(duck.id)}jaw_soft", t.id
     model = spec.compile()
+    if scenario.collision == "rollers":
+        for j in range(model.njnt):
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+            if name.rsplit("/", 1)[-1].startswith("passive_"):
+                model.dof_frictionloss[model.jnt_dofadr[j]] = ROLLER_WHEEL_FRICTIONLOSS
     for duck in scenario.ducks:
         if duck.team:
             paint_team(model, duck.id, duck.team)

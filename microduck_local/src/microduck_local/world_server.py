@@ -299,7 +299,15 @@ def builtin_scenarios() -> dict[str, Scenario]:
         d.policy = DEFAULT_POLICY
     for d in pitch.ducks:
         d.policy = DEFAULT_POLICY
-    return {s.name: s for s in (empty, wall, room, follow, playroom, pitch, pitch2, pitch3)}
+    # The skating tour (world/house.py, brain/skate.py): a duck on roller
+    # skates touring a house room by room. "casa-demo" is a PLACEHOLDER plan
+    # until the real one's measurements are in.
+    from .world.house import HOUSES
+    houses = []
+    for hname, make in HOUSES.items():
+        plan, route = make()
+        houses.append(plan.scenario(duck_spawn=(route[0], 0.0), brain="skate_route"))
+    return {s.name: s for s in (empty, wall, room, follow, playroom, pitch, pitch2, pitch3, *houses)}
 
 
 BUILTIN_NAMES = frozenset(builtin_scenarios().keys())

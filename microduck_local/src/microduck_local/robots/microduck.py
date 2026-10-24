@@ -211,7 +211,7 @@ class MicroduckBody(RobotSpec):
             split_jaw,
         )
         robot = mujoco.MjSpec.from_file(str(ROBOT_XML[collision]))
-        if collision != "walk":
+        if collision == "all":
             _pin_mass_properties_to_walk(robot)
         split_jaw(robot)
         spec.attach(robot, prefix=prefix, frame=frame)
