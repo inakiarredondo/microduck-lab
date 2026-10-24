@@ -146,7 +146,7 @@ def test_scenario_roundtrip_and_validation(tmp_path):
     bad(lambda r: r["ducks"][0].update(tof="lidar"))
     bad(lambda r: r["walls"][0].update(height=float("nan")))
     bad(lambda r: r["boxes"][0].update(size=[0, 0, 0]))
-    bad(lambda r: r.update(collision="rollers"))
+    bad(lambda r: r.update(collision="skates"))
     bad(lambda r: r.update(floor={"size": [100, 1]}))
     bad(lambda r: r["ducks"].extend({"id": f"x{i}", "spawn": [0, 0, 0]} for i in range(20)))
     bad(lambda r: r["ducks"][0].update(robot="mars_bot"))      # not a registry id
