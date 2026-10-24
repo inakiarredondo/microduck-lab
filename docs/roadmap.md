@@ -22644,18 +22644,54 @@ true pose and the true map, so 0 contacts is a statement about the planner
 and the skating policy's tracking, not about anything the robot could do
 alone.
 
-### 15.2 Next
+### 15.2 "Go to the kitchen": a real home from a vacuum's map — DONE (sim, privileged)
 
-- [ ] **The real house.** Measurements from the user (rooms, doors and widths,
-      furniture, the route). Replace `casa-demo` in `world/house.HOUSES`;
-      re-run `scripts/skate_house.py --house <name> --seeds 8`. Settles it:
-      8/8 complete, 0 contacts.
-- [ ] **Outdoor surface.** Skates on paving work like the floor; on grass
-      or gravel the 15 mm wheels almost certainly stall. Ask before modelling.
+The ask changed: not a fixed tour but **go to a named room** ("go and see if
+anyone is in the kitchen") and get there. The user's own home, from the map
+their robot vacuum's LIDAR made, hand-marked (rooms by colour, a door width
+for scale, the top of a staircase, the garden exits).
+
+**The plan is private.** `world/floorplan.py` is generic and public: it reads
+any colour-map image + a `plan.json` spec into floor / obstacle / STAIRS
+cells, rooms, static boxes and stair keep-out rectangles. The image and the
+spec live in `microduck_local/private/` (git-ignored, locked by
+`test_the_private_directory_is_ignored_by_git`); every test plan is drawn
+synthetically. No measurement of the home is written here.
+
+- **A vacuum draws the edge of a drop like a wall.** On the private plan the
+  floor met a stairwell along a thin grey band that the first reading turned
+  into a wall, so the planted "skate straight at the stairs" test never fired —
+  the world had a rail the home may not have. Unless the spec says
+  `"railed": true`, a band of obstacle cells between floor and stairs is now
+  read as the open edge (stairs, no geometry): the pessimistic reading.
+  Planted test: fires at 2.6 s.
+- **The stair keep-out has to fit the home.** At 0.45 m (clearance 0.20 +
+  margin 0.25) one narrow passage on the private plan closed: 8 of 64 trips
+  `no_path`. The margin is 0.15 now; the planner centres the path, so the
+  trunk passes **0.37 m** from the edge there whatever the margin below 0.20.
+- `SkateRoute(plan=...).goto(room)`; `scripts/skate_goto.py <plan>` scores
+  random trips: random start room and heading, a chain of random rooms.
+
+**Result (8 trials x 8 trips): 64/64 trips arrived, 0 contacts, 0 stair
+entries, 0 falls, median 11 s a trip, closest approach to the stairs 0.34 m.**
+Same caveat as 15.1: the brain reads the true pose and the true map, and the
+times are on XML-PD actuators (~2x BAM's speed).
+
+### 15.3 Next
+
+- [x] **The real house** — 15.2 (from a vacuum map, kept private).
+- [x] **Outdoor surface** — smooth tiles, modelled as floor. A 5 mm lip
+      between tiles would stop the blades.
+- [ ] **What a vacuum map cannot see.** Its LIDAR sweeps ~10 cm up: anything
+      lower, or overhanging (a sofa's skirt, a table top), is missing or wrong.
+- [ ] **Asking from the lab.** `goto` exists in code; the /sim inspector has
+      no room picker yet.
 - [ ] **Timing under BAM.** Tour times are on XML PD; re-time with the
       lab's BAM actuator before quoting a duration.
-- [ ] **The roll over the sill** (later phase): measure the sill,
-      then train a roller roulade. Settles it: clears the sill and ends upright
+- [ ] **The roll over the sill** (later phase): the sill is **6 cm** — about
+      a quarter of the duck's height, and the community's
+      closest skill (`microduck-step-up-policy`) climbs 2.5 cm on FEET. Train a
+      roller roulade. Settles it: clears the sill and ends upright
       on its wheels, N/N.
 - [ ] **Sensed brain (option A, later):** the same tour from the head ToF +
       odometry only, trained with `BrainEnv`; the privileged brain above is its

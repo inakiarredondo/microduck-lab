@@ -57,6 +57,8 @@ class SkateParams:
     corner_speed: float = 0.12   # … down to this speed, m/s
     goal_tol: float = 0.20       # final goal reached, m
     replan_dev: float = 0.35     # off the path by more than this: replan from here
+    keepout_margin: float = 0.15 # extra berth for a keep-out zone (a stairwell has no wall to bump);
+                                 # measured on a real plan: 0.20 closed a narrow passage
 
 
 class SkateRoute:
@@ -65,10 +67,14 @@ class SkateRoute:
     kind = "skate_route"
 
     def __init__(self, goals: list[tuple[str, tuple[float, float]]] | None = None,
-                 params: SkateParams | None = None, house: str | None = None) -> None:
+                 params: SkateParams | None = None, house: str | None = None,
+                 plan=None) -> None:
         self.p = params or SkateParams()
         self.goals_given = goals
         self.house = house
+        # A `world/floorplan.FloorPlan`: rooms by name for `goto`, and its
+        # stairs as keep-out zones the planner gives a wide berth.
+        self.plan = plan
         self.world = None            # attach_world fills these
         self.robot_id: str | None = None
         self.reset()
@@ -88,6 +94,16 @@ class SkateRoute:
     def inputs(self) -> dict:
         return dict(self._last)
 
+    def goto(self, room: str) -> None:
+        """Go to `room` from wherever the duck is now ("is anyone in the
+        kitchen?"). Aims at the room's most open point; replans from scratch."""
+        if self.plan is None:
+            raise ValueError("goto needs a plan (SkateRoute(plan=FloorPlan...))")
+        self.goals_given = [(room, self.plan.open_point(room))]
+        grid = self._grid
+        self.reset()
+        self._grid = grid            # the map did not change
+
     def step(self, senses: Senses) -> Intent:
         if self.world is None or self.robot_id is None:
             self.state = "blind"
@@ -96,14 +112,15 @@ class SkateRoute:
         xy = np.asarray(d.trunk_pos(self.world.data)[:2], float)
         yaw = d.yaw(self.world.data)
         if self._grid is None:
-            self._grid = OccupancyGrid.from_scenario(self.world.scenario, self.p)
+            self._grid = OccupancyGrid.from_scenario(
+                self.world.scenario, self.p, keepout=self.plan.keepout() if self.plan is not None else ())
         if self.path is None:
             self._plan(xy)
             if self.path is None:
                 self.state = "no_path"
                 return Intent(note="no collision-free path to the next room")
         if self.state == "done":
-            return Intent(twist=(0.0, 0.0, 0.0), note="tour complete")
+            return Intent(twist=(0.0, 0.0, 0.0), note="arrived")
 
         # progress: nearest path point in a window ahead of where we were
         hi = min(len(self.path), self.i + 40)
@@ -121,7 +138,7 @@ class SkateRoute:
             self.state = "done"
             self.reached.extend(name for _, name in self.labels)
             self.labels = []
-            return Intent(twist=(0.0, 0.0, 0.0), note="tour complete")
+            return Intent(twist=(0.0, 0.0, 0.0), note="arrived")
 
         carrot = self._ahead(self.i, self.p.lookahead)
         err = _wrap(math.atan2(carrot[1] - xy[1], carrot[0] - xy[0]) - yaw)
@@ -203,7 +220,10 @@ class OccupancyGrid:
     cost: np.ndarray             # (H, W) float, >= 1
 
     @classmethod
-    def from_scenario(cls, sc, p: SkateParams) -> "OccupancyGrid":
+    def from_scenario(cls, sc, p: SkateParams, keepout=()) -> "OccupancyGrid":
+        """`keepout`: (x0, y0, x1, y1) world rectangles with no geometry that
+        must still never be entered (stairs), kept `clearance + keepout_margin`
+        away."""
         res = p.resolution
         hx, hy = sc.floor[0] / 2, sc.floor[1] / 2
         W, H = int(math.ceil(2 * hx / res)), int(math.ceil(2 * hy / res))
@@ -233,6 +253,12 @@ class OccupancyGrid:
         edge = np.minimum.reduce([X - origin[0], -origin[0] - X, Y - origin[1], -origin[1] - Y])
         dist = np.minimum(dist, np.maximum(edge, 0.0))
         blocked = dist < p.clearance
+        for x0, y0, x1, y1 in keepout:
+            dx = np.maximum(np.maximum(x0 - X, X - x1), 0.0)
+            dy = np.maximum(np.maximum(y0 - Y, Y - y1), 0.0)
+            kd = np.hypot(dx, dy)
+            blocked |= kd < p.clearance + p.keepout_margin
+            dist = np.minimum(dist, np.maximum(kd - p.keepout_margin, 0.0))
         cost = 1.0 + 4.0 * np.clip((p.clearance + p.soft - dist) / p.soft, 0.0, 1.0) ** 2
         return cls(origin, res, blocked, cost)
 

@@ -68,3 +68,7 @@ duck-viewer/viewer-server.log
 # MuJoCo writes this beside whatever process loaded a model (compile
 # warnings from the G1 attach); it is a runtime log, not source.
 MUJOCO_LOG.TXT
+
+# A real home's floor plan and anything derived from it (world/floorplan.py).
+# Private by design: never commit it.
+microduck_local/private/
