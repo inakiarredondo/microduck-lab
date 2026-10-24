@@ -22677,6 +22677,17 @@ entries, 0 falls, median 11 s a trip, closest approach to the stairs 0.34 m.**
 Same caveat as 15.1: the brain reads the true pose and the true map, and the
 times are on XML-PD actuators (~2x BAM's speed).
 
+**On foot too (same seeds, same trips, `skate_goto.py --mode both`):**
+
+| mode | trips arrived | contacts | stair entries | falls | median trip | closest to stairs |
+|---|---|---|---|---|---|---|
+| roller (`pollen:roller`) | 64/64 | 0 | 0 | 0 | 11 s | 0.34 m |
+| walk (`pollen:alpha_walking`) | 64/64 | 0 | 0 | 0 | 33 s | 0.32 m |
+
+On feet the yaw bound had to be +-2 rad/s: turning in place, the shipped
+walker answers wz -1.0 with -0.04 rad/s (a right-turn dead zone) and +1.0
+with +0.58; at +-2.0 it turns ~1.5 rad/s both ways, 0 falls.
+
 ### 15.3 Next
 
 - [x] **The real house** — 15.2 (from a vacuum map, kept private).
